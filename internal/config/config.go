@@ -19,7 +19,7 @@ import (
 // Config is Reasonix's runtime configuration.
 type Config struct {
 	DefaultModel string            `toml:"default_model"`
-	Language     string            `toml:"language"` // ui language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
+	Language     string            `toml:"language"` // ui/model language tag (e.g. "zh"); empty = auto-detect from $LANG / $REASONIX_LANG
 	Agent        AgentConfig       `toml:"agent"`
 	Providers    []ProviderEntry   `toml:"providers"`
 	Tools        ToolsConfig       `toml:"tools"`
@@ -29,6 +29,31 @@ type Config struct {
 	Skills       SkillsConfig      `toml:"skills"`
 	Codegraph    CodegraphConfig   `toml:"codegraph"`
 	Statusline   StatuslineConfig  `toml:"statusline"`
+	LSP          LSPConfig         `toml:"lsp"`
+}
+
+// LSPConfig governs the optional Language Server Protocol tools (lsp_definition,
+// lsp_references, lsp_hover, lsp_diagnostics). Enabled defaults to true; the
+// servers themselves are never bundled — each resolves on PATH and the tool
+// returns an install hint when it is missing, so the capability is dormant until
+// the user installs a server. Servers overrides or extends the built-in language
+// → server map, keyed by language id (e.g. "go", "rust", "python").
+type LSPConfig struct {
+	Enabled bool                 `toml:"enabled"`
+	Servers map[string]LSPServer `toml:"servers"`
+}
+
+// LSPServer overrides a built-in language's server or, when keyed by a new
+// language, adds one. An empty field falls back to the built-in default for that
+// language; Extensions is required when adding a language the built-ins don't
+// cover (e.g. ".ex" for Elixir) so files route to it.
+type LSPServer struct {
+	Command     string            `toml:"command"`
+	Args        []string          `toml:"args"`
+	Env         map[string]string `toml:"env"`
+	LanguageID  string            `toml:"language_id"`
+	Extensions  []string          `toml:"extensions"`
+	InstallHint string            `toml:"install_hint"`
 }
 
 // StatuslineConfig configures a custom status line. Command, when set, is run at
@@ -142,6 +167,12 @@ type AgentConfig struct {
 	// startup (a built-in like "explanatory"/"learning"/"concise", or a custom
 	// .reasonix/output-styles/<name>.md). Empty = the unmodified prompt.
 	OutputStyle string `toml:"output_style"`
+	// AutoPlan controls whether interactive turns that look multi-step start in
+	// plan mode automatically: "off" disables it, "ask"/"on" enable the gate.
+	AutoPlan string `toml:"auto_plan"`
+	// AutoPlanClassifier optionally names a provider/model used to classify
+	// borderline auto-plan decisions. Empty keeps the zero-cost heuristic path.
+	AutoPlanClassifier string `toml:"auto_plan_classifier"`
 }
 
 // ProviderEntry declares a model provider instance. ContextWindow is the model's
@@ -233,6 +264,23 @@ type PluginEntry struct {
 	Env     map[string]string `toml:"env"`
 	URL     string            `toml:"url"`
 	Headers map[string]string `toml:"headers"`
+	// AutoStart controls whether the server connects during session startup.
+	// Nil preserves historical behavior: configured servers start automatically.
+	AutoStart *bool `toml:"auto_start"`
+}
+
+func (e PluginEntry) ShouldAutoStart() bool {
+	return e.AutoStart == nil || *e.AutoStart
+}
+
+func (c *Config) AutoStartPlugins() []PluginEntry {
+	out := make([]PluginEntry, 0, len(c.Plugins))
+	for _, p := range c.Plugins {
+		if p.ShouldAutoStart() {
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // DefaultSystemPrompt is used when config provides none.
@@ -251,11 +299,9 @@ In plan mode the harness blocks writer tools: do read-only research, then write 
 concise plan as your reply and stop. The user is asked to approve before anything
 is changed; once approved, work through the steps, updating the task list as you go.`
 
-// LanguagePolicy is appended to every system prompt (in boot assembly) so the
-// model mirrors the user's language per message instead of the harness pinning
-// one — the UI `language` setting governs only the interface, never the model.
-// It is static English text, so it stays part of the cache-stable prefix and
-// keeps model behaviour language-stable while still adapting the reply language.
+// LanguagePolicy is the auto fallback appended to the system prompt when no
+// concrete UI language is resolved. It is static English text, so it stays part
+// of the cache-stable prefix and avoids per-turn language injection.
 const LanguagePolicy = `Reply in the same language the user is using in their most recent message: ` +
 	`if they write in Chinese answer in Chinese, in English answer in English, and switch ` +
 	`whenever they switch. Let this also guide the language you think in. Always keep code, ` +
@@ -272,6 +318,7 @@ func Default() *Config {
 			// compaction, not by a round count. Set a positive agent.max_steps only
 			// if you want a hard guard against runaway.
 			MaxSteps: 0,
+			AutoPlan: "ask",
 		},
 		// Mode "ask" with no rules keeps `reasonix run` autonomous (no TTY → ask
 		// resolves to allow) while `reasonix chat` prompts before writers. Users add
@@ -287,11 +334,14 @@ func Default() *Config {
 		// first use. Set enabled = false to opt out, or auto_install = false to
 		// require an explicit `reasonix codegraph install`.
 		Codegraph: CodegraphConfig{Enabled: true, AutoInstall: true},
+		// LSP tools on by default, but dormant until a language server is on PATH;
+		// a missing server yields an install hint rather than an error.
+		LSP: LSPConfig{Enabled: true},
 		Providers: []ProviderEntry{
 			{Name: "deepseek-flash", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-flash", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: &provider.Pricing{CacheHit: 0.02, Input: 1, Output: 2, Currency: "¥"}},
 			{Name: "deepseek-pro", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4-pro", APIKeyEnv: "DEEPSEEK_API_KEY", BalanceURL: "https://api.deepseek.com/user/balance", ContextWindow: 1_000_000, Price: &provider.Pricing{CacheHit: 0.025, Input: 3, Output: 6, Currency: "¥"}},
-			{Name: "mimo-pro", Kind: "openai", BaseURL: "https://api.xiaomimimo.com/v1", Model: "mimo-v2.5-pro", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 1_000_000},
-			{Name: "mimo-flash", Kind: "openai", BaseURL: "https://api.xiaomimimo.com/v1", Model: "mimo-v2-flash", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 65_536},
+			{Name: "mimo-pro", Kind: "openai", BaseURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5-pro", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 1_000_000, Price: &provider.Pricing{CacheHit: 0.025, Input: 3, Output: 6, Currency: "¥"}},
+			{Name: "mimo-flash", Kind: "openai", BaseURL: "https://token-plan-cn.xiaomimimo.com/v1", Model: "mimo-v2.5", APIKeyEnv: "MIMO_API_KEY", ContextWindow: 1_000_000, Price: &provider.Pricing{CacheHit: 0.02, Input: 1, Output: 2, Currency: "¥"}},
 		},
 	}
 }
@@ -354,6 +404,10 @@ func userConfigPath() string {
 	}
 	return filepath.Join(dir, "reasonix", "config.toml")
 }
+
+// UserConfigPath is the user-global config file (~/.config/reasonix/config.toml),
+// or "" when the user config dir can't be resolved.
+func UserConfigPath() string { return userConfigPath() }
 
 // ArchiveDir is where compacted conversation history is archived for
 // traceability (one timestamped .jsonl per compaction). Empty if the user config
@@ -500,6 +554,12 @@ func (e *ProviderEntry) APIKey() string {
 		return ""
 	}
 	return os.Getenv(e.APIKeyEnv)
+}
+
+// Configured reports whether the provider's api_key_env is set — the same check
+// Validate enforces, so pickers can filter on it.
+func (e *ProviderEntry) Configured() bool {
+	return e.APIKey() != ""
 }
 
 // ResolveSystemPrompt returns the system prompt, reading system_prompt_file if set.

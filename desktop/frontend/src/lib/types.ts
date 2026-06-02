@@ -117,6 +117,12 @@ export interface SessionMeta {
   current: boolean;
 }
 
+export interface WorkspaceView {
+  path: string;
+  name: string;
+  current: boolean;
+}
+
 export interface ContextInfo {
   used: number;
   window: number;
@@ -145,6 +151,50 @@ export interface CommandInfo {
 export interface DirEntry {
   name: string;
   isDir: boolean;
+}
+
+export interface FilePreview {
+  path: string;
+  body: string;
+  size: number;
+  truncated: boolean;
+  binary: boolean;
+  err?: string;
+}
+
+// MCP & Skills drawer (desktop/app.go Capabilities) — the GUI counterpart to
+// /mcp + /skill: connected/failed servers and discoverable skills.
+export interface ServerView {
+  name: string;
+  transport: string;
+  status: "connected" | "failed" | "disabled";
+  tools: number;
+  prompts: number;
+  resources: number;
+  error?: string;
+  toolList?: MCPToolView[];
+}
+export interface MCPToolView {
+  name: string;
+  description: string;
+}
+export interface SkillView {
+  name: string;
+  description: string;
+  scope: string;
+  runAs: string;
+}
+export interface CapabilitiesView {
+  servers: ServerView[];
+  skills: SkillView[];
+}
+export interface MCPServerInput {
+  name: string;
+  transport: string; // stdio | http | sse
+  command: string;
+  args: string[];
+  url: string;
+  env: Record<string, string>;
 }
 
 export interface ModelInfo {
@@ -176,6 +226,7 @@ export interface MemoryDoc {
 
 export interface MemoryFact {
   name: string;
+  title?: string;
   description: string;
   type: string; // "user" | "feedback" | "project" | "reference"
   body: string;
@@ -252,7 +303,6 @@ export interface SettingsView {
   permissions: PermissionsView;
   sandbox: SandboxView;
   agent: AgentView;
-  language: string;
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   bypass: boolean; // live YOLO state (runtime-only) — whether approvals are skipped this session

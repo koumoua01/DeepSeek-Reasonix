@@ -169,13 +169,18 @@ func isTransientErr(err error) bool {
 }
 
 func (c *client) buildRequest(req provider.Request) chatRequest {
-	msgs := make([]chatMessage, len(req.Messages))
-	for i, m := range req.Messages {
+	// Repair tool-call pairing before sending: an interrupted/resumed history can
+	// carry an assistant tool_calls turn whose results never landed, which DeepSeek
+	// rejects with a 400 ("must be followed by tool messages …").
+	src := provider.SanitizeToolPairing(req.Messages)
+	msgs := make([]chatMessage, len(src))
+	for i, m := range src {
 		// reasoning_content is deliberately NOT sent back: it's a response-only
-		// field. DeepSeek accepts it but counts it as ordinary prompt input
-		// (measured ~500 extra tokens per turn on a reasoner chain), and the
-		// OpenAI-compatible convention is not to echo it. The session still keeps
-		// it (for display/archive); we just don't pay to re-upload it every turn.
+		// field. DeepSeek counts re-sent reasoning as billable prompt input
+		// (measured ~500 extra tokens per turn on a reasoner chain); MiMo accepts
+		// it but does not require it (verified empirically: multi-turn tool-call
+		// sessions work fine without it, saving ~18 tokens/turn). The session
+		// still keeps it (for display/archive); we just don't pay to re-upload it.
 		cm := chatMessage{
 			Role:       string(m.Role),
 			Content:    m.Content,
@@ -230,6 +235,7 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 	started := map[int]bool{}
 	var order []int
 	var lastFinishReason string
+	var think thinkSplitter
 
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
@@ -270,7 +276,13 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 			out <- provider.Chunk{Type: provider.ChunkReasoning, Text: delta.ReasoningContent}
 		}
 		if delta.Content != "" {
-			out <- provider.Chunk{Type: provider.ChunkText, Text: delta.Content}
+			r, txt := think.push(delta.Content)
+			if r != "" {
+				out <- provider.Chunk{Type: provider.ChunkReasoning, Text: r}
+			}
+			if txt != "" {
+				out <- provider.Chunk{Type: provider.ChunkText, Text: txt}
+			}
 		}
 		for _, tc := range delta.ToolCalls {
 			cur, ok := acc[tc.Index]
@@ -301,9 +313,25 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 		return
 	}
 
+	if r, txt := think.flush(); r != "" || txt != "" {
+		if r != "" {
+			out <- provider.Chunk{Type: provider.ChunkReasoning, Text: r}
+		}
+		if txt != "" {
+			out <- provider.Chunk{Type: provider.ChunkText, Text: txt}
+		}
+	}
+
 	sort.Ints(order)
 	for _, idx := range order {
-		out <- provider.Chunk{Type: provider.ChunkToolCall, ToolCall: acc[idx]}
+		tc := acc[idx]
+		if tc.ID == "" {
+			// Some OpenAI-compatible gateways stream tool calls by index with no id.
+			// Synthesize a stable one so the result can be paired back to its call —
+			// an empty tool_call_id collapses multi-tool turns downstream.
+			tc.ID = fmt.Sprintf("call_%d", idx)
+		}
+		out <- provider.Chunk{Type: provider.ChunkToolCall, ToolCall: tc}
 	}
 	out <- provider.Chunk{Type: provider.ChunkDone}
 }
@@ -366,7 +394,7 @@ type chatMessage struct {
 	ToolCallID string         `json:"tool_call_id,omitempty"`
 	Name       string         `json:"name,omitempty"`
 	// no reasoning_content field: it is a response-only signal and is never sent
-	// back upstream (see buildRequest) — re-uploading it is paid prompt input.
+	// back upstream — re-uploading it is paid prompt input.
 }
 
 type chatTool struct {

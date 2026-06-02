@@ -23,6 +23,7 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/hook"
 	"reasonix/internal/jobs"
+	"reasonix/internal/lsp"
 	"reasonix/internal/memory"
 	"reasonix/internal/outputstyle"
 	"reasonix/internal/permission"
@@ -101,9 +102,6 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if st, ok := outputstyle.Resolve(cfg.Agent.OutputStyle, outputstyle.Dirs()); ok {
 		sysPrompt = outputstyle.Apply(sysPrompt, st)
 	}
-	// Append the language policy so the model answers in the user's own language
-	// (the UI `language` setting governs only the interface). Static text, so it
-	// stays in the cache-stable prefix and costs nothing per turn.
 	sysPrompt += "\n\n" + config.LanguagePolicy
 
 	// Persistent memory (REASONIX.md / AGENTS.md hierarchy + auto-memory index)
@@ -128,11 +126,14 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if bashSpec.Mode == "enforce" && !sandbox.Available() {
 		fmt.Fprintln(stderr, "warning: bash sandbox requested but unavailable on this platform; running bash unconfined")
 	}
+	if sandbox.ResolveShell().Kind == sandbox.ShellPowerShell {
+		fmt.Fprintln(stderr, "warning: bash not found on PATH; the shell tool will run commands under Windows PowerShell. Install Git for Windows or WSL to use bash.")
+	}
 	addBuiltins(reg, cfg.Tools.Enabled, cfg.WriteRoots(), bashSpec, stderr)
 	// Always construct a host, even with no plugins configured, so the controller's
 	// host pointer is stable for the session and `/mcp add` can hot-add into it.
 	pluginHost := plugin.NewHost()
-	specs := PluginSpecs(cfg.Plugins)
+	specs := PluginSpecs(cfg.AutoStartPlugins())
 	// CodeGraph is a built-in MCP server fetched on first use. When it resolves,
 	// inject it as one more stdio plugin pinned to the project root (it is
 	// cwd-aware); EnsureInit only creates .codegraph/ (fast, size-independent),
@@ -154,7 +155,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			notify := func(msg string) { sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: msg}) }
 			notify("codegraph: fetching code-intelligence runtime in the background (one-time) — symbol-graph tools available next session")
 			go func() {
-				if _, err := codegraph.Install(ctx, nil); err != nil {
+				if _, err := codegraph.Install(context.WithoutCancel(ctx), nil); err != nil {
 					notify("codegraph: install failed (" + err.Error() + ") — using grep/glob; retries next session")
 				} else {
 					notify("codegraph: installed — symbol-graph tools available next session")
@@ -172,16 +173,29 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				specs[i].Stderr = opts.Stderr
 			}
 		}
-		host, ptools, err := plugin.StartAll(ctx, specs)
-		if err != nil {
-			return nil, fmt.Errorf("plugin: %w", err)
-		}
+		host, ptools := plugin.StartAvailable(ctx, specs)
 		pluginHost = host
 		for _, t := range ptools {
 			reg.Add(t)
 		}
+		if text, ok := MCPStartupNotice(host.Failures()); ok {
+			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: text})
+		}
 	}
 	cleanup := pluginHost.Close
+
+	// LSP tools resolve their servers on PATH and spawn lazily on first query, so
+	// registering them is cheap even when no server is installed (a query then
+	// returns an install hint). The manager is session-scoped; chain its shutdown
+	// into the controller's cleanup so servers stop with the session, not the turn.
+	if cfg.LSP.Enabled {
+		lspMgr := lsp.NewManager(cwd, LSPSpecs(cfg.LSP))
+		for _, t := range lsp.Tools(lspMgr) {
+			reg.Add(t)
+		}
+		prev := cleanup
+		cleanup = func() { prev(); lspMgr.Close() }
+	}
 
 	maxSteps := cfg.Agent.MaxSteps
 	if opts.MaxSteps > 0 {
@@ -222,8 +236,10 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		entry.ContextWindow, cfg.Agent.Temperature, config.ArchiveDir(), "", headlessGate))
 
 	// The `remember` tool lets the model persist durable facts to the project's
-	// auto-memory store; the saved index loads into the prefix on the next session.
+	// auto-memory store; `forget` prunes ones that turn out wrong. The saved index
+	// loads into the prefix on the next session.
 	reg.Add(memory.NewRememberTool(mem.Store))
+	reg.Add(memory.NewForgetTool(mem.Store))
 
 	// The `ask` tool puts structured multiple-choice questions to the user. It
 	// reaches them through the Asker on the call context, which interactive
@@ -310,6 +326,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 
 	var runner agent.Runner = executor
 	label := entry.Model
+	var classifier *control.ProviderAutoPlanClassifier
 
 	// Two-model collaboration: a distinct planner_model wraps the executor in a
 	// Coordinator with its own session, kept separate for cache stability.
@@ -328,8 +345,20 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			label = entry.Model + " + planner " + pe.Model
 		}
 	}
+	if !strings.EqualFold(strings.TrimSpace(cfg.Agent.AutoPlan), "off") && cfg.Agent.AutoPlanClassifier != "" {
+		cm := cfg.Agent.AutoPlanClassifier
+		ce, ok := cfg.ResolveModel(cm)
+		if !ok {
+			return nil, fmt.Errorf("auto_plan_classifier %q is not a configured provider", cm)
+		}
+		classifierProv, err := NewProvider(ce)
+		if err != nil {
+			return nil, fmt.Errorf("auto_plan_classifier %q: %w", cm, err)
+		}
+		classifier = control.NewProviderAutoPlanClassifier(classifierProv)
+	}
 
-	return control.New(control.Options{
+	ctrlOpts := control.Options{
 		Runner:        runner,
 		Executor:      executor,
 		Sink:          sink,
@@ -349,7 +378,12 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Registry:      reg,
 		PluginCtx:     ctx,
 		WorkspaceRoot: cwd,
-	}), nil
+		AutoPlan:      cfg.Agent.AutoPlan,
+	}
+	if classifier != nil {
+		ctrlOpts.Classifier = classifier
+	}
+	return control.New(ctrlOpts), nil
 }
 
 func subagentModelRef(cfg *config.Config, sk skill.Skill) string {
@@ -461,6 +495,60 @@ func PluginSpecs(entries []config.PluginEntry) []plugin.Spec {
 			URL:     e.URL,
 			Headers: e.Headers,
 		}
+	}
+	return specs
+}
+
+// MCPStartupNotice formats the warning shown when configured MCP servers failed
+// to connect, naming the first few; ok is false when none failed.
+func MCPStartupNotice(failures []plugin.Failure) (text string, ok bool) {
+	if len(failures) == 0 {
+		return "", false
+	}
+	names := make([]string, 0, min(len(failures), 3))
+	for i, f := range failures {
+		if i >= 3 {
+			break
+		}
+		names = append(names, f.Name)
+	}
+	more := ""
+	if len(failures) > len(names) {
+		more = fmt.Sprintf(" (+%d more)", len(failures)-len(names))
+	}
+	return fmt.Sprintf("%d MCP server(s) failed to start: %s%s — run /mcp for details",
+		len(failures), strings.Join(names, ", "), more), true
+}
+
+// LSPSpecs returns the language → server map: the built-in defaults overlaid with
+// any user overrides. A user entry may set only the fields it wants to change;
+// empty fields keep the default for that language.
+func LSPSpecs(cfg config.LSPConfig) map[string]lsp.ServerSpec {
+	specs := lsp.DefaultSpecs()
+	for lang, s := range cfg.Servers {
+		spec := specs[lang]
+		if s.Command != "" {
+			spec.Command = s.Command
+		}
+		if s.Args != nil {
+			spec.Args = s.Args
+		}
+		if s.Env != nil {
+			spec.Env = s.Env
+		}
+		if s.LanguageID != "" {
+			spec.LanguageID = s.LanguageID
+		}
+		if s.Extensions != nil {
+			spec.Extensions = s.Extensions
+		}
+		if s.InstallHint != "" {
+			spec.InstallHint = s.InstallHint
+		}
+		if spec.LanguageID == "" {
+			spec.LanguageID = lang
+		}
+		specs[lang] = spec
 	}
 	return specs
 }

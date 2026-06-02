@@ -12,6 +12,7 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig := Default()
 	orig.DefaultModel = "mimo-pro"
 	orig.Language = "zh"
+	orig.Agent.AutoPlanClassifier = "deepseek-flash"
 	orig.Agent.SubagentModel = "mimo-pro"
 	orig.Agent.SubagentModels = map[string]string{"review": "deepseek-pro"}
 	orig.Permissions = PermissionsConfig{
@@ -21,7 +22,7 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	orig.Plugins = []PluginEntry{
 		{Name: "example", Command: "reasonix-plugin-example"},
-		{Name: "stripe", Type: "http", URL: "https://mcp.stripe.com", Headers: map[string]string{"Authorization": "Bearer x"}},
+		{Name: "stripe", Type: "http", URL: "https://mcp.stripe.com", Headers: map[string]string{"Authorization": "Bearer x"}, AutoStart: boolPtr(false)},
 	}
 	mm, _ := orig.Provider("mimo-pro")
 	mm.BaseURL = "http://localhost:8000/v1"
@@ -44,6 +45,12 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if got.Agent.Temperature != orig.Agent.Temperature {
 		t.Errorf("temperature = %v, want %v", got.Agent.Temperature, orig.Agent.Temperature)
+	}
+	if got.Agent.AutoPlan != "ask" {
+		t.Errorf("auto_plan = %q, want ask", got.Agent.AutoPlan)
+	}
+	if got.Agent.AutoPlanClassifier != "deepseek-flash" {
+		t.Errorf("auto_plan_classifier = %q, want deepseek-flash", got.Agent.AutoPlanClassifier)
 	}
 	if got.Agent.SystemPrompt != orig.Agent.SystemPrompt {
 		t.Errorf("system_prompt mismatch:\n got %q\nwant %q", got.Agent.SystemPrompt, orig.Agent.SystemPrompt)
@@ -79,4 +86,9 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if stripe.Headers["Authorization"] != "Bearer x" {
 		t.Errorf("plugin headers not preserved: %v", stripe.Headers)
 	}
+	if stripe.AutoStart == nil || *stripe.AutoStart {
+		t.Errorf("auto_start should render and parse as false, got %+v", stripe.AutoStart)
+	}
 }
+
+func boolPtr(v bool) *bool { return &v }

@@ -30,16 +30,24 @@ var English = Messages{
 	ResumeRequiresTTY: "--resume needs an interactive terminal; pass --continue for the most recent session",
 	PickSessionLabel:  "Resume which session?",
 
+	ResumeListHeader:    "sessions (/resume <n> to switch)",
+	ResumeBusy:          "finish or cancel the current turn before resuming",
+	ResumeBadIndexFmt:   "pick a session 1–%d (run /resume to list)",
+	ResumeAlreadyActive: "already in that session",
+	ResumedTitle:        "resumed session",
+
+	ChatThinking:           "thinking…",
+	ChatThoughtForFmt:      "thought for %ds",
 	ChatStatusThinkingFmt:  "%s thinking… (%ds · Esc cancels)",
-	ChatStatusIdle:         "Tab toggles plan · Enter sends · Esc clears/exits state · PgUp/PgDn scrolls · Ctrl-D quits",
+	ChatStatusIdle:         "Tab toggles plan · Ctrl-O toggles verbose thinking · Enter sends · Esc clears/exits state · PgUp/PgDn scrolls · Ctrl-D quits",
 	ChatStatusPlanApproval: "Enter/y approves & executes · n/Esc keeps planning · PgUp/PgDn scrolls",
 	PlanApprovalPrompt:     "Plan ready above — Enter/y to approve & execute, n/Esc to keep planning",
-	ChatStatusToolApproval: "y/1 approve once · a/2 allow this session · n/3 deny · Ctrl-C cancels turn",
+	ChatStatusToolApproval: "1 approve once · 2 allow this session · 3 deny · y/a/n also work · Ctrl-C cancels turn",
 	AskTypeSomething:       "Type something else",
 	AskTypingHint:          "type below, Enter to confirm",
 	AskChatInstead:         "None — just chat",
 	ChatStatusQuestion:     "↑/↓ move · number to pick · space multi · Enter confirm · ←/→ switch · Esc cancel",
-	ToolApprovalPromptFmt:  "Permission required\n\nWill call tool %s%s.\n%s\n[y] allow once    [a] allow this session    [n] deny",
+	ToolApprovalPromptFmt:  "Permission required\n\nWill call tool %s%s.\n%s\n1. Allow once\n2. Allow similar calls this session\n3. Deny\nChoose [1/2/3] (y/a/n also work)",
 	ToolApprovalSourceFmt:  "Source: %s",
 	ToolApprovalBuiltIn:    "built-in tool",
 	ToolApprovalImageUse:   "It will read provided image input for image understanding.",
@@ -61,9 +69,10 @@ var English = Messages{
 	SlashUnavailable:   "command unavailable in this build",
 	SlashUnknown:       "unknown command",
 	SlashTodoCleared:   "task list dismissed",
-	SlashHelp:          "commands: /compact · /new · /rewind · /tree · /branch · /switch · /todo · /model (switch model) · /mcp · /skill · /hooks · /memory · /help · plus skills (/init, /explore, …)",
+	SlashHelp:          "commands: /compact · /new · /resume · /rewind · /tree · /branch · /switch · /todo · /verbose · /model (switch model) · /mcp · /skill · /hooks · /paste-image · /memory · /quit · /help · plus skills (/init, /explore, …)",
 	SlashPromptEmpty:   "the MCP prompt returned no content to send",
 	SlashMCPNone:       "no MCP servers configured — add a [[plugins]] entry in reasonix.toml",
+	CtrlCQuitHint:      "press Ctrl+C again to quit",
 	CompHintSlash:      "↑/↓ move · Tab/Enter select · Esc close",
 	CompHintFile:       "↑/↓ move · Tab/Enter open folder or pick file · Esc close",
 
@@ -73,14 +82,19 @@ var English = Messages{
 	CmdTree:         "show conversation branches",
 	CmdBranch:       "create a conversation branch",
 	CmdSwitchBranch: "switch conversation branch",
+	CmdResume:       "resume a saved session",
 	CmdModel:        "switch model",
 	CmdMemory:       "show memory files",
+	CmdForget:       "delete a saved memory",
 	CmdMcp:          "MCP servers",
 	CmdHooks:        "manage hooks",
+	CmdPasteImage:   "paste clipboard image",
 	CmdOutputStyle:  "list output styles",
 	CmdSkill:        "manage skills",
+	CmdVerbose:      "toggle thinking text",
 	CmdHelp:         "list commands",
 	CmdTodo:         "dismiss the task list",
+	CmdQuit:         "exit the session",
 	ArgSkillList:    "list skills",
 	ArgSkillShow:    "show a skill's body",
 	ArgSkillNew:     "scaffold a new skill",
@@ -128,7 +142,7 @@ var English = Messages{
 	UsageBody: `reasonix — a config- and plugin-driven coding agent (multi-model)
 
 Usage:
-  reasonix chat [--model NAME]                          interactive session (multi-turn)
+  reasonix chat [--model NAME] [-c|--continue] [--resume]   interactive session (multi-turn; -c resumes the latest, --resume picks one)
   reasonix run  [--model NAME] [--max-steps N] <task>   run one task and exit
   reasonix serve [--model NAME] [--addr HOST:PORT]      serve the session over HTTP+SSE (browser client at /)
   reasonix setup [path]                                 interactive config wizard; writes reasonix.toml (+ .env)
@@ -138,6 +152,7 @@ Usage:
 
 Examples:
   reasonix chat
+  reasonix chat --continue
   reasonix run "implement the TODOs in main.go"
   reasonix run --model mimo-pro "add unit tests for this function"
   echo "explain this code" | reasonix run
