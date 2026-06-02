@@ -48,3 +48,4 @@ node_modules/
 Thumbs.db
 .idea/
 .vscode/
+build-windows.txt
