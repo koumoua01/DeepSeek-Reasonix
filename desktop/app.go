@@ -1350,7 +1350,9 @@ func (a *App) SetModel(name string) error {
 	}
 
 	var carried []provider.Message
+	prevPath := ""
 	if ctrl != nil {
+		prevPath = ctrl.SessionPath()
 		_ = ctrl.Snapshot()
 		carried = ctrl.History()
 		ctrl.Close()
@@ -1367,12 +1369,10 @@ func (a *App) SetModel(name string) error {
 	a.mu.Unlock()
 	newCtrl.EnableInteractiveApproval()
 
-	path := ""
-	if dir := newCtrl.SessionDir(); dir != "" {
-		path = agent.NewSessionPath(dir, newCtrl.Label())
-	}
 	// Carry the prior conversation (full provider.Message log, incl. the system
-	// prompt) into the new session so history is preserved across the switch.
+	// prompt) into the new session so history is preserved across the switch, and
+	// keep it in its existing file so the switch doesn't orphan a duplicate (#2807).
+	path := agent.ContinueSessionPath(prevPath, newCtrl.SessionDir(), newCtrl.Label())
 	if len(carried) > 0 {
 		newCtrl.Resume(&agent.Session{Messages: carried}, path)
 	} else if path != "" {
@@ -1724,6 +1724,67 @@ func (a *App) SavePastedFile(name, dataURL string) (string, error) {
 // AttachmentDataURL returns a safe data URL for a stored image attachment.
 func (a *App) AttachmentDataURL(path string) (string, error) {
 	return control.ImageDataURL(path)
+}
+
+// DroppedItem is one OS-dropped file resolved into a composer context entry: an
+// in-tree file becomes a workspace @reference (read in place, no copy), while an
+// image or out-of-tree file is copied into .reasonix/attachments.
+type DroppedItem struct {
+	Kind       string `json:"kind"` // "workspace" | "attachment"
+	Path       string `json:"path"`
+	IsDir      bool   `json:"isDir,omitempty"`
+	PreviewURL string `json:"previewUrl,omitempty"`
+}
+
+// AttachDropped turns an absolute path from the native file-drop bridge into a
+// composer context entry. Images are stored as attachments so the chip shows a
+// thumbnail; other in-workspace files are referenced relatively (no copy); files
+// outside the workspace are copied into .reasonix/attachments.
+func (a *App) AttachDropped(path string) (DroppedItem, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return DroppedItem{}, err
+	}
+	if isImageExt(path) {
+		if rel, err := control.SaveImageFile(path); err == nil {
+			preview, _ := control.ImageDataURL(rel)
+			return DroppedItem{Kind: "attachment", Path: rel, PreviewURL: preview}, nil
+		}
+	}
+	if rel, ok := workspaceRelative(path); ok {
+		return DroppedItem{Kind: "workspace", Path: rel, IsDir: info.IsDir()}, nil
+	}
+	if info.IsDir() {
+		return DroppedItem{}, fmt.Errorf("can only attach files from outside the workspace")
+	}
+	rel, err := control.SaveAttachmentFile(path)
+	if err != nil {
+		return DroppedItem{}, err
+	}
+	return DroppedItem{Kind: "attachment", Path: rel}, nil
+}
+
+func isImageExt(path string) bool {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".png", ".jpg", ".jpeg", ".gif", ".webp":
+		return true
+	}
+	return false
+}
+
+func workspaceRelative(path string) (string, bool) {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(cwd, path)
+	if err != nil {
+		return "", false
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return filepath.ToSlash(rel), true
 }
 
 // --- memory panel (frontend ⇄ controller) ---

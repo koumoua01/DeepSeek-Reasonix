@@ -184,6 +184,7 @@ export const zh: Record<DictKey, string> = {
   "status.cache": "缓存 {pct}%",
   "status.cacheAvg": "平均 {pct}%",
   "status.balanceTitle": "钱包余额",
+  "status.spendTitle": "本会话花费",
   "status.jobs": "{n} 个运行中",
   "status.jobsTitle": "后台作业",
   "status.yolo": "YOLO",
@@ -205,6 +206,12 @@ export const zh: Record<DictKey, string> = {
   "approval.allowSession": "本会话内允许",
 
   // 提问卡片
+  "ask.title": "需要你决定",
+  "ask.questionProgress": "问题 {progress}",
+  "ask.details": "详情",
+  "ask.hideDetails": "收起",
+  "ask.back": "返回",
+  "ask.next": "下一步",
   "ask.customPlaceholder": "输入你自己的答案…",
   "ask.justChat": "只是聊聊",
 

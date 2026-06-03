@@ -12,6 +12,7 @@ import type {
   CommandInfo,
   ContextInfo,
   DirEntry,
+  DroppedItem,
   EffortInfo,
   FilePreview,
   HistoryMessage,
@@ -98,6 +99,9 @@ export interface AppBindings {
   RevealWorkspacePath(rel: string): Promise<void>;
   SavePastedImage(dataUrl: string): Promise<string>;
   SavePastedFile(name: string, dataUrl: string): Promise<string>;
+  // AttachDropped resolves an OS-dropped absolute path (from the native file-drop
+  // bridge) into a composer context entry — a workspace ref or a stored attachment.
+  AttachDropped(path: string): Promise<DroppedItem>;
   AttachmentDataURL(path: string): Promise<string>;
   Models(): Promise<ModelInfo[]>;
   SetModel(name: string): Promise<void>;
@@ -143,6 +147,10 @@ export interface AppBindings {
 interface WailsRuntime {
   EventsOn(name: string, cb: (...data: unknown[]) => void): () => void;
   BrowserOpenURL(url: string): void;
+  // Native OS file drop (desktop only); useDropTarget gates delivery to elements
+  // carrying the --wails-drop-target CSS property. Absent in the browser dev mock.
+  OnFileDrop?(cb: (x: number, y: number, paths: string[]) => void, useDropTarget: boolean): void;
+  OnFileDropOff?(): void;
 }
 
 declare global {
@@ -188,6 +196,18 @@ export function onUpdaterProgress(cb: (p: UpdateProgress) => void): () => void {
   return () => {
     updaterListeners.delete(cb);
   };
+}
+
+// onFilesDropped subscribes to native OS file drops landing on the composer (the
+// --wails-drop-target element); the callback gets the dropped files' absolute
+// paths. No-op in the browser dev mock, where the runtime is absent.
+export function onFilesDropped(cb: (paths: string[]) => void): () => void {
+  const rt = typeof window !== "undefined" ? window.runtime : undefined;
+  if (!rt?.OnFileDrop) return () => {};
+  rt.OnFileDrop((_x, _y, paths) => {
+    if (Array.isArray(paths) && paths.length > 0) cb(paths);
+  }, true);
+  return () => rt.OnFileDropOff?.();
 }
 
 // onReady subscribes to the agent:ready event fired when boot.Build completes.
@@ -251,6 +271,8 @@ function delay(ms: number): Promise<void> {
 
 function makeMockApp(): AppBindings {
   let cancelled = false;
+  let pendingAskPreview = false;
+  let pendingApprovalPreview = false;
   let cwd = "~/projects/reasonix"; // mutable so PickWorkspace is visible in dev
   let workspaces = ["~/projects/reasonix", "~/projects/blade", "~/projects/deepseek-forge", "~/projects/cc-switch-light", "~/projects/SuperRig"];
   let mockEffort = "auto";
@@ -323,6 +345,73 @@ function makeMockApp(): AppBindings {
     async Submit(input) {
       cancelled = false;
       emit({ kind: "turn_started" });
+      const trimmedInput = input.trim().toLowerCase();
+      if (trimmedInput === "/approve-preview" || trimmedInput === "approve preview" || trimmedInput === "approve预览") {
+        pendingApprovalPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-approval-preview",
+            tool: "bash",
+            subject: "npm run build\n\n需要运行构建命令来验证前端产物和样式打包是否正常。",
+          },
+        });
+        return;
+      }
+      if (
+        trimmedInput === "/plan-approve-preview" ||
+        trimmedInput === "plan approve preview" ||
+        trimmedInput === "plan approve预览"
+      ) {
+        pendingApprovalPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "approval_request",
+          approval: {
+            id: "mock-plan-approval-preview",
+            tool: "exit_plan_mode",
+            subject: "",
+          },
+        });
+        return;
+      }
+      if (trimmedInput === "/ask-preview" || trimmedInput === "ask preview" || trimmedInput === "ask预览") {
+        pendingAskPreview = true;
+        await delay(250);
+        if (cancelled) return;
+        emit({
+          kind: "ask_request",
+          ask: {
+            id: "mock-ask-preview",
+            questions: [
+              {
+                id: "q1",
+                header: "处理方向",
+                prompt: "git pull 的冲突你想怎么处理？",
+                options: [
+                  { label: "git stash 后 pull", description: "用 git stash 暂存本地修改，拉取最新代码后再恢复" },
+                  { label: "丢弃本地修改后 pull", description: "放弃本地所有修改，强制与远端同步" },
+                  { label: "另建分支保存改动", description: "先创建分支把本地改动保存起来，再拉取主分支" },
+                ],
+              },
+              {
+                id: "q2",
+                header: "Reasonix 构建",
+                prompt: "对于 reasonix 二进制缺失的问题，你想怎么做？",
+                options: [
+                  { label: "先查文档", description: "查看 README / 构建文档来确定正确的构建命令" },
+                  { label: "看构建配置", description: "查看 desktop/wails.json 与 main.go 来推断入口" },
+                  { label: "我先帮你尝试构建", description: "先处理 git 冲突，然后尝试本地构建并汇报结果" },
+                ],
+              },
+            ],
+          },
+        });
+        return;
+      }
       // Simulate the server's pre-first-token latency so the deferred user bubble
       // and the "un-send on Esc before any reply" path are observable in browser
       // dev. Bail if cancelled during the wait — nothing was streamed yet.
@@ -374,8 +463,24 @@ function makeMockApp(): AppBindings {
       cancelled = true;
       emit({ kind: "turn_done" });
     },
-    async Approve() {},
-    async AnswerQuestion() {},
+    async Approve(_id, allow, session) {
+      if (!pendingApprovalPreview) return;
+      pendingApprovalPreview = false;
+      emit({
+        kind: "message",
+        text: `approval preview answered: ${allow ? (session ? "allowed for session" : "allowed once") : "denied"}`,
+      });
+      emit({ kind: "turn_done" });
+    },
+    async AnswerQuestion(_id, answers) {
+      if (!pendingAskPreview) return;
+      pendingAskPreview = false;
+      const summary = answers
+        .map((answer) => `${answer.questionId}: ${(answer.selected ?? []).join(", ") || "(no answer)"}`)
+        .join("\n");
+      emit({ kind: "message", text: `ask preview answered:\n\n${summary}` });
+      emit({ kind: "turn_done" });
+    },
     async SetPlanMode() {},
     async Compact() {},
     async NewSession() {},
@@ -618,6 +723,10 @@ function makeMockApp(): AppBindings {
     },
     async SavePastedFile(name: string, _dataUrl: string) {
       return `.reasonix/attachments/mock-${name}`;
+    },
+    async AttachDropped(path: string) {
+      const name = path.split(/[/\\]/).filter(Boolean).pop() ?? path;
+      return { kind: "attachment" as const, path: `.reasonix/attachments/mock-${name}` };
     },
     async AttachmentDataURL(_path: string) {
       return "data:image/png;base64,iVBORw0KGgo=";
