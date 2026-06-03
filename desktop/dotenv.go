@@ -2,18 +2,24 @@ package main
 
 import (
 	"os"
+	"path/filepath"
 	"strings"
 
 	"reasonix/internal/fileutil"
 )
 
-// dotEnvPath is the project-root .env the kernel reads keys from (config.loadDotEnv
-// opens "./.env"). The settings panel writes secrets here so api_key_env resolves.
-const dotEnvPath = ".env"
+// dotEnvPath is ~/.env (absolute, so a workspace switch — which changes cwd —
+// can't scatter or lose the key).
+var dotEnvPath = func() string {
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".env")
+	}
+	return ".env" // fallback: relative to cwd if home is unavailable
+}()
 
-// upsertDotEnv sets KEY=value in ./.env (replacing an existing KEY line, else
-// appending), and applies it to the running process so a rebuild picks it up
-// without a restart. Comments and unrelated lines are preserved.
+// upsertDotEnv sets KEY=value in the home-directory .env (replacing an existing
+// KEY line, else appending), and applies it to the running process so a rebuild
+// picks it up without a restart. Comments and unrelated lines are preserved.
 func upsertDotEnv(key, value string) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
@@ -40,7 +46,7 @@ func upsertDotEnv(key, value string) error {
 	}
 	out := strings.Join(lines, "\n") + "\n"
 
-	tmp, err := os.CreateTemp(".", ".env.*.tmp")
+	tmp, err := os.CreateTemp(filepath.Dir(dotEnvPath), ".env.*.tmp")
 	if err != nil {
 		return err
 	}

@@ -142,8 +142,7 @@ export default function App() {
     cancel,
     approve,
     answerQuestion,
-    setPlan,
-    setBypass,
+    setControllerMode,
     newSession,
     listSessions,
     resumeSession,
@@ -200,16 +199,17 @@ export default function App() {
     [effectiveSidebarWidth, viewportWidth, workspaceFileTreePanelWidth, workspacePanelWidth, workspacePreviewModeActive],
   );
 
+  const syncModeToController = useCallback((m: Mode) => setControllerMode(m), [setControllerMode]);
+
   // applyMode is the single source of truth for the input mode: it updates the
   // local pill and pushes the matching gate state to the controller (plan = read
   // only; yolo = auto-approve every tool call). normal clears both.
   const applyMode = useCallback(
     (m: Mode) => {
       setMode(m);
-      setPlan(m === "plan");
-      setBypass(m === "yolo");
+      void syncModeToController(m);
     },
-    [setPlan, setBypass],
+    [syncModeToController],
   );
   // Shift+Tab cycles normal → plan → yolo → normal.
   const cycleMode = useCallback(() => {
@@ -222,11 +222,19 @@ export default function App() {
   const switchModel = useCallback(
     async (name: string) => {
       await setModel(name);
-      if (mode === "plan") setPlan(true);
-      else if (mode === "yolo") setBypass(true);
+      await syncModeToController(mode);
     },
-    [setModel, mode, setPlan, setBypass],
+    [setModel, mode, syncModeToController],
   );
+
+  // Startup and workspace/model rebuilds create a fresh controller in normal
+  // mode. Re-apply the UI mode once the controller is ready, including the case
+  // where the user picked YOLO while boot was still loading and SetBypass was a
+  // harmless no-op.
+  useEffect(() => {
+    if (state.meta?.ready !== true || mode === "normal") return;
+    void syncModeToController(mode);
+  }, [state.meta, mode, syncModeToController]);
 
   // The live task list pinned above the composer comes from the most recent
   // top-level todo_write call; it stays visible while work remains, clears itself
@@ -277,7 +285,7 @@ export default function App() {
   // (/skill, /hooks, /mcp) — goes straight to Submit, which the controller
   // resolves (a turn, or a listing Notice).
   const handleSend = useCallback(
-    (displayText: string, submitText = displayText) => {
+    async (displayText: string, submitText = displayText) => {
       const trimmed = displayText.trim();
       const model = /^\/model\s+(\S+)$/.exec(trimmed);
       if (model) {
@@ -312,9 +320,10 @@ export default function App() {
         notice(t("settings.themeUnknown", { name: arg }), "warn");
         return;
       }
+      await syncModeToController(mode);
       send(trimmed, submitText.trim());
     },
-    [switchModel, openMemory, send, notice, t],
+    [switchModel, openMemory, syncModeToController, mode, send, notice, t],
   );
 
   const addToChat = useCallback((text: string) => {
@@ -937,8 +946,7 @@ export default function App() {
                   approve(state.approval!.id, false, false);
                 }}
                 onExitPlan={() => {
-                  setMode("normal");
-                  setPlan(false);
+                  applyMode("normal");
                   approve(state.approval!.id, false, false);
                 }}
               />

@@ -586,13 +586,16 @@ export function useController() {
     app.AnswerQuestion(id, answers).catch(() => {});
   }, []);
 
-  const setPlan = useCallback((on: boolean) => {
-    app.SetPlanMode(on).catch(() => {});
-  }, []);
-
-  // setBypass toggles YOLO mode (auto-approve every tool call this session).
-  const setBypass = useCallback((on: boolean) => {
-    app.SetBypass(on).catch(() => {});
+  // setControllerMode pushes plan/yolo/normal to the kernel in one atomic call —
+  // the composer's single seam for gating, so it never sequences SetPlanMode +
+  // SetBypass and can't leave the backend in a half-applied mode.
+  const setControllerMode = useCallback((mode: "plan" | "yolo" | "normal"): Promise<void> => {
+    return app
+      .SetMode(mode)
+      .then(() => {
+        if (mode === "yolo") dispatch({ type: "clearApproval" });
+      })
+      .catch(() => {});
   }, []);
 
   const newSession = useCallback(async () => {
@@ -746,8 +749,7 @@ export function useController() {
     cancel,
     approve,
     answerQuestion,
-    setPlan,
-    setBypass,
+    setControllerMode,
     newSession,
     listSessions,
     resumeSession,
