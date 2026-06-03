@@ -2,13 +2,24 @@ import { useEffect, useState } from "react";
 import { app } from "../lib/bridge";
 import { useI18n, useT } from "../lib/i18n";
 import { useUpdater } from "../lib/useUpdater";
-import { applyTheme, getTheme, type Theme } from "../lib/theme";
-import type { ProviderView, SettingsView } from "../lib/types";
+import {
+  THEME_STYLES,
+  applyTheme,
+  defaultStyleForTheme,
+  getResolvedTheme,
+  getTheme,
+  getThemeStyle,
+  themeForStyle,
+  type Theme,
+  type ThemeStyle,
+} from "../lib/theme";
+import type { NetworkView, ProviderView, SettingsView } from "../lib/types";
 import { ResizableDrawer } from "./ResizableDrawer";
+import { Tooltip } from "./Tooltip";
 
-type SettingsTab = "models" | "providers" | "permissions" | "sandbox" | "agent" | "appearance" | "updates";
+type SettingsTab = "models" | "providers" | "network" | "permissions" | "sandbox" | "agent" | "appearance" | "updates";
 
-const SETTINGS_TABS: SettingsTab[] = ["models", "providers", "permissions", "sandbox", "agent", "appearance", "updates"];
+const SETTINGS_TABS: SettingsTab[] = ["models", "providers", "network", "permissions", "sandbox", "agent", "appearance", "updates"];
 
 // SettingsPanel is the desktop settings surface, aligning with Claude Code's
 // settings: model & providers (incl. API keys), permissions, sandbox, agent
@@ -20,6 +31,7 @@ export function SettingsPanel({ onClose, onChanged }: { onClose: () => void; onC
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [theme, setThemeState] = useState<Theme>(getTheme());
+  const [themeStyle, setThemeStyleState] = useState<ThemeStyle>(() => getThemeStyle(getTheme()));
   const [tab, setTab] = useState<SettingsTab>("models");
 
   const reload = async () => setS(await app.Settings().catch(() => null));
@@ -47,9 +59,11 @@ export function SettingsPanel({ onClose, onChanged }: { onClose: () => void; onC
     <ResizableDrawer onClose={onClose} wide>
         <header className="drawer__head">
           <div className="drawer__title">{t("settings.title")}</div>
-          <button className="chip" onClick={onClose} title={t("common.close")}>
-            ✕
-          </button>
+          <Tooltip label={t("common.close")}>
+            <button className="chip" onClick={onClose}>
+              ✕
+            </button>
+          </Tooltip>
         </header>
 
         {!s ? (
@@ -73,15 +87,25 @@ export function SettingsPanel({ onClose, onChanged }: { onClose: () => void; onC
                 {err && <div className="banner banner--error">{err}</div>}
                 {tab === "models" && <ModelsSection s={s} busy={busy} apply={apply} onManageProviders={() => setTab("providers")} />}
                 {tab === "providers" && <ProvidersSection s={s} busy={busy} apply={apply} />}
+                {tab === "network" && <NetworkSection s={s} busy={busy} apply={apply} />}
                 {tab === "permissions" && <PermissionsSection s={s} busy={busy} apply={apply} />}
                 {tab === "sandbox" && <SandboxSection s={s} busy={busy} apply={apply} />}
                 {tab === "agent" && <AgentSection s={s} busy={busy} apply={apply} />}
                 {tab === "appearance" && (
                   <AppearanceSection
                     theme={theme}
+                    themeStyle={themeStyle}
                     onTheme={(t) => {
-                      applyTheme(t);
+                      const nextStyle = themeForStyle(themeStyle) === getResolvedTheme(t) ? themeStyle : defaultStyleForTheme(t);
+                      applyTheme(t, nextStyle);
                       setThemeState(t);
+                      setThemeStyleState(nextStyle);
+                    }}
+                    onThemeStyle={(style) => {
+                      const nextTheme = themeForStyle(style);
+                      applyTheme(nextTheme, style);
+                      setThemeState(nextTheme);
+                      setThemeStyleState(style);
                     }}
                   />
                 )}
@@ -106,6 +130,8 @@ function settingsTabLabel(id: SettingsTab, t: ReturnType<typeof useT>): string {
       return t("settings.tab.models");
     case "providers":
       return t("settings.tab.providers");
+    case "network":
+      return t("settings.tab.network");
     case "permissions":
       return t("settings.tab.permissions");
     case "sandbox":
@@ -125,6 +151,8 @@ function settingsTabMeta(id: SettingsTab, s: SettingsView, t: ReturnType<typeof 
       return toRef(s.defaultModel, s) || t("common.none");
     case "providers":
       return t("settings.providerCount", { n: s.providers.length });
+    case "network":
+      return proxyModeLabel(normalizeProxyMode(s.network.proxyMode), t);
     case "permissions":
       return s.permissions.mode;
     case "sandbox":
@@ -155,6 +183,147 @@ function toRef(model: string, s: SettingsView): string {
   const byModel = s.providers.find((p) => p.models.includes(model));
   if (byModel) return `${byModel.name}/${model}`;
   return model;
+}
+
+const PROXY_MODES = ["auto", "custom", "off"] as const;
+const PROXY_TYPES = ["http", "https", "socks5", "socks5h"] as const;
+
+type ProxyMode = (typeof PROXY_MODES)[number];
+
+function normalizeProxyMode(mode: string): ProxyMode {
+  switch (mode) {
+    case "custom":
+      return "custom";
+    case "off":
+      return "off";
+    default:
+      return "auto";
+  }
+}
+
+function normalizeNetworkView(network: NetworkView): NetworkView {
+  return { ...network, proxyMode: normalizeProxyMode(network.proxyMode) };
+}
+
+function NetworkSection({ s, busy, apply }: SectionProps) {
+  const t = useT();
+  const savedNetwork = normalizeNetworkView(s.network);
+  const [draft, setDraft] = useState<NetworkView>(savedNetwork);
+  useEffect(() => setDraft(normalizeNetworkView(s.network)), [s.network]);
+  const dirty = JSON.stringify(draft) !== JSON.stringify(savedNetwork);
+  const setProxy = (next: Partial<NetworkView["proxy"]>) => {
+    setDraft({ ...draft, proxy: { ...draft.proxy, ...next } });
+  };
+
+  return (
+    <section className="mem-section">
+      <div className="mem-section__title">{t("settings.tab.network")}</div>
+      <div className="set-row">
+        <label className="set-label">{t("settings.proxyMode")}</label>
+        <div className="set-seg">
+          {PROXY_MODES.map((mode) => (
+            <button
+              key={mode}
+              className={`set-seg__btn${draft.proxyMode === mode ? " set-seg__btn--on" : ""}`}
+              disabled={busy}
+              onClick={() => setDraft({ ...draft, proxyMode: mode })}
+            >
+              {proxyModeLabel(mode, t)}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {draft.proxyMode === "custom" && (
+        <>
+          <div className="set-row">
+            <label className="set-label">{t("settings.proxyType")}</label>
+            <div className="set-seg">
+              {PROXY_TYPES.map((typ) => (
+                <button
+                  key={typ}
+                  className={`set-seg__btn${draft.proxy.type === typ ? " set-seg__btn--on" : ""}`}
+                  disabled={busy}
+                  onClick={() => setProxy({ type: typ })}
+                >
+                  {typ.toUpperCase()}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="set-row">
+            <label className="set-label">{t("settings.proxyServer")}</label>
+            <input
+              className="mem-input set-grow"
+              placeholder="127.0.0.1"
+              value={draft.proxy.server}
+              disabled={busy || !!draft.proxyUrl.trim()}
+              onChange={(e) => setProxy({ server: e.target.value })}
+            />
+            <label className="set-label">{t("settings.proxyPort")}</label>
+            <input
+              className="mem-input set-narrow"
+              placeholder="7890"
+              value={draft.proxy.port ? String(draft.proxy.port) : ""}
+              disabled={busy || !!draft.proxyUrl.trim()}
+              inputMode="numeric"
+              onChange={(e) => setProxy({ port: Number(e.target.value) || 0 })}
+            />
+          </div>
+          <div className="set-row">
+            <label className="set-label">{t("settings.proxyUsername")}</label>
+            <input
+              className="mem-input set-grow"
+              value={draft.proxy.username}
+              disabled={busy || !!draft.proxyUrl.trim()}
+              onChange={(e) => setProxy({ username: e.target.value })}
+            />
+            <label className="set-label">{t("settings.proxyPassword")}</label>
+            <input
+              className="mem-input set-grow"
+              type="password"
+              value={draft.proxy.password}
+              disabled={busy || !!draft.proxyUrl.trim()}
+              onChange={(e) => setProxy({ password: e.target.value })}
+            />
+          </div>
+          <div className="set-field">
+            <div className="set-row">
+              <label className="set-label">{t("settings.proxyUrl")}</label>
+              <input
+                className="mem-input set-grow"
+                placeholder="socks5://127.0.0.1:7890"
+                value={draft.proxyUrl}
+                disabled={busy}
+                onChange={(e) => setDraft({ ...draft, proxyUrl: e.target.value })}
+              />
+            </div>
+            <div className="mem-hint set-hint">{t("settings.proxyUrlHint")}</div>
+          </div>
+          <div className="set-row">
+            <label className="set-label">{t("settings.noProxy")}</label>
+            <input
+              className="mem-input set-grow"
+              placeholder="localhost,127.0.0.1,.local"
+              value={draft.noProxy}
+              disabled={busy}
+              onChange={(e) => setDraft({ ...draft, noProxy: e.target.value })}
+            />
+          </div>
+        </>
+      )}
+
+      <div className="prov-card__actions">
+        <button
+          className="btn btn--primary btn--small"
+          disabled={busy || !dirty}
+          onClick={() => void apply(() => app.SetNetwork(draft))}
+        >
+          {t("settings.saveNetwork")}
+        </button>
+      </div>
+    </section>
+  );
 }
 
 function ModelsSection({ s, busy, apply, onManageProviders }: SectionProps & { onManageProviders: () => void }) {
@@ -233,6 +402,17 @@ function ModelsSection({ s, busy, apply, onManageProviders }: SectionProps & { o
   );
 }
 
+function proxyModeLabel(mode: ProxyMode, t: ReturnType<typeof useT>): string {
+  switch (mode) {
+    case "auto":
+      return t("settings.proxyMode.auto");
+    case "custom":
+      return t("settings.proxyMode.custom");
+    case "off":
+      return t("settings.proxyMode.off");
+  }
+}
+
 function ProvidersSection({ s, busy, apply }: SectionProps) {
   const t = useT();
   // The provider backing the default model — can't be deleted (would dangle the
@@ -273,14 +453,15 @@ function ProvidersSection({ s, busy, apply }: SectionProps) {
                 <button className="btn btn--small" disabled={busy} onClick={() => setEditing(p.name)}>
                   {t("common.edit")}
                 </button>
-                <button
-                  className="btn btn--small"
-                  disabled={busy || defaultProvider === p.name}
-                  title={defaultProvider === p.name ? t("settings.cantDeleteDefault") : t("settings.deleteProvider")}
-                  onClick={() => void apply(() => app.DeleteProvider(p.name))}
-                >
-                  {t("common.delete")}
-                </button>
+                <Tooltip label={defaultProvider === p.name ? t("settings.cantDeleteDefault") : t("settings.deleteProvider")}>
+                  <button
+                    className="btn btn--small"
+                    disabled={busy || defaultProvider === p.name}
+                    onClick={() => void apply(() => app.DeleteProvider(p.name))}
+                  >
+                    {t("common.delete")}
+                  </button>
+                </Tooltip>
               </div>
               <div className="prov-card__meta">
                 <span>{p.kind}</span>
@@ -475,9 +656,11 @@ function RuleList({
         {rules.map((r) => (
           <span className="set-rule" key={r}>
             {r}
-            <button className="set-rule__x" disabled={busy} onClick={() => void onRemove(r)} title={t("common.delete")}>
-              ✕
-            </button>
+            <Tooltip label={t("common.delete")}>
+              <button className="set-rule__x" disabled={busy} onClick={() => void onRemove(r)}>
+                ✕
+              </button>
+            </Tooltip>
           </span>
         ))}
       </div>
@@ -574,7 +757,17 @@ function AgentSection({ s, busy, apply }: SectionProps) {
   );
 }
 
-function AppearanceSection({ theme, onTheme }: { theme: Theme; onTheme: (t: Theme) => void }) {
+function AppearanceSection({
+  theme,
+  themeStyle,
+  onTheme,
+  onThemeStyle,
+}: {
+  theme: Theme;
+  themeStyle: ThemeStyle;
+  onTheme: (t: Theme) => void;
+  onThemeStyle: (style: ThemeStyle) => void;
+}) {
   const { t, pref, setPref } = useI18n();
   const themeOptions: Theme[] = ["auto", "light", "dark"];
   return (
@@ -590,6 +783,21 @@ function AppearanceSection({ theme, onTheme }: { theme: Theme; onTheme: (t: Them
               onClick={() => onTheme(opt)}
             >
               {themeName(opt, t)}
+            </button>
+          ))}
+        </div>
+      </div>
+      <div className="set-row set-row--stack">
+        <label className="set-label">{t("settings.themeStyle")}</label>
+        <div className="theme-style-grid">
+          {THEME_STYLES.map((opt) => (
+            <button
+              key={opt}
+              className={`theme-style-btn${themeStyle === opt ? " theme-style-btn--on" : ""}`}
+              onClick={() => onThemeStyle(opt)}
+            >
+              <span className="theme-style-swatch" data-theme-style-swatch={opt} />
+              <span>{opt}</span>
             </button>
           ))}
         </div>
@@ -671,9 +879,9 @@ function UpdatesSection({ configPath }: { configPath: string }) {
       {status.kind === "done" && <div className="mem-hint">{t("updater.done")}</div>}
       {status.kind === "error" && <div className="banner banner--error">{t("updater.failed", { msg: status.message })}</div>}
       {configPath && (
-        <div className="mem-hint settings-config-path" title={configPath}>
+        <Tooltip label={configPath} fill block className="mem-hint settings-config-path">
           {t("settings.config", { path: configPath })}
-        </div>
+        </Tooltip>
       )}
     </section>
   );

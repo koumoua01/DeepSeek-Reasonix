@@ -1,11 +1,13 @@
 package main
 
 import (
-	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/text/encoding/simplifiedchinese"
 )
 
 // --- workspaceStatePath ---
@@ -110,7 +112,7 @@ func TestReadFileTrimsPartialUTF8RuneAtPreviewBoundary(t *testing.T) {
 	}
 }
 
-func TestReadFileKeepsInvalidUTF8Binary(t *testing.T) {
+func TestReadFilePreviewBinaryClassification(t *testing.T) {
 	orig, _ := os.Getwd()
 	defer os.Chdir(orig)
 
@@ -119,17 +121,52 @@ func TestReadFileKeepsInvalidUTF8Binary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	data := append(bytes.Repeat([]byte("a"), filePreviewLimit-1), 0xff, 'x', 'y')
-	if err := os.WriteFile("invalid.txt", data, 0o644); err != nil {
+	// NUL is the binary signal, matching the CLI read_file tool once GB18030
+	// decoding meant invalid UTF-8 alone no longer implies binary.
+	if err := os.WriteFile("binary.bin", append([]byte("data"), 0x00, 0x01, 0x02), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if p := (&App{}).ReadFile("binary.bin"); !p.Binary {
+		t.Errorf("NUL-containing file should be binary, got Body=%q", p.Body)
+	}
+
+	// Invalid UTF-8 without a NUL is decoded leniently and shown as text, with
+	// U+FFFD where bytes don't map — not hidden behind a binary classification.
+	if err := os.WriteFile("invalid.txt", append([]byte("hello"), 0xff, 'x', 'y'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	p := (&App{}).ReadFile("invalid.txt")
+	if p.Binary {
+		t.Error("invalid-but-NUL-free file should render as lossy text, not binary")
+	}
+	if !strings.ContainsRune(p.Body, '�') {
+		t.Errorf("lossy decode should mark undecodable bytes with U+FFFD, got %q", p.Body)
+	}
+}
+
+func TestReadFileGB18030(t *testing.T) {
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
 		t.Fatal(err)
 	}
 
-	preview := (&App{}).ReadFile("invalid.txt")
+	gb, _ := simplifiedchinese.GB18030.NewEncoder().String("你好世界")
+	if err := os.WriteFile("gbk.txt", []byte(gb), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	preview := (&App{}).ReadFile("gbk.txt")
 	if preview.Err != "" {
 		t.Fatalf("ReadFile err = %q", preview.Err)
 	}
-	if !preview.Binary {
-		t.Fatal("ReadFile should keep invalid UTF-8 preview classified as binary")
+	if preview.Binary {
+		t.Fatal("ReadFile should decode GB18030, not mark as binary")
+	}
+	if !strings.Contains(preview.Body, "你好世界") {
+		t.Errorf("expected decoded Chinese text, got %q", preview.Body)
 	}
 }
 
@@ -144,6 +181,175 @@ func TestWindowsOpenWorkspacePathAvoidsCmdShell(t *testing.T) {
 	}
 	if strings.Contains(body, "cmd") || strings.Contains(body, "/c") {
 		t.Fatal("Windows workspace opener must not route paths through cmd.exe")
+	}
+}
+
+func TestParseGitStatusPorcelainZ(t *testing.T) {
+	raw := []byte(" M changed.go\x00?? new.txt\x00R  renamed.go\x00old.go\x00")
+	got := parseGitStatusPorcelainZ(raw)
+	if len(got) != 3 {
+		t.Fatalf("entries = %d, want 3: %+v", len(got), got)
+	}
+	if got[0].Path != "changed.go" || got[0].Status != "M" {
+		t.Fatalf("modified entry = %+v", got[0])
+	}
+	if got[1].Path != "new.txt" || got[1].Status != "??" {
+		t.Fatalf("untracked entry = %+v", got[1])
+	}
+	if got[2].Path != "renamed.go" || got[2].OldPath != "old.go" || got[2].Status != "R" {
+		t.Fatalf("rename entry = %+v", got[2])
+	}
+}
+
+func TestWorkspaceChangesNonGitDirectory(t *testing.T) {
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	got := (&App{}).WorkspaceChanges()
+	if got.GitAvailable {
+		t.Fatal("non-git directory should mark git unavailable")
+	}
+	if len(got.Files) != 0 {
+		t.Fatalf("files = %+v, want none", got.Files)
+	}
+}
+
+func TestWorkspaceChangesGitStatus(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "init")
+	if err := os.WriteFile("tracked.txt", []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "add", "tracked.txt")
+	if err := os.WriteFile("tracked.txt", []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("untracked.txt", []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := (&App{}).WorkspaceChanges()
+	if !got.GitAvailable {
+		t.Fatalf("git unavailable: %s", got.GitErr)
+	}
+	byPath := map[string]WorkspaceChangeView{}
+	for _, file := range got.Files {
+		byPath[file.Path] = file
+	}
+	if byPath["tracked.txt"].GitStatus == "" {
+		t.Fatalf("tracked.txt missing git status: %+v", got.Files)
+	}
+	if byPath["untracked.txt"].GitStatus != "??" {
+		t.Fatalf("untracked.txt = %+v", byPath["untracked.txt"])
+	}
+}
+
+func TestWorkspaceChangesGitStatusFromRepoSubdirectory(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	repo := t.TempDir()
+	if err := os.Chdir(repo); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "init")
+	if err := os.MkdirAll("sub", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("sub", "tracked.txt"), []byte("v1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "add", filepath.Join("sub", "tracked.txt"))
+	if err := os.WriteFile(filepath.Join("sub", "tracked.txt"), []byte("v2\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("sub", "untracked.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile("outside.txt", []byte("outside\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(filepath.Join(repo, "sub")); err != nil {
+		t.Fatal(err)
+	}
+
+	got := (&App{}).WorkspaceChanges()
+	if !got.GitAvailable {
+		t.Fatalf("git unavailable: %s", got.GitErr)
+	}
+	byPath := map[string]WorkspaceChangeView{}
+	for _, file := range got.Files {
+		byPath[file.Path] = file
+	}
+	if byPath["tracked.txt"].GitStatus == "" {
+		t.Fatalf("tracked.txt missing git status: %+v", got.Files)
+	}
+	if byPath["untracked.txt"].GitStatus != "??" {
+		t.Fatalf("untracked.txt = %+v", byPath["untracked.txt"])
+	}
+	if _, ok := byPath["sub/tracked.txt"]; ok {
+		t.Fatalf("git status path should be workspace-relative, got %+v", got.Files)
+	}
+	if _, ok := byPath["outside.txt"]; ok {
+		t.Fatalf("changes outside the opened workspace should be hidden: %+v", got.Files)
+	}
+}
+
+func TestWorkspaceChangesUntrackedDirectoryListsFiles(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, "init")
+	if err := os.MkdirAll(filepath.Join("newdir", "nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join("newdir", "nested", "file.txt"), []byte("new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	got := (&App{}).WorkspaceChanges()
+	byPath := map[string]WorkspaceChangeView{}
+	for _, file := range got.Files {
+		byPath[file.Path] = file
+	}
+	if byPath["newdir/"].GitStatus != "" {
+		t.Fatalf("directory should not be listed as a changed file: %+v", got.Files)
+	}
+	if byPath["newdir/nested/file.txt"].GitStatus != "??" {
+		t.Fatalf("untracked file missing from directory: %+v", got.Files)
+	}
+}
+
+func runGit(t *testing.T, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,19 +13,23 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"reasonix/internal/agent"
+	"reasonix/internal/billing"
 	"reasonix/internal/boot"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	fileenc "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/i18n"
 	"reasonix/internal/memory"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
+	"reasonix/internal/skill"
 )
 
 // eventChannel is the Wails runtime event name the frontend subscribes to for the
@@ -54,11 +59,21 @@ type App struct {
 	ready       bool   // true once boot.Build completes (success or failure)
 	disabledMCP map[string]ServerView
 	mcpOrder    []string
+
+	// Per-turn autosave runs off the event goroutine so disk I/O never delays
+	// event delivery; overlapping requests coalesce into one trailing write.
+	saveMu    sync.Mutex
+	saving    bool
+	saveAgain bool
 }
 
 // NewApp constructs the bound object. The controller is built later, in startup,
 // once the Wails context exists.
-func NewApp() *App { return &App{sink: &eventSink{}, disabledMCP: map[string]ServerView{}} }
+func NewApp() *App {
+	a := &App{sink: &eventSink{}, disabledMCP: map[string]ServerView{}}
+	a.sink.app = a
+	return a
+}
 
 // startup runs once the webview process is up, before the frontend can issue any
 // bound call. It captures the Wails context (needed for EventsEmit), points the
@@ -157,6 +172,11 @@ func (a *App) shutdown(context.Context) {
 // Submit runs raw user input as a turn; slash commands and @-references are
 // resolved by the controller. Output arrives asynchronously on eventChannel.
 func (a *App) Submit(input string) {
+	trimmed := strings.TrimSpace(input)
+	if trimmed == "/effort" || strings.HasPrefix(trimmed, "/effort ") {
+		a.runEffortCommand(trimmed)
+		return
+	}
 	a.mu.RLock()
 	ctrl := a.ctrl
 	a.mu.RUnlock()
@@ -335,12 +355,14 @@ func (a *App) SummarizeUpTo(turn int) error {
 
 // SessionMeta summarises one saved session for the history panel.
 type SessionMeta struct {
-	Path    string `json:"path"`
-	Preview string `json:"preview"`         // first user message
-	Title   string `json:"title,omitempty"` // user-chosen name, when set (overrides preview)
-	Turns   int    `json:"turns"`
-	ModTime int64  `json:"modTime"` // unix milliseconds, for the frontend to group/format
-	Current bool   `json:"current"`
+	Path           string `json:"path"`
+	Preview        string `json:"preview"`         // first user message
+	Title          string `json:"title,omitempty"` // user-chosen name, when set (overrides preview)
+	Turns          int    `json:"turns"`
+	CreatedAt      int64  `json:"createdAt"`      // unix milliseconds
+	LastActivityAt int64  `json:"lastActivityAt"` // unix milliseconds
+	ModTime        int64  `json:"modTime"`        // compatibility alias for lastActivityAt
+	Current        bool   `json:"current"`
 }
 
 type WorkspaceMeta struct {
@@ -369,12 +391,14 @@ func (a *App) ListSessions() []SessionMeta {
 	out := make([]SessionMeta, 0, len(infos))
 	for _, s := range infos {
 		out = append(out, SessionMeta{
-			Path:    s.Path,
-			Preview: s.Preview,
-			Title:   titles[filepath.Base(s.Path)],
-			Turns:   s.Turns,
-			ModTime: s.ModTime.UnixMilli(),
-			Current: s.Path == cur,
+			Path:           s.Path,
+			Preview:        s.Preview,
+			Title:          titles[filepath.Base(s.Path)],
+			Turns:          s.Turns,
+			CreatedAt:      s.CreatedAt.UnixMilli(),
+			LastActivityAt: s.LastActivityAt.UnixMilli(),
+			ModTime:        s.LastActivityAt.UnixMilli(),
+			Current:        s.Path == cur,
 		})
 	}
 	return out
@@ -384,13 +408,21 @@ func (a *App) ListSessions() []SessionMeta {
 // session — that's the conversation on screen, and auto-save would recreate the
 // file on the next turn; start a new session first to retire it.
 func (a *App) DeleteSession(path string) error {
+	dir := config.SessionDir()
+	sessionPath, key, err := validateSessionPath(dir, path)
+	if err != nil {
+		return err
+	}
 	a.mu.RLock()
 	ctrl := a.ctrl
 	a.mu.RUnlock()
-	if ctrl != nil && ctrl.SessionPath() == path {
-		return errActiveSession
+	if ctrl != nil {
+		currentPath, _, err := validateSessionPath(dir, ctrl.SessionPath())
+		if err == nil && currentPath == sessionPath {
+			return errActiveSession
+		}
 	}
-	return deleteSessionFile(config.SessionDir(), path)
+	return removeSessionArtifacts(dir, sessionPath, key)
 }
 
 // RenameSession sets a custom display name for a session (empty clears it back to
@@ -417,6 +449,12 @@ func (a *App) ResumeSession(path string) ([]HistoryMessage, error) {
 	_ = ctrl.Snapshot() // persist the current session before switching away
 	ctrl.Resume(loaded, path)
 	return a.History(), nil
+}
+
+// PreviewSession reads a saved session for display only. It does not snapshot or
+// swap the active controller, so the history drawer can call it while a turn runs.
+func (a *App) PreviewSession(path string) ([]HistoryMessage, error) {
+	return previewSessionMessages(config.SessionDir(), path)
 }
 
 // PickWorkspace opens a folder chooser and, on a pick, switches the agent to that
@@ -546,8 +584,9 @@ func (a *App) SwitchWorkspace(dir string) (string, error) {
 // HistoryMessage is one prior turn, for the frontend to repopulate its transcript
 // after a reload.
 type HistoryMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string `json:"role"`
+	Content   string `json:"content"`
+	Reasoning string `json:"reasoning,omitempty"`
 }
 
 // History returns the session's message log.
@@ -559,16 +598,31 @@ func (a *App) History() []HistoryMessage {
 		return nil
 	}
 	msgs := ctrl.History()
-	resolve := sessionDisplayResolver(config.SessionDir(), ctrl.SessionPath())
+	return historyMessages(msgs, sessionDisplayResolver(config.SessionDir(), ctrl.SessionPath()))
+}
+
+func historyMessages(msgs []provider.Message, resolveUserContent func(string) string) []HistoryMessage {
 	out := make([]HistoryMessage, 0, len(msgs))
 	for _, m := range msgs {
 		content := m.Content
 		if m.Role == provider.RoleUser {
-			content = resolve(m.Content)
+			content = resolveUserContent(m.Content)
 		}
-		out = append(out, HistoryMessage{Role: string(m.Role), Content: content})
+		reasoning := ""
+		if m.Role == provider.RoleAssistant {
+			reasoning = m.ReasoningContent
+		}
+		out = append(out, HistoryMessage{Role: string(m.Role), Content: content, Reasoning: reasoning})
 	}
 	return out
+}
+
+func previewSessionMessages(sessionDir, path string) ([]HistoryMessage, error) {
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		return nil, err
+	}
+	return historyMessages(loaded.Snapshot(), sessionDisplayResolver(sessionDir, path)), nil
 }
 
 // ContextInfo is the prompt-vs-window gauge payload. Both zero means no data yet.
@@ -705,9 +759,12 @@ func (a *App) Commands() []CommandInfo {
 		{Name: "new", Description: i18n.M.CmdNew, Kind: "builtin"},
 		{Name: "compact", Description: i18n.M.CmdCompact, Kind: "builtin"},
 		{Name: "model", Description: i18n.M.CmdModel, Kind: "builtin"},
+		{Name: "effort", Description: i18n.M.CmdEffort, Kind: "builtin"},
 		{Name: "memory", Description: i18n.M.CmdMemory, Kind: "builtin"},
+		{Name: "remember", Description: i18n.M.CmdRemember, Kind: "builtin"},
 		{Name: "mcp", Description: i18n.M.CmdMcp, Kind: "builtin"},
 		{Name: "hooks", Description: i18n.M.CmdHooks, Kind: "builtin"},
+		{Name: "theme", Description: i18n.M.CmdTheme, Kind: "builtin"},
 		{Name: "skill", Description: i18n.M.CmdSkill, Kind: "builtin"},
 	}
 	a.mu.RLock()
@@ -785,8 +842,9 @@ func (a *App) SlashArgs(input string) SlashArgsResult {
 // CapabilitiesView is the MCP & Skills drawer's data: connected/failed MCP
 // servers and the discoverable skills, the GUI counterpart to `/mcp` + `/skill`.
 type CapabilitiesView struct {
-	Servers []ServerView `json:"servers"`
-	Skills  []SkillView  `json:"skills"`
+	Servers    []ServerView    `json:"servers"`
+	Skills     []SkillView     `json:"skills"`
+	SkillRoots []SkillRootView `json:"skillRoots"`
 }
 
 // ServerView is one MCP server for the drawer. Status is "connected" (with
@@ -815,10 +873,21 @@ type SkillView struct {
 	RunAs       string `json:"runAs"`
 }
 
+// SkillRootView is one skill discovery root for the drawer's Sources section.
+type SkillRootView struct {
+	Dir        string `json:"dir"`
+	Scope      string `json:"scope"`
+	Priority   int    `json:"priority"`
+	Status     string `json:"status"`
+	Configured bool   `json:"configured"`
+	Skills     int    `json:"skills"`
+	Warning    string `json:"warning,omitempty"`
+}
+
 // Capabilities projects the session's MCP servers (connected + failed) and skills
 // for the MCP & Skills drawer. Non-nil slices so the frontend can map over them.
 func (a *App) Capabilities() CapabilitiesView {
-	out := CapabilitiesView{Servers: []ServerView{}, Skills: []SkillView{}}
+	out := CapabilitiesView{Servers: []ServerView{}, Skills: []SkillView{}, SkillRoots: []SkillRootView{}}
 	a.mu.RLock()
 	ctrl := a.ctrl
 	disabled := make(map[string]ServerView, len(a.disabledMCP))
@@ -905,7 +974,150 @@ func (a *App) Capabilities() CapabilitiesView {
 			Scope: string(s.Scope), RunAs: string(s.RunAs),
 		})
 	}
+	out.SkillRoots = skillRootsView()
 	return out
+}
+
+func skillRootsView() []SkillRootView {
+	cwd, _ := os.Getwd()
+	cfg, _ := config.Load()
+	userCfg := config.LoadForEdit(config.UserConfigPath())
+	var custom []string
+	if cfg != nil {
+		custom = cfg.SkillCustomPaths()
+	}
+	st := skill.New(skill.Options{ProjectRoot: cwd, CustomPaths: custom, DisableBuiltins: true, Stderr: io.Discard})
+	counts := map[string]int{}
+	for _, sk := range st.List() {
+		counts[config.CanonicalSkillPath(filepath.Dir(skillRootPath(sk.Path)))]++
+	}
+	userConfigured := map[string]bool{}
+	if userCfg != nil {
+		for _, p := range userCfg.Skills.Paths {
+			userConfigured[config.CanonicalSkillPath(p)] = true
+		}
+	}
+	var out []SkillRootView
+	for _, r := range st.Roots() {
+		dir := config.CanonicalSkillPath(r.Dir)
+		view := SkillRootView{
+			Dir:        r.Dir,
+			Scope:      string(r.Scope),
+			Priority:   r.Priority + 1,
+			Status:     string(r.Status),
+			Configured: r.Scope == skill.ScopeCustom && userConfigured[dir],
+			Skills:     counts[dir],
+		}
+		out = append(out, view)
+	}
+	if userCfg != nil {
+		for _, p := range userCfg.Skills.Paths {
+			if rootActive(out, p) {
+				continue
+			}
+			out = append(out, SkillRootView{
+				Dir:        p,
+				Scope:      string(skill.ScopeCustom),
+				Status:     "inactive",
+				Configured: true,
+				Warning:    "configured in user config but not active in this workspace; project [skills].paths may override it",
+			})
+		}
+	}
+	return out
+}
+
+func rootActive(roots []SkillRootView, path string) bool {
+	want := config.CanonicalSkillPath(path)
+	for _, r := range roots {
+		if r.Scope == string(skill.ScopeCustom) && config.CanonicalSkillPath(r.Dir) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// PickSkillFolder opens a directory picker for adding custom skill roots. It only
+// returns a path; AddSkillPath performs normalization and writes config.
+func (a *App) PickSkillFolder() (string, error) {
+	if a.ctx == nil {
+		return "", nil
+	}
+	cur, _ := os.Getwd()
+	dir, err := runtime.OpenDirectoryDialog(a.ctx, runtime.OpenDialogOptions{
+		Title:            "Choose skills folder",
+		DefaultDirectory: cur,
+	})
+	if err != nil || dir == "" {
+		return "", err
+	}
+	return normalizeSkillPath(dir), nil
+}
+
+// AddSkillPath adds a custom skill root to the user config and rebuilds the
+// controller so the skills index and slash menu reflect it immediately.
+func (a *App) AddSkillPath(path string) error {
+	path = normalizeSkillPath(path)
+	return a.applyConfigChange(func(c *config.Config) error {
+		return c.AddSkillPath(path)
+	})
+}
+
+// RemoveSkillPath removes a custom skill root from the user config and rebuilds.
+func (a *App) RemoveSkillPath(path string) error {
+	path = normalizeSkillPath(path)
+	return a.applyConfigChange(func(c *config.Config) error {
+		_, err := c.RemoveSkillPath(path)
+		return err
+	})
+}
+
+// RefreshSkills rebuilds the controller without changing config, reloading skill
+// discovery, the system prompt index, and slash completions.
+func (a *App) RefreshSkills() error {
+	return a.rebuild()
+}
+
+func normalizeSkillPath(path string) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			if path == "~" {
+				path = home
+			} else {
+				path = filepath.Join(home, path[2:])
+			}
+		}
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		path = abs
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return filepath.Clean(path)
+	}
+	if info.Mode().IsRegular() {
+		if filepath.Base(path) == skill.SkillFile {
+			return filepath.Clean(filepath.Dir(filepath.Dir(path)))
+		}
+		return filepath.Clean(filepath.Dir(path))
+	}
+	if info.IsDir() {
+		if _, err := os.Stat(filepath.Join(path, skill.SkillFile)); err == nil {
+			return filepath.Clean(filepath.Dir(path))
+		}
+	}
+	return filepath.Clean(path)
+}
+
+func skillRootPath(path string) string {
+	if filepath.Base(path) == skill.SkillFile {
+		return filepath.Dir(path)
+	}
+	return path
 }
 
 // MCPServerInput is the drawer's "add server" form. Transport is "stdio" (Command
@@ -1087,6 +1299,13 @@ type ModelInfo struct {
 	Current  bool   `json:"current"`
 }
 
+type EffortInfo struct {
+	Supported bool     `json:"supported"`
+	Current   string   `json:"current"`
+	Default   string   `json:"default"`
+	Levels    []string `json:"levels"`
+}
+
 // Models flattens the configured providers into their (provider, model) pairs —
 // the switcher's options — marking the active one. A vendor with a `models` list
 // yields one entry per model, all sharing the same endpoint/key. Unconfigured
@@ -1162,6 +1381,48 @@ func (a *App) SetModel(name string) error {
 	return nil
 }
 
+func (a *App) Effort() EffortInfo {
+	entry, err := a.currentProviderEntry()
+	if err != nil {
+		return EffortInfo{Current: "auto", Levels: []string{}}
+	}
+	cap := config.EffortCapabilityForEntry(entry)
+	if !cap.Supported {
+		return EffortInfo{Supported: false, Current: "auto", Default: cap.Default, Levels: []string{}}
+	}
+	return EffortInfo{Supported: true, Current: config.EffortDisplay(entry), Default: cap.Default, Levels: cap.Levels}
+}
+
+func (a *App) SetEffort(level string) error {
+	a.mu.RLock()
+	ctrl := a.ctrl
+	a.mu.RUnlock()
+	if ctrl != nil && ctrl.Running() {
+		return fmt.Errorf("finish or cancel the current turn before changing effort")
+	}
+	entry, err := a.currentProviderEntry()
+	if err != nil {
+		return err
+	}
+	effort, err := config.NormalizeEffort(entry, level)
+	if err != nil {
+		return err
+	}
+	return a.applyConfigChange(func(cfg *config.Config) error {
+		if _, ok := cfg.Provider(entry.Name); !ok {
+			if err := cfg.UpsertProvider(*entry); err != nil {
+				return err
+			}
+		}
+		if entry.Kind == "anthropic" && effort != "" && entry.Thinking == "" {
+			if err := cfg.SetProviderThinking(entry.Name, "adaptive"); err != nil {
+				return err
+			}
+		}
+		return cfg.SetProviderEffort(entry.Name, effort)
+	})
+}
+
 // DirEntry is one entry in the "@" file-reference menu.
 type DirEntry struct {
 	Name  string `json:"name"`
@@ -1176,6 +1437,22 @@ type FilePreview struct {
 	Truncated bool   `json:"truncated"`
 	Binary    bool   `json:"binary"`
 	Err       string `json:"err,omitempty"`
+}
+
+type WorkspaceChangeView struct {
+	Path         string   `json:"path"`
+	OldPath      string   `json:"oldPath,omitempty"`
+	Sources      []string `json:"sources"`
+	GitStatus    string   `json:"gitStatus,omitempty"`
+	Turns        []int    `json:"turns,omitempty"`
+	LatestPrompt string   `json:"latestPrompt,omitempty"`
+	LatestTime   int64    `json:"latestTime,omitempty"`
+}
+
+type WorkspaceChangesView struct {
+	Files        []WorkspaceChangeView `json:"files"`
+	GitAvailable bool                  `json:"gitAvailable"`
+	GitErr       string                `json:"gitErr,omitempty"`
 }
 
 // atSkip are entries the "@" menu hides as noise.
@@ -1303,13 +1580,42 @@ func (a *App) ReadFile(rel string) FilePreview {
 	if len(data) > filePreviewLimit {
 		data = data[:filePreviewLimit]
 		out.Truncated = true
-		data = trimUTF8PartialSuffix(data)
 	}
-	if bytes.Contains(data, []byte{0}) || !utf8.Valid(data) {
+
+	// Check for BOM first (just the first 2-3 bytes — always complete
+	// even at a truncation boundary). BOM-prefixed files skip the NUL
+	// check since UTF-16 normally contains 0x00 for ASCII characters.
+	bomKind := fileenc.DetectQuick(data)
+	if bomKind != fileenc.UTF8 {
+		enc, _ := fileenc.Detect(data)
+		if enc == fileenc.LossyUTF8 {
+			out.Binary = true
+			return out
+		}
+		decoded := fileenc.Decode(data, enc)
+		out.Body = string(decoded)
+		return out
+	}
+
+	// No BOM — NUL in raw bytes is a binary signal.
+	if bytes.Contains(data, []byte{0}) {
 		out.Binary = true
 		return out
 	}
-	out.Body = string(data)
+
+	// Trim any partial multi-byte rune at the truncation boundary BEFORE
+	// encoding detection. Without this, a large UTF-8 file truncated
+	// mid-character would fail utf8.Valid and be misdetected as GB18030
+	// or LossyUTF8, producing mojibake or a false binary classification.
+	if out.Truncated {
+		data = trimUTF8PartialSuffix(data)
+	}
+	enc, _ := fileenc.Detect(data)
+	if enc == fileenc.LossyUTF8 {
+		out.Binary = true
+		return out
+	}
+	out.Body = string(fileenc.Decode(data, enc))
 	return out
 }
 
@@ -1342,10 +1648,77 @@ func (a *App) RevealWorkspacePath(rel string) error {
 	}
 }
 
+func (a *App) notice(text string) {
+	if a.sink != nil {
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: text})
+	}
+}
+
+func (a *App) runEffortCommand(input string) {
+	entry, err := a.currentProviderEntry()
+	if err != nil {
+		a.notice("effort: " + err.Error())
+		return
+	}
+	cap := config.EffortCapabilityForEntry(entry)
+	if !cap.Supported {
+		a.notice(fmt.Sprintf("effort is not configurable for %s", entry.Name))
+		return
+	}
+	args := strings.Fields(input)
+	if len(args) < 2 {
+		a.notice(fmt.Sprintf("effort for %s: %s (default: %s; options: %s)", entry.Name, config.EffortDisplay(entry), cap.Default, strings.Join(cap.Levels, "|")))
+		return
+	}
+	if len(args) > 2 {
+		a.notice("usage: /effort " + strings.Join(cap.Levels, "|"))
+		return
+	}
+	effort, err := config.NormalizeEffort(entry, args[1])
+	if err != nil {
+		a.notice(err.Error())
+		return
+	}
+	if err := a.SetEffort(args[1]); err != nil {
+		a.notice("effort: " + err.Error())
+		return
+	}
+	display := effort
+	if display == "" {
+		display = "auto"
+	}
+	a.notice(fmt.Sprintf("effort for %s set to %s", entry.Name, display))
+}
+
+func (a *App) currentProviderEntry() (*config.ProviderEntry, error) {
+	cfg, err := config.Load()
+	if err != nil {
+		return nil, err
+	}
+	a.mu.RLock()
+	ref := a.model
+	a.mu.RUnlock()
+	if strings.TrimSpace(ref) == "" {
+		ref = cfg.DefaultModel
+	}
+	entry, ok := cfg.ResolveModel(ref)
+	if !ok {
+		return nil, fmt.Errorf("unknown model %q", ref)
+	}
+	return entry, nil
+}
+
 // SavePastedImage stores a browser clipboard image data URL under
 // .reasonix/attachments and returns the relative @-reference path.
 func (a *App) SavePastedImage(dataURL string) (string, error) {
 	return control.SaveImageDataURL(dataURL)
+}
+
+// SavePastedFile stores a dropped non-image file (the browser exposes its bytes
+// as a data URL but not a real path) under .reasonix/attachments and returns the
+// relative @-reference path.
+func (a *App) SavePastedFile(name, dataURL string) (string, error) {
+	return control.SaveAttachmentDataURL(name, dataURL)
 }
 
 // AttachmentDataURL returns a safe data URL for a stored image attachment.
@@ -1426,8 +1799,8 @@ func (a *App) Memory() MemoryView {
 }
 
 // Remember quick-adds a one-line note to the doc-memory file for scope — the
-// panel's explicit "remember" action, equivalent to typing "#<note>". An unknown
-// scope falls back to project. Returns the file written.
+// panel's explicit "remember" action, equivalent to typing "/remember <note>".
+// An unknown scope falls back to project. Returns the file written.
 func (a *App) Remember(scope, note string) (string, error) {
 	a.mu.RLock()
 	ctrl := a.ctrl
@@ -1474,17 +1847,95 @@ func parseScope(s string) memory.Scope {
 	}
 }
 
+// onboardingKeyEnv is the default provider (deepseek) key from config.Default().
+const onboardingKeyEnv = "DEEPSEEK_API_KEY"
+
+// onboardingBalanceURL doubles as a zero-token connectivity + auth probe:
+// billing.FetchWithClient surfaces 401/403 for a bad key.
+const onboardingBalanceURL = "https://api.deepseek.com/user/balance"
+
+func (a *App) NeedsOnboarding() bool {
+	return strings.TrimSpace(os.Getenv(onboardingKeyEnv)) == ""
+}
+
+// ConnectKey validates apiKey against the balance endpoint, persists it to
+// ./.env, and rebuilds the controller so the new key takes effect.
+func (a *App) ConnectKey(apiKey string) error {
+	apiKey = strings.TrimSpace(apiKey)
+	if apiKey == "" {
+		return fmt.Errorf("key is required")
+	}
+	ctx, cancel := context.WithTimeout(a.ctx, 8*time.Second)
+	defer cancel()
+	if _, err := billing.FetchWithClient(ctx, nil, onboardingBalanceURL, apiKey); err != nil {
+		return fmt.Errorf("validate: %w", err)
+	}
+	if err := upsertDotEnv(onboardingKeyEnv, apiKey); err != nil {
+		return fmt.Errorf("save: %w", err)
+	}
+	if err := a.rebuild(); err != nil {
+		// Key is persisted; surface the failure but let the next rebuild load it.
+		a.mu.Lock()
+		a.startupErr = err.Error()
+		a.mu.Unlock()
+	}
+	return nil
+}
+
 // eventSink is the controller's event.Sink in desktop mode: it forwards every
 // agent event to the webview as one runtime event, JSON-shaped by toWire. It is a
 // type distinct from App so App's bound method set stays the clean command surface
 // — Emit must not be exposed to JS. Emit runs on the agent goroutine;
 // runtime.EventsEmit is goroutine-safe, and the ctx guard covers the brief window
 // before startup assigns it.
-type eventSink struct{ ctx context.Context }
+type eventSink struct {
+	ctx context.Context
+	app *App
+}
 
 func (s *eventSink) Emit(e event.Event) {
-	if s.ctx == nil {
+	if s.ctx != nil {
+		runtime.EventsEmit(s.ctx, eventChannel, toWire(e))
+	}
+	// Persist after each turn so a force-kill of a long session loses at most the
+	// in-flight prompt, not every turn back to the last workspace switch.
+	if e.Kind == event.TurnDone && s.app != nil {
+		s.app.scheduleSnapshot()
+	}
+}
+
+// scheduleSnapshot kicks a single-flight background save of the active session;
+// a request arriving while one runs sets a trailing pass so the final state lands.
+func (a *App) scheduleSnapshot() {
+	a.saveMu.Lock()
+	if a.saving {
+		a.saveAgain = true
+		a.saveMu.Unlock()
 		return
 	}
-	runtime.EventsEmit(s.ctx, eventChannel, toWire(e))
+	a.saving = true
+	a.saveMu.Unlock()
+	go a.snapshotLoop()
+}
+
+func (a *App) snapshotLoop() {
+	for {
+		a.mu.RLock()
+		ctrl := a.ctrl
+		a.mu.RUnlock()
+		if ctrl != nil {
+			if err := ctrl.Snapshot(); err != nil {
+				slog.Warn("desktop: per-turn snapshot", "err", err)
+			}
+		}
+		a.saveMu.Lock()
+		if a.saveAgain {
+			a.saveAgain = false
+			a.saveMu.Unlock()
+			continue
+		}
+		a.saving = false
+		a.saveMu.Unlock()
+		return
+	}
 }

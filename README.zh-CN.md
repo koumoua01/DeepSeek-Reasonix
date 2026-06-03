@@ -17,7 +17,7 @@
 > [!IMPORTANT]
 > **Reasonix 1.0 是用 Go 从零重写的版本** —— 本分支(`main-v2`)已是新的默认分支,后续开发都在这里。
 > 早期的 `0.x` TypeScript 版本转为 **legacy**,保留在 [`v1`](https://github.com/esengine/DeepSeek-Reasonix/tree/v1) 分支(仅维护)。
-> 详见**[迁移指南](./docs/MIGRATING.md)**。`npm i -g reasonix` 仍是安装命令——`1.0.0`+ 装的是 Go 二进制,`0.x` 是 legacy TS 版。(注意:1.0.0 尚未发到 npm,在此之前请从源码构建。)
+> 详见**[迁移指南](./docs/MIGRATING.md)**。`npm i -g reasonix` 仍是安装命令——`1.0.0`+ 装的是 Go 二进制,`0.x` 是 legacy TS 版。
 
 <p align="center">
   <a href="https://www.npmjs.com/package/reasonix"><img src="https://img.shields.io/npm/v/reasonix.svg?style=flat-square&color=cb3837&labelColor=161b22&logo=npm&logoColor=white" alt="npm version"/></a>
@@ -58,7 +58,17 @@
 - **零摩擦分发**：`CGO_ENABLED=0` 单二进制；一条命令交叉编译到六个目标平台。
   唯一依赖是一个 TOML 解析库。
 
-## 安装 / 构建
+## 安装
+
+```sh
+npm i -g reasonix                  # 任意系统;自动拉取对应平台的原生二进制
+brew install esengine/reasonix/reasonix   # macOS
+```
+
+预编译归档(`darwin|linux|windows × amd64|arm64`)和 `SHA256SUMS` 见每个
+[GitHub release](https://github.com/esengine/DeepSeek-Reasonix/releases)。
+
+### 从源码构建
 
 ```sh
 make build      # -> bin/reasonix
@@ -170,7 +180,7 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 ### 斜杠命令
 
-`reasonix chat` 里,内置命令(`/compact`、`/new`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/mcp`、`/help`)在本地执行。
+`reasonix chat` 里,内置命令(`/compact`、`/new`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/effort`、`/mcp`、`/help`)在本地执行。
 `/tree` 查看已保存的对话分支,`/branch [name]` 从当前对话末端分支,`/branch <turn> [name]`
 从较早的 checkpoint 轮次分支,`/switch <id|name>` 切换到另一个分支。**自定义命令**
 是放在 `.reasonix/commands/`(项目)或 `~/.config/reasonix/commands/`(用户)下的 Markdown 文件——

@@ -2,20 +2,182 @@ package control
 
 import (
 	"context"
+	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"reasonix/internal/agent"
 	"reasonix/internal/event"
+	"reasonix/internal/plugin"
+	"reasonix/internal/provider"
+	"reasonix/internal/tool"
 )
 
 type typedNilControllerSink struct{}
 
 func (*typedNilControllerSink) Emit(event.Event) {}
 
+type appendingRunner struct {
+	session *agent.Session
+}
+
+func (r appendingRunner) Run(_ context.Context, input string) error {
+	r.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
+	return nil
+}
+
+type fakeControlTool struct{ name string }
+
+func (t fakeControlTool) Name() string { return t.name }
+func (fakeControlTool) Description() string {
+	return "fake"
+}
+func (fakeControlTool) Schema() json.RawMessage {
+	return json.RawMessage(`{"type":"object"}`)
+}
+func (fakeControlTool) Execute(context.Context, json.RawMessage) (string, error) {
+	return "", nil
+}
+func (fakeControlTool) ReadOnly() bool { return true }
+
 func TestNewTreatsTypedNilSinkAsDiscard(t *testing.T) {
 	var sink *typedNilControllerSink
 	c := New(Options{Sink: sink})
 
 	c.notice("typed nil sink should not panic")
+}
+
+func TestRunTurnSnapshotsActivityWhenTranscriptChanges(t *testing.T) {
+	dir := t.TempDir()
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	path := filepath.Join(dir, "session.jsonl")
+	c := New(Options{Runner: appendingRunner{session: sess}, Executor: exec, SessionDir: dir, SessionPath: path, Label: "test"})
+
+	if err := c.runTurn(context.Background(), "hello"); err != nil {
+		t.Fatal(err)
+	}
+
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 2 {
+		t.Fatalf("saved messages = %d, want system + user", len(loaded.Messages))
+	}
+	meta, ok, err := agent.LoadBranchMeta(path)
+	if err != nil || !ok {
+		t.Fatalf("load activity meta ok=%v err=%v", ok, err)
+	}
+	if meta.UpdatedAt.IsZero() {
+		t.Fatal("activity meta should be marked")
+	}
+}
+
+func TestSnapshotDoesNotRefreshSessionActivity(t *testing.T) {
+	dir := t.TempDir()
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, Label: "test"})
+	c.SetSessionPath(filepath.Join(dir, "session.jsonl"))
+
+	if err := c.SnapshotActivity(); err != nil {
+		t.Fatal(err)
+	}
+	first, ok, err := agent.LoadBranchMeta(c.SessionPath())
+	if err != nil || !ok {
+		t.Fatalf("load initial meta ok=%v err=%v", ok, err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "saved without activity"})
+	if err := c.Snapshot(); err != nil {
+		t.Fatal(err)
+	}
+	second, ok, err := agent.LoadBranchMeta(c.SessionPath())
+	if err != nil || !ok {
+		t.Fatalf("load second meta ok=%v err=%v", ok, err)
+	}
+	if !second.UpdatedAt.Equal(first.UpdatedAt) {
+		t.Fatalf("Snapshot refreshed activity: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
+func TestSnapshotActivityRefreshesSessionActivity(t *testing.T) {
+	dir := t.TempDir()
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, Label: "test"})
+	c.SetSessionPath(filepath.Join(dir, "session.jsonl"))
+
+	if err := c.SnapshotActivity(); err != nil {
+		t.Fatal(err)
+	}
+	first, _, err := agent.LoadBranchMeta(c.SessionPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(10 * time.Millisecond)
+	sess.Add(provider.Message{Role: provider.RoleAssistant, Content: "activity"})
+	if err := c.SnapshotActivity(); err != nil {
+		t.Fatal(err)
+	}
+	second, _, err := agent.LoadBranchMeta(c.SessionPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !second.UpdatedAt.After(first.UpdatedAt) {
+		t.Fatalf("SnapshotActivity did not refresh activity: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
+func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeControlTool{name: "mcp__mock__connect"})
+	c := New(Options{Host: plugin.NewHost(), Registry: reg})
+
+	if ok := c.DisconnectMCPServer("mock"); !ok {
+		t.Fatal("DisconnectMCPServer returned false for a registered lazy placeholder")
+	}
+	if _, found := reg.Get("mcp__mock__connect"); found {
+		t.Fatalf("lazy placeholder still registered after disconnect; names=%v", reg.Names())
+	}
+}
+
+func TestRemoveMCPServerRemovesUnconnectedLazyPlaceholder(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("reasonix.toml", []byte(`
+[[plugins]]
+name = "mock"
+command = "mock-mcp"
+tier = "lazy"
+`), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	reg := tool.NewRegistry()
+	reg.Add(fakeControlTool{name: "mcp__mock__connect"})
+	c := New(Options{Host: plugin.NewHost(), Registry: reg})
+
+	disconnected, err := c.RemoveMCPServer("mock")
+	if err != nil {
+		t.Fatalf("RemoveMCPServer: %v", err)
+	}
+	if disconnected {
+		t.Fatal("RemoveMCPServer reported a live disconnect for an unconnected lazy placeholder")
+	}
+	if _, found := reg.Get("mcp__mock__connect"); found {
+		t.Fatalf("lazy placeholder still registered after remove; names=%v", reg.Names())
+	}
+	if names := c.ConfiguredMCPNames(); len(names) != 0 {
+		t.Fatalf("ConfiguredMCPNames() = %v, want empty after remove", names)
+	}
 }
 
 // approvalIDs returns a Controller whose Sink forwards each ApprovalRequest's ID
@@ -59,11 +221,10 @@ func TestApprovalDeny(t *testing.T) {
 // later prompts for the same tool+subject: only the first reaches the frontend.
 func TestApprovalSessionGrant(t *testing.T) {
 	c, ids, prompts := approvalIDs()
-	go func() {
-		for id := range ids {
-			c.Approve(id, true, true)
-		}
-	}()
+	// Only the first call reaches the frontend (the session grant short-circuits
+	// the rest), so a single approval is all this needs — ranging would block on
+	// a second ID that never arrives.
+	go func() { c.Approve(<-ids, true, true) }()
 
 	for i := 0; i < 3; i++ {
 		allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", "go build", nil)

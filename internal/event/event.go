@@ -63,6 +63,22 @@ const (
 	// Summary so the placeholder still resolves. Replaces the older plain Notice
 	// so a sink can render a distinct, expandable card.
 	CompactionDone
+	// ToolProgress streams a chunk of a still-running tool's combined output
+	// (Tool: ID + Output = the new chunk). Emitted between ToolDispatch and
+	// ToolResult for long tools like bash so a frontend can show live progress.
+	// Appended last to keep the Kind values before it wire-stable.
+	ToolProgress
+	// MCPSurfaceReady fires once per server when its background-loaded surface
+	// (prompts or resources) finishes after startup. Lets UIs refresh /mcp
+	// status without polling. Text carries "<server>: <surface> ready (<count>
+	// items)". Appended last to keep the Kind values before it wire-stable.
+	MCPSurfaceReady
+	// Retrying fires before each backoff sleep while the provider re-attempts the
+	// connection+header phase after a transient failure (RetryAttempt of RetryMax).
+	// A frontend shows a transient "retrying (n/m)" indicator that the next stream
+	// event — or TurnDone — clears. Appended last to keep the Kind values before
+	// it wire-stable.
+	Retrying
 )
 
 // Level classifies a Notice so sinks can style or filter it.
@@ -92,6 +108,17 @@ type Tool struct {
 	// sub-agent's calls carry the parent `task` call's ID so a frontend can nest
 	// them under it. Empty for top-level calls.
 	ParentID string
+	FileDiff
+}
+
+// FileDiff is a previewed change carried on a writer tool's full ToolDispatch
+// and on its ApprovalRequest, so a frontend can render +/- lines before the
+// call runs. Diff is the unified diff (empty for read-only tools, binary files,
+// or no-op changes); Added/Removed are its line tallies.
+type FileDiff struct {
+	Diff    string
+	Added   int
+	Removed int
 }
 
 // Approval identifies a pending tool-call approval for an ApprovalRequest
@@ -156,13 +183,15 @@ type Event struct {
 	// session (Usage events only), so a frontend can show the aggregate hit-rate
 	// — which doesn't crater on a short turn or after compaction — alongside
 	// Usage's single-turn numbers.
-	SessionHit  int        // Usage: cumulative cache-hit prompt tokens this session
-	SessionMiss int        // Usage: cumulative cache-miss prompt tokens this session
-	Level       Level      // Notice
-	Approval    Approval   // ApprovalRequest
-	Ask         Ask        // AskRequest
-	Err         error      // TurnDone: non-nil on failure
-	Compaction  Compaction // Compaction
+	SessionHit   int        // Usage: cumulative cache-hit prompt tokens this session
+	SessionMiss  int        // Usage: cumulative cache-miss prompt tokens this session
+	Level        Level      // Notice
+	Approval     Approval   // ApprovalRequest
+	Ask          Ask        // AskRequest
+	Err          error      // TurnDone: non-nil on failure
+	Compaction   Compaction // Compaction
+	RetryAttempt int        // Retrying: 1-based attempt about to be made
+	RetryMax     int        // Retrying: total attempts before giving up
 }
 
 // Sink consumes a turn's events. The agent calls Emit serially from its run

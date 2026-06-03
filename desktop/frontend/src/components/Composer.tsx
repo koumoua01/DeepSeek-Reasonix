@@ -1,17 +1,29 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
-import { ArrowUp, Check, ChevronDown, Eye, FileText, FolderGit2, FolderPlus, Search, Square, Trash2, X } from "lucide-react";
+import { ArrowUp, Check, ChevronDown, Eye, FileText, Folder, FolderGit2, FolderPlus, Search, Square, Trash2, X } from "lucide-react";
 import { app } from "../lib/bridge";
 import { useT } from "../lib/i18n";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
-import type { CommandInfo, DirEntry, Mode, SlashArgItem, SlashArgsResult, WorkspaceView } from "../lib/types";
+import type { CommandInfo, ComposerInsertRequest, DirEntry, Mode, SlashArgItem, SlashArgsResult, WorkspaceView } from "../lib/types";
+import {
+  formatWorkspaceReference,
+  parseWorkspaceReference,
+  readWorkspaceReferenceDrag,
+  WORKSPACE_REF_DRAG_TYPE,
+} from "../lib/workspaceDrag";
 import { SlashMenu } from "./SlashMenu";
 import { ArgMenu } from "./ArgMenu";
 import { FileMenu } from "./FileMenu";
+import { Tooltip } from "./Tooltip";
 
 interface Attachment {
   path: string;
-  previewUrl: string;
+  previewUrl?: string;
+}
+
+interface WorkspaceReference {
+  path: string;
+  isDir?: boolean;
 }
 
 const LONG_PASTE_MIN_CHARS = 2000;
@@ -19,6 +31,10 @@ const LONG_PASTE_MIN_LINES = 20;
 const COMPOSER_MIN_HEIGHT = 86;
 const COMPOSER_MAX_HEIGHT = 360;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.4;
+// Grace after compositionend to swallow a confirm-Enter that lands just after
+// it; the real gap is a few ms, so keep it short or a deliberate quick second
+// Enter (submit) gets eaten too.
+const IME_CONFIRM_GRACE_MS = 100;
 
 type PastedBlock = {
   label: string;
@@ -38,6 +54,15 @@ function renderPastedBlock(block: PastedBlock): string {
   return `${block.label}\n\n--- Begin ${block.label} ---\n${block.text}\n--- End ${block.label} ---`;
 }
 
+function baseName(path: string): string {
+  const clean = path.replace(/\/$/, "");
+  return clean.split("/").filter(Boolean).pop() ?? path;
+}
+
+function workspaceReferenceKey(ref: WorkspaceReference): string {
+  return `${ref.isDir ? "dir" : "file"}:${ref.path}`;
+}
+
 function composerMaxHeight(): number {
   if (typeof window === "undefined") return COMPOSER_MAX_HEIGHT;
   return Math.max(COMPOSER_MIN_HEIGHT, Math.min(COMPOSER_MAX_HEIGHT, Math.floor(window.innerHeight * COMPOSER_MAX_VIEWPORT_RATIO)));
@@ -51,6 +76,23 @@ function loadComposerHeight(): number | null {
   return loadOptionalLayoutSize("composerHeight", clampComposerHeight);
 }
 
+function isImeKeyEvent(
+  e: KeyboardEvent<HTMLTextAreaElement>,
+  composing: boolean,
+  lastCompositionEndAt: number,
+): boolean {
+  const native = e.nativeEvent as globalThis.KeyboardEvent & {
+    isComposing?: boolean;
+    keyCode?: number;
+  };
+  return (
+    composing ||
+    native.isComposing === true ||
+    native.keyCode === 229 ||
+    Date.now() - lastCompositionEndAt < IME_CONFIRM_GRACE_MS
+  );
+}
+
 export function Composer({
   running,
   mode,
@@ -59,6 +101,7 @@ export function Composer({
   onCancel,
   onCycleMode,
   onPickFolder,
+  insertRequest,
   disabled,
 }: {
   running: boolean;
@@ -70,11 +113,13 @@ export function Composer({
   onCancel: () => string | undefined;
   onCycleMode: () => void;
   onPickFolder: (path?: string) => Promise<string>;
+  insertRequest?: ComposerInsertRequest | null;
   disabled?: boolean;
 }) {
   const t = useT();
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [workspaceRefs, setWorkspaceRefs] = useState<WorkspaceReference[]>([]);
   const [pastedBlocks, setPastedBlocks] = useState<PastedBlock[]>([]);
   const [openPastedLabels, setOpenPastedLabels] = useState<string[]>([]);
   const [pendingPaste, setPendingPaste] = useState(0);
@@ -93,6 +138,10 @@ export function Composer({
   const workspaceAnchorRef = useRef<HTMLDivElement>(null);
   const workspaceMenuRef = useRef<HTMLDivElement>(null);
   const wasRunning = useRef(running);
+  const composingRef = useRef(false);
+  const lastCompositionEndAt = useRef(0);
+  const lastSelectionRef = useRef({ start: 0, end: 0 });
+  const consumedInsertIdRef = useRef(0);
 
   useEffect(() => {
     if (wasRunning.current && !running && text.trim() === "") {
@@ -232,6 +281,54 @@ export function Composer({
     });
   };
 
+  const rememberCaret = () => {
+    const ta = taRef.current;
+    if (!ta) return;
+    lastSelectionRef.current = { start: ta.selectionStart ?? text.length, end: ta.selectionEnd ?? text.length };
+  };
+
+  const insertTextAtCaret = (snippet: string) => {
+    const ta = taRef.current;
+    const start = ta ? (ta.selectionStart ?? text.length) : Math.min(lastSelectionRef.current.start, text.length);
+    const end = ta ? (ta.selectionEnd ?? start) : Math.min(lastSelectionRef.current.end, text.length);
+    const before = text.slice(0, start);
+    const after = text.slice(end);
+    const leading = before.length === 0 || before.endsWith("\n\n") ? "" : before.endsWith("\n") ? "\n" : "\n\n";
+    const body = snippet.trimEnd();
+    const trailing = after.length === 0 ? "\n" : after.startsWith("\n") ? "" : "\n\n";
+    const inserted = leading + body + trailing;
+    const next = before + inserted + after;
+    const pos = before.length + inserted.length;
+    setText(next);
+    requestAnimationFrame(() => {
+      const node = taRef.current;
+      if (!node) return;
+      node.focus();
+      node.selectionStart = node.selectionEnd = pos;
+      lastSelectionRef.current = { start: pos, end: pos };
+    });
+  };
+
+  const addWorkspaceReference = (ref: WorkspaceReference) => {
+    setWorkspaceRefs((prev) => {
+      const key = workspaceReferenceKey(ref);
+      if (prev.some((item) => workspaceReferenceKey(item) === key)) return prev;
+      return [...prev, ref];
+    });
+    requestAnimationFrame(() => taRef.current?.focus());
+  };
+
+  useEffect(() => {
+    if (!insertRequest || insertRequest.id === consumedInsertIdRef.current) return;
+    consumedInsertIdRef.current = insertRequest.id;
+    const ref = parseWorkspaceReference(insertRequest.text);
+    if (ref) {
+      addWorkspaceReference(ref);
+      return;
+    }
+    insertTextAtCaret(insertRequest.text);
+  }, [insertRequest]);
+
   const expandPastedBlocks = (displayText: string): string => {
     let expanded = displayText;
     for (const block of pastedBlocksRef.current) {
@@ -245,14 +342,26 @@ export function Composer({
   const submit = () => {
     if (disabled) return;
     const t = text.trim();
-    if ((!t && attachments.length === 0) || pendingPaste > 0) return;
-    const refs = attachments.map((a) => `@${a.path}`).join(" ");
+    if ((!t && attachments.length === 0 && workspaceRefs.length === 0) || pendingPaste > 0) return;
+    const refs = [
+      ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
+      ...attachments.map((a) => `@${a.path}`),
+    ].join(" ");
     const displayText = [t, refs].filter(Boolean).join(t && refs ? " " : "");
     const submitText = [expandPastedBlocks(t), refs].filter(Boolean).join(t && refs ? " " : "");
     onSend(displayText, submitText);
     setText("");
     setAttachments([]);
+    setWorkspaceRefs([]);
   };
+
+  const readFileAsDataURL = (file: File) =>
+    new Promise<string>((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(String(reader.result));
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
 
   const attachImageFiles = async (files: File[]) => {
     const images = files.filter((f) => f.type.startsWith("image/"));
@@ -260,12 +369,7 @@ export function Composer({
     for (const file of images) {
       setPendingPaste((n) => n + 1);
       try {
-        const dataUrl = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(String(reader.result));
-          reader.onerror = () => reject(reader.error);
-          reader.readAsDataURL(file);
-        });
+        const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedImage(dataUrl);
         const previewUrl = await app.AttachmentDataURL(path);
         setAttachments((prev) => [...prev, { path, previewUrl }]);
@@ -277,11 +381,35 @@ export function Composer({
     }
   };
 
+  // Non-image drops (PDFs, docs): the browser hands us bytes, not a path, so the
+  // kernel stores them and we reference the saved path — attached, not ignored.
+  const attachOtherFiles = async (files: File[]) => {
+    const others = files.filter((f) => !f.type.startsWith("image/"));
+    if (others.length === 0) return;
+    for (const file of others) {
+      setPendingPaste((n) => n + 1);
+      try {
+        const dataUrl = await readFileAsDataURL(file);
+        const path = await app.SavePastedFile(file.name, dataUrl);
+        setAttachments((prev) => [...prev, { path }]);
+      } catch {
+        // non-fatal: a failed attach must not block normal text input
+      } finally {
+        setPendingPaste((n) => Math.max(0, n - 1));
+      }
+    }
+  };
+
+  const attachFiles = (files: File[]) => {
+    void attachImageFiles(files);
+    void attachOtherFiles(files);
+  };
+
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData.files).filter((f) => f.type.startsWith("image/"));
+    const files = Array.from(e.clipboardData.files);
     if (files.length > 0) {
       e.preventDefault();
-      void attachImageFiles(files);
+      attachFiles(files);
       return;
     }
 
@@ -310,17 +438,32 @@ export function Composer({
     });
   };
 
+  const hasWorkspaceReferenceDrag = (dataTransfer: DataTransfer): boolean =>
+    Array.from(dataTransfer.types).includes(WORKSPACE_REF_DRAG_TYPE);
+
+  const hasFileDrag = (dataTransfer: DataTransfer): boolean =>
+    Array.from(dataTransfer.items).some((it) => it.kind === "file") || dataTransfer.files.length > 0;
+
   const onDrop = (e: DragEvent<HTMLDivElement>) => {
+    const droppedWorkspaceRef = readWorkspaceReferenceDrag(e.dataTransfer);
+    if (droppedWorkspaceRef) {
+      e.preventDefault();
+      setDragOver(false);
+      addWorkspaceReference(droppedWorkspaceRef);
+      return;
+    }
+
     const files = Array.from(e.dataTransfer.files);
-    if (!files.some((f) => f.type.startsWith("image/"))) return;
+    if (files.length === 0) return;
     e.preventDefault();
     setDragOver(false);
-    void attachImageFiles(files);
+    attachFiles(files);
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
-    if (!Array.from(e.dataTransfer.items).some((it) => it.kind === "file")) return;
+    if (!hasWorkspaceReferenceDrag(e.dataTransfer) && !hasFileDrag(e.dataTransfer)) return;
     e.preventDefault(); // required for the drop event to fire
+    e.dataTransfer.dropEffect = "copy";
     setDragOver(true);
   };
 
@@ -336,6 +479,12 @@ export function Composer({
   const pickCommand = (c: CommandInfo) => setTextCaretEnd("/" + c.name + " ");
 
   const activePastedBlocks = pastedBlocks.filter((block) => text.includes(block.label));
+
+  const removeWorkspaceReference = (target: WorkspaceReference) => {
+    const key = workspaceReferenceKey(target);
+    setWorkspaceRefs((prev) => prev.filter((ref) => workspaceReferenceKey(ref) !== key));
+    requestAnimationFrame(() => taRef.current?.focus());
+  };
 
   const togglePastedPreview = (label: string) => {
     setOpenPastedLabels((prev) => (prev.includes(label) ? prev.filter((x) => x !== label) : [...prev, label]));
@@ -465,7 +614,8 @@ export function Composer({
   };
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    const composing = e.nativeEvent.isComposing;
+    const composing = isImeKeyEvent(e, composingRef.current, lastCompositionEndAt.current);
+    if (e.key === "Enter" && composing) return;
 
     // Shift+Tab cycles the input mode (normal → plan → YOLO → normal). Handled
     // before the menus so it works even while one is open.
@@ -498,7 +648,7 @@ export function Composer({
       }
     }
 
-    // Enter sends; Shift+Enter newline. isComposing guards IME (pinyin) confirms.
+    // Enter sends; Shift+Enter newline. `composing` guards IME confirms.
     if (e.key === "Enter" && !e.shiftKey && !composing) {
       e.preventDefault();
       submit();
@@ -531,22 +681,22 @@ export function Composer({
           </label>
           <div className="workspace-switcher__list">
             {filteredWorkspaces.map((w) => (
-              <button
-                key={w.path}
-                className="workspace-switcher__item"
-                onClick={() => {
-                  if (w.current) {
-                    setWorkspaceMenuOpen(false);
-                    return;
-                  }
-                  void chooseWorkspace(w.path);
-                }}
-                title={w.path}
-              >
-                <FolderGit2 size={15} />
-                <span>{w.name}</span>
-                {w.current && <Check size={15} />}
-              </button>
+              <Tooltip key={w.path} label={w.path} fill>
+                <button
+                  className="workspace-switcher__item"
+                  onClick={() => {
+                    if (w.current) {
+                      setWorkspaceMenuOpen(false);
+                      return;
+                    }
+                    void chooseWorkspace(w.path);
+                  }}
+                >
+                  <FolderGit2 size={15} />
+                  <span>{w.name}</span>
+                  {w.current && <Check size={15} />}
+                </button>
+              </Tooltip>
             ))}
             {filteredWorkspaces.length === 0 && <div className="workspace-switcher__empty">{t("composer.noProjectMatches")}</div>}
           </div>
@@ -565,19 +715,48 @@ export function Composer({
         <ArgMenu items={argRes.items} activeIndex={active} onPick={pickArg} onHover={setActive} />
       )}
       {menuMode === "at" && <FileMenu items={atMatches} activeIndex={active} onPick={pickEntry} onHover={setActive} />}
-      {attachments.length > 0 && (
-        <div className="composer__attachments">
+      {(attachments.length > 0 || workspaceRefs.length > 0) && (
+        <div className="composer-context" aria-label={t("composer.contextItems")}>
           {attachments.map((a) => (
-            <div className="composer__attachment" key={a.path}>
-              <img src={a.previewUrl} alt="" />
-              <span>{a.path.split("/").pop()}</span>
-              <button
-                type="button"
-                title="Remove image"
-                onClick={() => setAttachments((prev) => prev.filter((x) => x.path !== a.path))}
-              >
-                <X size={14} />
-              </button>
+            <div
+              className={`composer-context__item${a.previewUrl ? " composer-context__item--image" : " composer-context__item--attachment"}`}
+              key={a.path}
+            >
+              <Tooltip label={a.path}>
+                <span className="composer-context__label">
+                  {a.previewUrl ? <img src={a.previewUrl} alt="" /> : <FileText size={15} />}
+                  <span>{a.path.split("/").pop()}</span>
+                </span>
+              </Tooltip>
+              <Tooltip label={t("composer.removeImage")}>
+                <button
+                  type="button"
+                  onClick={() => setAttachments((prev) => prev.filter((x) => x.path !== a.path))}
+                >
+                  <X size={14} />
+                </button>
+              </Tooltip>
+            </div>
+          ))}
+          {workspaceRefs.map((ref) => (
+            <div
+              className={`composer-context__item composer-context__item--workspace${ref.isDir ? " composer-context__item--folder" : " composer-context__item--file"}`}
+              key={workspaceReferenceKey(ref)}
+            >
+              <Tooltip label={formatWorkspaceReference(ref.path, ref.isDir)}>
+                <span className="composer-context__label">
+                  {ref.isDir ? <Folder size={15} /> : <FileText size={15} />}
+                  <span>{ref.isDir ? `${baseName(ref.path)}/` : baseName(ref.path)}</span>
+                </span>
+              </Tooltip>
+              <Tooltip label={t("composer.removeReference")}>
+                <button
+                  type="button"
+                  onClick={() => removeWorkspaceReference(ref)}
+                >
+                  <X size={13} />
+                </button>
+              </Tooltip>
             </div>
           ))}
         </div>
@@ -591,15 +770,19 @@ export function Composer({
                 <div className="composer__pasted-head">
                   <FileText size={15} />
                   <span>{block.label}</span>
-                  <button type="button" title={t(open ? "composer.pastedHidePreview" : "composer.pastedShowPreview")} onClick={() => togglePastedPreview(block.label)}>
-                    <Eye size={14} />
-                  </button>
-                  <button type="button" title={t("composer.pastedExpand")} onClick={() => expandPastedBlock(block)}>
+                  <Tooltip label={t(open ? "composer.pastedHidePreview" : "composer.pastedShowPreview")}>
+                    <button type="button" onClick={() => togglePastedPreview(block.label)}>
+                      <Eye size={14} />
+                    </button>
+                  </Tooltip>
+                  <button type="button" onClick={() => expandPastedBlock(block)}>
                     {t("composer.pastedExpand")}
                   </button>
-                  <button type="button" title={t("composer.pastedRemove")} onClick={() => removePastedBlock(block)}>
-                    <Trash2 size={14} />
-                  </button>
+                  <Tooltip label={t("composer.pastedRemove")}>
+                    <button type="button" onClick={() => removePastedBlock(block)}>
+                      <Trash2 size={14} />
+                    </button>
+                  </Tooltip>
                 </div>
                 {open && <pre className="composer__pasted-preview">{block.text}</pre>}
               </div>
@@ -629,48 +812,62 @@ export function Composer({
             className="composer__input"
             value={text}
             onChange={(e) => setText(e.target.value)}
+            onSelect={rememberCaret}
+            onClick={rememberCaret}
+            onKeyUp={rememberCaret}
+            onFocus={rememberCaret}
             onPaste={onPaste}
             onKeyDown={onKeyDown}
+            onCompositionStart={() => {
+              composingRef.current = true;
+            }}
+            onCompositionEnd={() => {
+              composingRef.current = false;
+              lastCompositionEndAt.current = Date.now();
+            }}
             placeholder={disabled ? t("common.loading") : t("composer.placeholder")}
             rows={1}
             disabled={disabled}
           />
           {running ? (
-            <button className="composer__btn composer__btn--stop" onClick={handleCancel} title={t("composer.stop")}>
-              <Square size={14} fill="currentColor" />
-            </button>
+            <Tooltip label={t("composer.stop")}>
+              <button className="composer__btn composer__btn--stop" onClick={handleCancel}>
+                <Square size={14} fill="currentColor" />
+              </button>
+            </Tooltip>
           ) : (
-            <button
-              className="composer__btn composer__btn--send"
-              onClick={submit}
-              disabled={pendingPaste > 0 || (!text.trim() && attachments.length === 0) || disabled}
-              title={t("composer.send")}
-            >
-              <ArrowUp size={16} />
-            </button>
+            <Tooltip label={t("composer.send")}>
+              <button
+                className="composer__btn composer__btn--send"
+                onClick={submit}
+                disabled={pendingPaste > 0 || (!text.trim() && attachments.length === 0 && workspaceRefs.length === 0) || disabled}
+              >
+                <ArrowUp size={16} />
+              </button>
+            </Tooltip>
           )}
         </div>
         <div className="composer-meta">
           {cwd && (
             <div className="composer-workspace-wrap" ref={workspaceAnchorRef}>
-              <button
-                className={`composer__workspace${workspaceMenuOpen ? " composer__workspace--open" : ""}`}
-                onClick={() => {
-                  if (!running) setWorkspaceMenuOpen((open) => !open);
-                }}
-                disabled={running}
-                title={running ? t("common.busyHint") : t("status.switchFolder", { cwd })}
-              >
-                <FolderGit2 size={13} />
-                <span>{workspaceName}</span>
-                <ChevronDown size={12} />
-              </button>
+              <Tooltip label={running ? t("common.busyHint") : t("status.switchFolder", { cwd })}>
+                <button
+                  className={`composer__workspace${workspaceMenuOpen ? " composer__workspace--open" : ""}`}
+                  onClick={() => {
+                    if (!running) setWorkspaceMenuOpen((open) => !open);
+                  }}
+                  disabled={running}
+                >
+                  <FolderGit2 size={13} />
+                  <span>{workspaceName}</span>
+                  <ChevronDown size={12} />
+                </button>
+              </Tooltip>
             </div>
           )}
           <button
             className={`composer__mode composer__mode--${mode}`}
             onClick={onCycleMode}
-            title={t("composer.modeTitle")}
           >
             <span className="composer__mode-dot" />
             {mode === "yolo" ? t("composer.modeYolo") : mode === "plan" ? t("composer.modePlan") : t("composer.modeNormal")}

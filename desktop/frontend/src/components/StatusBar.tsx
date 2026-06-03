@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import { Cpu, Wallet } from "lucide-react";
+import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
+import { Tooltip } from "./Tooltip";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
-import type { BalanceInfo, ContextInfo, JobView, Meta, Mode, WireUsage } from "../lib/types";
+import type { BalanceInfo, ContextInfo, EffortInfo, JobView, Meta, Mode, WireUsage } from "../lib/types";
 
 // JobsChip is the status-bar background-jobs indicator: a count that opens an
 // upward popover listing the running jobs (id · label · status), mirroring the
@@ -13,10 +15,12 @@ function JobsChip({ jobs }: { jobs: JobView[] }) {
   const [open, setOpen] = useState(false);
   return (
     <div className="statusbar__jobswrap">
-      <button className="statusbar__jobs" onClick={() => setOpen((v) => !v)} title={t("status.jobsTitle")}>
-        <Cpu size={11} />
-        {t("status.jobs", { n: jobs.length })}
-      </button>
+      <Tooltip label={t("status.jobsTitle")}>
+        <button className="statusbar__jobs" onClick={() => setOpen((v) => !v)}>
+          <Cpu size={11} />
+          {t("status.jobs", { n: jobs.length })}
+        </button>
+      </Tooltip>
       {open && (
         <>
           <div className="modelsw__backdrop" onClick={() => setOpen(false)} />
@@ -84,23 +88,29 @@ export function StatusBar({
   context,
   usage,
   balance,
+  effort,
   jobs,
   running,
   mode,
   turnStartAt,
   turnTokens,
+  retry,
   onSwitchModel,
+  onSetEffort,
 }: {
   meta?: Meta;
   context: ContextInfo;
   usage?: WireUsage;
   balance?: BalanceInfo;
+  effort?: EffortInfo;
   jobs?: JobView[];
   running: boolean;
   mode: Mode;
   turnStartAt: number;
   turnTokens: number;
+  retry?: { attempt: number; max: number };
   onSwitchModel: (name: string) => void;
+  onSetEffort: (level: string) => void;
 }) {
   const { t, locale } = useI18n();
   const now = useTick(running);
@@ -111,7 +121,9 @@ export function StatusBar({
   // While a turn runs, the status line shows live activity (word · elapsed ·
   // tokens) in place of the static context gauge.
   let activity: string | null = null;
-  if (running && turnStartAt) {
+  if (retry) {
+    activity = t("status.retrying", { attempt: retry.attempt, max: retry.max });
+  } else if (running && turnStartAt) {
     const elapsedMs = Math.max(0, now - turnStartAt);
     const words = SPINNER_WORDS[locale];
     const word = words[Math.floor(elapsedMs / 3000) % words.length];
@@ -123,6 +135,12 @@ export function StatusBar({
     <div className="statusbar">
       <span className={`statusbar__dot ${running ? "statusbar__dot--busy" : ""}`} />
       <ModelSwitcher label={meta?.label ?? t("status.connecting")} onPick={onSwitchModel} />
+      {effort?.supported && (
+        <>
+          <span className="statusbar__sep">·</span>
+          <EffortSwitcher effort={effort} disabled={running} onPick={onSetEffort} />
+        </>
+      )}
       {activity ? (
         <>
           <span className="statusbar__sep">·</span>
@@ -157,18 +175,13 @@ export function StatusBar({
       {balance?.available && balance.display && (
         <>
           <span className="statusbar__sep">·</span>
-          <span className="statusbar__balance" title={t("status.balanceTitle")}>
+          <span className="statusbar__balance">
             <Wallet size={11} />
             {balance.display}
           </span>
         </>
       )}
       <span className="statusbar__spacer" />
-      {mode === "yolo" && (
-        <span className="statusbar__yolo" title={t("status.yoloTitle")}>
-          {t("status.yolo")}
-        </span>
-      )}
       {mode === "plan" && <span className="statusbar__plan">{t("status.plan")}</span>}
     </div>
   );

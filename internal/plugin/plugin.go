@@ -17,7 +17,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
+	"reasonix/internal/event"
 	"reasonix/internal/tool"
 )
 
@@ -69,6 +71,10 @@ type Host struct {
 	prompts   []Prompt
 	resources []Resource
 	failures  []Failure
+
+	// Detached stats/schema-cache writers from Start; off the boot path but
+	// drained by Close so cleanup can't race a still-open cache file.
+	bgWrites sync.WaitGroup
 }
 
 // Prompts returns every MCP prompt discovered across connected servers.
@@ -115,6 +121,39 @@ func (h *Host) ReadResource(ctx context.Context, server, uri string) (string, er
 	return target.readResource(ctx, uri) // network call: outside the lock
 }
 
+// StartPolicy tunes batch plugin startup. The zero value disables every safeguard,
+// so most call sites should use the StartAll / StartAvailable wrappers, which
+// fill in production defaults.
+type StartPolicy struct {
+	// PerPluginTimeout caps how long a single plugin's handshake (start +
+	// initialize + listTools + listPrompts/Resources) may take. Zero disables.
+	// Exceeded plugins are recorded as failures and, when AbortOnError is set,
+	// tear down the whole batch with the timeout as the cause.
+	PerPluginTimeout time.Duration
+
+	// Concurrency caps how many handshakes run at once. Zero or negative means
+	// no cap (every plugin gets a goroutine immediately). A small cap prevents
+	// process storms / FD exhaustion when many MCP servers are configured.
+	Concurrency int
+
+	// AbortOnError makes any single failure tear down the partial batch and
+	// return an error (StartAll semantics). When false, failures are recorded
+	// on the host and other plugins keep going (StartAvailable semantics).
+	AbortOnError bool
+}
+
+// defaultStartConcurrency caps parallel handshakes for the batch-start wrappers.
+// Eight is the standard "process storm" guardrail (Bazel's --jobs=auto, most LSP
+// managers) — large enough to mask single-plugin latency, small enough to spare
+// a workstation with 20+ configured MCP servers from fork-bombing itself.
+const defaultStartConcurrency = 8
+
+// defaultStartTimeout is the per-plugin budget used by StartAvailable. Five
+// seconds covers a healthy stdio MCP spawning under a slow npm/node loader; past
+// that, an interactive user is better served by recording the failure and moving
+// on than by stalling the whole session.
+const defaultStartTimeout = 5 * time.Second
+
 // StartAll connects every plugin in parallel, performs the MCP handshake, and
 // returns the union of their tools (namespaced "mcp__<server>__<tool>"). On any
 // failure it tears down everything started so far. The caller must Close the Host.
@@ -122,102 +161,157 @@ func (h *Host) ReadResource(ctx context.Context, server, uri string) (string, er
 // For stdio plugins, subprocess lifetime is bound to ctx (via
 // exec.CommandContext): cancelling ctx kills the children and unblocks reads.
 func StartAll(ctx context.Context, specs []Spec) (*Host, []tool.Tool, error) {
-	if len(specs) == 0 {
-		return &Host{}, nil, nil
-	}
-
-	type result struct {
-		idx    int
-		client *Client
-		tools  []tool.Tool
-		err    error
-	}
-
-	// Start all plugins in parallel — each is an independent subprocess or
-	// HTTP connection with no cross-dependencies.
-	ch := make(chan result, len(specs))
-	for i, s := range specs {
-		go func(idx int, spec Spec) {
-			c, err := start(ctx, spec)
-			if err != nil {
-				ch <- result{idx: idx, err: fmt.Errorf("start plugin %q: %w", spec.Name, err)}
-				return
-			}
-
-			ts, err := c.listTools(ctx)
-			if err != nil {
-				c.close()
-				ch <- result{idx: idx, err: fmt.Errorf("list tools from %q: %w", spec.Name, err)}
-				return
-			}
-			c.toolCount = len(ts)
-
-			// Prompts and resources are auxiliary: only fetched when the server
-			// advertised the capability, and a listing error is tolerated (skipped)
-			// rather than failing the whole session over a non-essential surface.
-			if c.hasPrompts {
-				if ps, perr := c.listPrompts(ctx); perr == nil {
-					c.prompts = ps
-				}
-			}
-			if c.hasResources {
-				if rs, rerr := c.listResources(ctx); rerr == nil {
-					c.resources = rs
-				}
-			}
-
-			ch <- result{idx: idx, client: c, tools: ts}
-		}(i, s)
-	}
-
-	// Collect results in index order so the Host.clients slice matches the
-	// original specs order (stable for /mcp status display).
-	results := make([]result, len(specs))
-	for range specs {
-		r := <-ch
-		results[r.idx] = r
-	}
-
-	// Collect every started client into the Host first, so that if any plugin
-	// failed, h.Close() tears down all of them — including ones whose index sits
-	// after the failure (parallel start means they're already running).
-	h := &Host{}
-	var tools []tool.Tool
-	var firstErr error
-	for _, r := range results {
-		if r.err != nil {
-			if firstErr == nil {
-				firstErr = r.err
-			}
-			continue
-		}
-		h.clients = append(h.clients, r.client)
-		tools = append(tools, r.tools...)
-		h.prompts = append(h.prompts, r.client.prompts...)
-		h.resources = append(h.resources, r.client.resources...)
-	}
-	if firstErr != nil {
-		h.Close()
-		return nil, nil, firstErr
-	}
-	return h, tools, nil
+	return Start(ctx, specs, StartPolicy{
+		Concurrency:  defaultStartConcurrency,
+		AbortOnError: true,
+	})
 }
 
 // StartAvailable connects every plugin it can and records failures on the host
 // instead of aborting the whole session. The returned tools are the union of the
 // successfully connected servers.
 func StartAvailable(ctx context.Context, specs []Spec) (*Host, []tool.Tool) {
+	h, tools, _ := Start(ctx, specs, StartPolicy{
+		PerPluginTimeout: defaultStartTimeout,
+		Concurrency:      defaultStartConcurrency,
+		// AbortOnError stays false: a misconfigured plugin must not bring down
+		// the whole session at boot.
+	})
+	return h, tools
+}
+
+// Start is the unified batch-startup primitive behind StartAll / StartAvailable.
+// It fans out handshakes in parallel under the policy's concurrency cap, gives
+// each plugin its own per-plugin timeout, and either aborts the batch on first
+// failure (AbortOnError=true) or records failures on the host and keeps going.
+//
+// Result ordering matches specs (stable for /mcp status). For stdio plugins the
+// subprocess is bound to the parent ctx, not the per-plugin startup timeout:
+// successful servers stay alive after startup, while failed/time-limited starts
+// are closed explicitly before the goroutine returns.
+func Start(ctx context.Context, specs []Spec, p StartPolicy) (*Host, []tool.Tool, error) {
+	if len(specs) == 0 {
+		return &Host{}, nil, nil
+	}
+
+	type result struct {
+		idx    int
+		spec   Spec
+		client *Client
+		tools  []tool.Tool
+		err    error
+	}
+
+	// A buffered channel acts as a counting semaphore. Capacity 0/negative
+	// means no cap — we still launch one goroutine per spec, but they all run
+	// immediately. Capped, the extra goroutines block on the semaphore until a
+	// slot frees up; collection order is still by idx so /mcp status is stable.
+	concurrency := p.Concurrency
+	if concurrency <= 0 || concurrency > len(specs) {
+		concurrency = len(specs)
+	}
+	sem := make(chan struct{}, concurrency)
+	ch := make(chan result, len(specs))
+
+	// Created before the fan-out so the detached cache writers can join bgWrites.
 	h := &Host{}
+
+	for i, s := range specs {
+		go func(idx int, spec Spec) {
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			callCtx := ctx
+			cancelStartup := func() {}
+			if p.PerPluginTimeout > 0 {
+				var cancel context.CancelFunc
+				callCtx, cancel = context.WithTimeout(ctx, p.PerPluginTimeout)
+				cancelStartup = cancel
+			}
+
+			phaseAStart := time.Now()
+
+			// Transport on the parent ctx, startup RPCs on the timed callCtx: the
+			// per-plugin timeout caps initialize+listTools, but the long-lived
+			// stdio child must outlive the startup scope and later phase-B calls.
+			c, err := start(ctx, callCtx, spec)
+			if err != nil {
+				phaseADur := time.Since(phaseAStart)
+				cancelStartup()
+				h.bgWrites.Add(1)
+				go func() { defer h.bgWrites.Done(); _ = RecordStartup(spec.Name, phaseADur) }()
+				ch <- result{idx: idx, spec: spec, err: fmt.Errorf("start plugin %q: %w", spec.Name, err)}
+				return
+			}
+
+			ts, err := c.listTools(callCtx)
+			if err != nil {
+				phaseADur := time.Since(phaseAStart)
+				cancelStartup()
+				h.bgWrites.Add(1)
+				go func() { defer h.bgWrites.Done(); _ = RecordStartup(spec.Name, phaseADur) }()
+				c.close()
+				ch <- result{idx: idx, spec: spec, err: fmt.Errorf("list tools from %q: %w", spec.Name, err)}
+				return
+			}
+			c.toolCount = len(ts)
+
+			// Persist for next launch on the side: a slow stats/cache write
+			// must not delay tools coming online, and either failure is
+			// recoverable (we just re-handshake or skip auto-demote).
+			phaseADur := time.Since(phaseAStart)
+			cancelStartup()
+			h.bgWrites.Add(1)
+			go func() {
+				defer h.bgWrites.Done()
+				_ = RecordStartup(spec.Name, phaseADur)
+				_ = SaveCachedSchema(spec.Name, CachedSchema{
+					SpecHash: SpecFingerprint(spec),
+					Capabilities: map[string]bool{
+						"prompts":   c.hasPrompts,
+						"resources": c.hasResources,
+					},
+					Tools: cacheableToolsOf(ts),
+				})
+			}()
+
+			// Prompts and resources are deferred to StartPhaseB so the boot path
+			// can return as soon as tools are ready — the slow-to-list surfaces
+			// stream in later and fan out an MCPSurfaceReady event each.
+			ch <- result{idx: idx, spec: spec, client: c, tools: ts}
+		}(i, s)
+	}
+
+	// Wait for every goroutine even on abort: started clients sit beyond a
+	// failing index, so we need them all back to tear them down in Close().
+	results := make([]result, len(specs))
+	for range specs {
+		r := <-ch
+		results[r.idx] = r
+	}
+
 	var tools []tool.Tool
-	for _, s := range specs {
-		ts, err := h.addConnected(ctx, s)
-		if err != nil {
-			h.RecordFailure(s, err)
+	var firstErr error
+	for _, r := range results {
+		if r.err != nil {
+			if p.AbortOnError {
+				if firstErr == nil {
+					firstErr = r.err
+				}
+			} else {
+				h.RecordFailure(r.spec, r.err)
+			}
 			continue
 		}
-		tools = append(tools, ts...)
+		h.clients = append(h.clients, r.client)
+		tools = append(tools, r.tools...)
+		// prompts/resources are filled in later by StartPhaseB.
 	}
-	return h, tools
+	if firstErr != nil {
+		h.Close()
+		return nil, nil, firstErr
+	}
+	return h, tools, nil
 }
 
 // Close terminates all plugin connections.
@@ -228,6 +322,84 @@ func (h *Host) Close() {
 	for _, c := range clients {
 		c.close()
 	}
+	h.bgWrites.Wait() // drain detached stats/schema writers before returning
+}
+
+// StartPhaseB asynchronously fetches the auxiliary surfaces (prompts and
+// resources) for every connected client. Boot calls it right after Start
+// returns, on a session-scoped ctx, so the agent becomes responsive as soon as
+// tools are ready and the slower list calls stream in afterwards. Each finished
+// surface fires an MCPSurfaceReady event on sink so UIs (e.g. /mcp status) can
+// refresh without polling. A nil sink is tolerated — the merge still happens.
+// Errors are logged and swallowed: prompts/resources are non-essential and must
+// not break the session over one slow server.
+func (h *Host) StartPhaseB(ctx context.Context, sink event.Sink) {
+	h.mu.RLock()
+	clients := append([]*Client(nil), h.clients...)
+	h.mu.RUnlock()
+	for _, c := range clients {
+		if c.hasPrompts {
+			go h.fetchPrompts(ctx, c, sink)
+		}
+		if c.hasResources {
+			go h.fetchResources(ctx, c, sink)
+		}
+	}
+}
+
+func (h *Host) fetchPrompts(ctx context.Context, c *Client, sink event.Sink) {
+	aux, auxCtx, cancel, err := c.auxiliaryClient(ctx)
+	if err != nil {
+		slog.Warn("plugin: start auxiliary prompt client failed", "server", c.name, "err", err)
+		return
+	}
+	defer cancel()
+	defer aux.close()
+
+	ps, err := aux.listPrompts(auxCtx)
+	if err != nil {
+		slog.Warn("plugin: listPrompts failed", "server", c.name, "err", err)
+		return
+	}
+	for i := range ps {
+		ps[i].client = c
+	}
+	h.mu.Lock()
+	c.prompts = ps
+	h.prompts = append(h.prompts, ps...)
+	h.mu.Unlock()
+	if sink != nil {
+		sink.Emit(event.Event{
+			Kind: event.MCPSurfaceReady,
+			Text: fmt.Sprintf("%s: prompts ready (%d items)", c.name, len(ps)),
+		})
+	}
+}
+
+func (h *Host) fetchResources(ctx context.Context, c *Client, sink event.Sink) {
+	aux, auxCtx, cancel, err := c.auxiliaryClient(ctx)
+	if err != nil {
+		slog.Warn("plugin: start auxiliary resource client failed", "server", c.name, "err", err)
+		return
+	}
+	defer cancel()
+	defer aux.close()
+
+	rs, err := aux.listResources(auxCtx)
+	if err != nil {
+		slog.Warn("plugin: listResources failed", "server", c.name, "err", err)
+		return
+	}
+	h.mu.Lock()
+	c.resources = rs
+	h.resources = append(h.resources, rs...)
+	h.mu.Unlock()
+	if sink != nil {
+		sink.Emit(event.Event{
+			Kind: event.MCPSurfaceReady,
+			Text: fmt.Sprintf("%s: resources ready (%d items)", c.name, len(rs)),
+		})
+	}
 }
 
 // Client is one MCP server connection: a name plus the transport carrying its
@@ -236,6 +408,7 @@ func (h *Host) Close() {
 type Client struct {
 	name string
 	t    transport
+	spec Spec
 
 	// Capabilities advertised by the server at initialize. prompts/list and
 	// resources/list are only called when advertised, so we never provoke a
@@ -251,6 +424,16 @@ type Client struct {
 	prompts   []Prompt
 	resources []Resource
 	tools     []ToolInfo
+}
+
+func (c *Client) auxiliaryClient(ctx context.Context) (*Client, context.Context, context.CancelFunc, error) {
+	auxCtx, cancel := context.WithTimeout(ctx, defaultStartTimeout)
+	aux, err := start(auxCtx, auxCtx, c.spec)
+	if err != nil {
+		cancel()
+		return nil, nil, nil, err
+	}
+	return aux, auxCtx, cancel, nil
 }
 
 // ToolInfo is the human-facing metadata returned by MCP tools/list for one tool.
@@ -372,7 +555,7 @@ func (h *Host) Add(ctx context.Context, s Spec) ([]tool.Tool, error) {
 }
 
 func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
-	c, err := start(ctx, s)
+	c, err := start(ctx, ctx, s)
 	if err != nil {
 		return nil, err
 	}
@@ -382,30 +565,20 @@ func (h *Host) addConnected(ctx context.Context, s Spec) ([]tool.Tool, error) {
 		return nil, fmt.Errorf("list tools: %w", err)
 	}
 	c.toolCount = len(ts)
-	// Do the remaining network calls before taking the lock, so a hot-add never
-	// blocks status reads for the duration of a listPrompts/listResources round-trip.
-	var prompts []Prompt
-	if c.hasPrompts {
-		if ps, perr := c.listPrompts(ctx); perr == nil {
-			prompts = ps
-		} else {
-			slog.Warn("plugin: listPrompts failed", "server", s.Name, "err", perr)
-		}
-	}
-	var resources []Resource
-	if c.hasResources {
-		if rs, rerr := c.listResources(ctx); rerr == nil {
-			resources = rs
-		} else {
-			slog.Warn("plugin: listResources failed", "server", s.Name, "err", rerr)
-		}
-	}
 	h.mu.Lock()
 	h.clients = append(h.clients, c)
-	h.prompts = append(h.prompts, prompts...)
-	h.resources = append(h.resources, resources...)
 	h.clearFailure(s.Name)
 	h.mu.Unlock()
+	// Prompts and resources stream in on the long ctx the caller passed (Host.Add
+	// uses the session-scoped PluginCtx, not a per-turn ctx), so the slow list
+	// calls cannot starve a /mcp add of its return value. nil sink keeps hot-add
+	// quiet — the chat UI re-queries Host.Prompts()/Resources() on demand.
+	if c.hasPrompts {
+		go h.fetchPrompts(ctx, c, nil)
+	}
+	if c.hasResources {
+		go h.fetchResources(ctx, c, nil)
+	}
 	return ts, nil
 }
 
@@ -451,8 +624,15 @@ func (h *Host) Remove(name string) (toolPrefix string, found bool) {
 	return "mcp__" + normalizeName(name) + "__", true
 }
 
-func start(ctx context.Context, s Spec) (*Client, error) {
-	t, err := newTransport(ctx, s)
+// start opens the transport on lifeCtx (whose cancellation later closes the
+// subprocess) and uses callCtx for the initialize round-trip (whose cancellation
+// only bounds startup RPCs). Splitting the two lets a per-plugin timeout cap
+// handshake latency without making the timeout context own a successfully
+// registered stdio server; the child also has to outlive phase A so phase B
+// (prompts + resources) can still call it later. Callers that don't care pass
+// the same ctx for both.
+func start(lifeCtx, callCtx context.Context, s Spec) (*Client, error) {
+	t, err := newTransport(lifeCtx, s)
 	if err != nil {
 		return nil, err
 	}
@@ -460,8 +640,8 @@ func start(ctx context.Context, s Spec) (*Client, error) {
 	if tt == "" {
 		tt = "stdio"
 	}
-	c := &Client{name: s.Name, t: t, transport: tt}
-	if err := c.initialize(ctx); err != nil {
+	c := &Client{name: s.Name, t: t, spec: s, transport: tt}
+	if err := c.initialize(callCtx); err != nil {
 		c.close()
 		return nil, err
 	}
@@ -567,7 +747,12 @@ func (c *Client) listTools(ctx context.Context) ([]tool.Tool, error) {
 // matching Claude Code. Spaces in either part are normalised to underscores so
 // the name is a clean identifier the model can call.
 func toolName(server, raw string) string {
-	return "mcp__" + normalizeName(server) + "__" + normalizeName(raw)
+	return ToolPrefix(server) + normalizeName(raw)
+}
+
+// ToolPrefix is the model-visible namespace prefix for every tool from server.
+func ToolPrefix(server string) string {
+	return "mcp__" + normalizeName(server) + "__"
 }
 
 var invalidNameChars = regexp.MustCompile(`[^a-zA-Z0-9_-]+`)
@@ -689,12 +874,4 @@ func parseToolResult(res json.RawMessage) (string, error) {
 		return text, fmt.Errorf("plugin tool reported error: %s", text)
 	}
 	return text, nil
-}
-
-func envSlice(m map[string]string) []string {
-	out := make([]string, 0, len(m))
-	for k, v := range m {
-		out = append(out, k+"="+v)
-	}
-	return out
 }

@@ -10,6 +10,7 @@ import { app, onEvent, onReady } from "./bridge";
 import type {
   BalanceInfo,
   ContextInfo,
+  EffortInfo,
   HistoryMessage,
   JobView,
   MemoryView,
@@ -23,6 +24,11 @@ import type {
 } from "./types";
 
 export type ToolStatus = "running" | "done" | "error" | "stopped";
+
+// LiveStream holds the in-flight assistant segment's text/reasoning, kept out of
+// `items` so per-token deltas don't rebuild the backlog. It folds back into its
+// assistant item on the closing `message` (or at turn end as a fallback).
+export type LiveStream = { id: string; text: string; reasoning: string };
 
 export type Item =
   | { kind: "user"; id: string; text: string }
@@ -68,12 +74,16 @@ interface State {
   // balance is the active provider's wallet readout, refreshed on mount and after
   // each turn; undefined until first fetched, available:false when not configured.
   balance?: BalanceInfo;
+  effort?: EffortInfo;
   // jobs are the running background jobs, refreshed on mount, turn end, and on
   // each notice (job start/finish emit notices).
   jobs: JobView[];
   // currentAssistant tracks the in-flight assistant item that text/reasoning
   // deltas accumulate into; cleared at turn boundaries.
   currentAssistant?: string;
+  // live is the streaming segment's accumulating text/reasoning, kept out of
+  // items so a token only updates this O(1) field, not the whole backlog.
+  live?: LiveStream;
   // pendingUser holds a just-sent message whose bubble is deferred until the
   // server's first real packet, so an Esc/Stop before any reply "un-sends" it —
   // restoring the text to the composer with nothing left in the transcript. It's
@@ -88,6 +98,9 @@ interface State {
   // frontend-observed harness state; no model cooperation needed.
   turnStartAt: number;
   turnTokens: number;
+  // retry drives the transient "retrying (n/m)" indicator while the provider
+  // re-attempts the connection; cleared by the next stream event or turn end.
+  retry?: { attempt: number; max: number };
   // seq is a monotonic id source so React keys stay stable across re-renders.
   seq: number;
 }
@@ -110,8 +123,10 @@ type Action =
   | { type: "meta"; meta: Meta }
   | { type: "context"; context: ContextInfo }
   | { type: "balance"; balance: BalanceInfo }
+  | { type: "effort"; effort: EffortInfo }
   | { type: "jobs"; jobs: JobView[] }
   | { type: "history"; messages: HistoryMessage[] }
+  | { type: "local_notice"; level: "info" | "warn"; text: string }
   | { type: "clearApproval" }
   | { type: "clearAsk" }
   | { type: "reset" };
@@ -146,7 +161,7 @@ function applyEvent(s: State, e: WireEvent): State {
   // After an un-send, swallow the cancelled turn's still-buffered events so no
   // orphan assistant/tool bubble appears; its turn_done clears the discard.
   if (s.discardTurn) {
-    if (e.kind === "turn_done") return { ...s, discardTurn: false, running: false, turnActive: false, currentAssistant: undefined };
+    if (e.kind === "turn_done") return { ...s, discardTurn: false, running: false, turnActive: false, currentAssistant: undefined, live: undefined };
     return s;
   }
   // The first real packet means the server replied — commit the deferred user
@@ -155,32 +170,42 @@ function applyEvent(s: State, e: WireEvent): State {
   if (s.pendingUser !== undefined && e.kind !== "turn_started" && e.kind !== "turn_done") {
     s = flushPendingUser(s);
   }
+  if (e.kind === "retrying") {
+    return { ...s, retry: { attempt: e.retryAttempt ?? 0, max: e.retryMax ?? 0 } };
+  }
+  // Any other event got past the retry window (or ended the turn): clear it.
+  if (s.retry) {
+    s = { ...s, retry: undefined };
+  }
   switch (e.kind) {
     case "turn_started":
       return { ...s, running: true, turnActive: true, currentAssistant: undefined, turnStartAt: Date.now(), turnTokens: 0 };
 
     case "text":
     case "reasoning": {
+      // ensureAssistant appends the placeholder once per segment (items changes
+      // then); subsequent tokens only grow `live`, leaving items' ref untouched.
       const { items, id, seq } = ensureAssistant(s);
       const delta = e.text ?? e.reasoning ?? "";
-      const next = items.map((it) =>
-        it.kind === "assistant" && it.id === id
-          ? e.kind === "text"
-            ? { ...it, text: it.text + delta }
-            : { ...it, reasoning: it.reasoning + delta }
-          : it,
-      );
-      return { ...s, items: next, currentAssistant: id, seq };
+      const base = s.live?.id === id ? s.live : { id, text: "", reasoning: "" };
+      const live =
+        e.kind === "text" ? { ...base, text: base.text + delta } : { ...base, reasoning: base.reasoning + delta };
+      return { ...s, items, live, currentAssistant: id, seq };
     }
 
     case "message": {
       const { items, id, seq } = ensureAssistant(s);
       const next = items.map((it) =>
         it.kind === "assistant" && it.id === id
-          ? { ...it, text: e.text ?? it.text, reasoning: e.reasoning ?? it.reasoning, streaming: false }
+          ? {
+              ...it,
+              text: e.text ?? s.live?.text ?? it.text,
+              reasoning: e.reasoning ?? s.live?.reasoning ?? it.reasoning,
+              streaming: false,
+            }
           : it,
       );
-      return { ...s, items: next, currentAssistant: undefined, seq };
+      return { ...s, items: next, live: undefined, currentAssistant: undefined, seq };
     }
 
     case "tool_dispatch": {
@@ -239,6 +264,17 @@ function applyEvent(s: State, e: WireEvent): State {
           };
         }
       }
+      return { ...s, items: next };
+    }
+
+    case "tool_progress": {
+      const t = e.tool;
+      if (!t?.id) return s;
+      const idx = s.items.findIndex((it) => it.kind === "tool" && it.id === t.id);
+      if (idx < 0) return s;
+      const next = [...s.items];
+      const it = next[idx];
+      if (it.kind === "tool") next[idx] = { ...it, output: (it.output ?? "") + (t.output ?? "") };
       return { ...s, items: next };
     }
 
@@ -322,10 +358,13 @@ function applyEvent(s: State, e: WireEvent): State {
       // reply, or an empty turn) was really sent — commit it so it isn't lost. A
       // user-cancel before any reply takes the un-send path instead (discardTurn).
       if (s.pendingUser !== undefined) s = flushPendingUser(s);
-      // The turn is over, so nothing more will arrive: freeze a streaming
-      // assistant, and settle any tool still "running" (e.g. a call interrupted
-      // by cancel, which never gets a result) to "stopped" so it stops spinning.
+      // The turn is over, so nothing more will arrive: fold any residual live
+      // segment (a turn that errored before its closing `message`) back into its
+      // item, freeze a streaming assistant, and settle any tool still "running"
+      // (e.g. a call interrupted by cancel, which never gets a result) to "stopped".
       const finalized = s.items.map((it) => {
+        if (it.kind === "assistant" && s.live && it.id === s.live.id)
+          return { ...it, text: s.live.text, reasoning: s.live.reasoning, streaming: false };
         if (it.kind === "assistant" && it.streaming) return { ...it, streaming: false };
         if (it.kind === "tool" && it.status === "running") return { ...it, status: "stopped" as const };
         return it;
@@ -333,8 +372,12 @@ function applyEvent(s: State, e: WireEvent): State {
       const items: Item[] = e.err
         ? [...finalized, { kind: "notice", id: `e${s.seq}`, level: "warn", text: e.err }]
         : finalized;
-      return { ...s, items, running: false, turnActive: false, currentAssistant: undefined, approval: undefined, ask: undefined, seq: s.seq + 1 };
+      return { ...s, items, live: undefined, running: false, turnActive: false, currentAssistant: undefined, approval: undefined, ask: undefined, seq: s.seq + 1 };
     }
+    // An unrecognized event kind (e.g. one the kernel added but this build's wire
+    // map doesn't name yet) must not collapse state to undefined — ignore it.
+    default:
+      return s;
   }
 }
 
@@ -355,28 +398,40 @@ function reducer(s: State, a: Action): State {
       // Esc/Stop before any reply: drop the deferred bubble and mark the turn
       // discarded so its trailing events are swallowed. The composer restores the
       // text from cancel()'s return value.
-      return { ...s, pendingUser: undefined, discardTurn: true, running: false };
+      return { ...s, pendingUser: undefined, discardTurn: true, running: false, live: undefined };
     case "meta":
       return { ...s, meta: a.meta };
     case "context":
       return { ...s, context: a.context };
     case "balance":
       return { ...s, balance: a.balance };
+    case "effort":
+      return { ...s, effort: a.effort };
     case "jobs":
       return { ...s, jobs: a.jobs };
     case "history": {
-      // Only user/assistant turns with visible text — never the system prompt or
-      // tool-result messages, and not the empty content of a tool-call-only turn.
+      // Only user/assistant turns with visible text or assistant reasoning — never
+      // the system prompt or tool-result messages.
       const visible = a.messages.filter(
-        (m) => (m.role === "user" || m.role === "assistant") && m.content.trim() !== "",
+        (m) =>
+          (m.role === "user" && m.content.trim() !== "") ||
+          (m.role === "assistant" && (m.content.trim() !== "" || (m.reasoning ?? "").trim() !== "")),
       );
       const items: Item[] = visible.map((m, i) =>
         m.role === "user"
           ? { kind: "user", id: `h${i}`, text: m.content }
-          : { kind: "assistant", id: `h${i}`, text: m.content, reasoning: "", streaming: false },
+          : { kind: "assistant", id: `h${i}`, text: m.content, reasoning: m.reasoning ?? "", streaming: false },
       );
       return { ...s, items, seq: s.seq + visible.length };
     }
+    case "local_notice":
+      return {
+        ...s,
+        running: false,
+        turnActive: false,
+        seq: s.seq + 1,
+        items: [...s.items, { kind: "notice", id: `n${s.seq}`, level: a.level, text: a.text }],
+      };
     case "clearApproval":
       return { ...s, approval: undefined };
     case "clearAsk":
@@ -384,9 +439,11 @@ function reducer(s: State, a: Action): State {
     case "reset":
       // Background jobs and the balance are session-scoped (the controller and its
       // job manager survive a new-session rotation), so carry them across a reset.
-      return { ...initialState, meta: s.meta, context: { ...s.context, used: 0 }, balance: s.balance, jobs: s.jobs };
+      return { ...initialState, meta: s.meta, context: { ...s.context, used: 0 }, balance: s.balance, effort: s.effort, jobs: s.jobs };
     case "event":
       return applyEvent(s, a.e);
+    default:
+      return s;
   }
 }
 
@@ -403,6 +460,7 @@ export function useController() {
     try {
       dispatch({ type: "meta", meta: await app.Meta() });
       dispatch({ type: "context", context: await app.ContextUsage() });
+      dispatch({ type: "effort", effort: await app.Effort() });
       const history = await app.History();
       if (history && history.length) dispatch({ type: "history", messages: history });
     } catch {
@@ -425,6 +483,10 @@ export function useController() {
         app
           .Balance()
           .then((balance) => dispatch({ type: "balance", balance }))
+          .catch(() => {});
+        app
+          .Effort()
+          .then((effort) => dispatch({ type: "effort", effort }))
           .catch(() => {});
       }
       // Background jobs start/finish via notices and bound around a turn, so
@@ -449,6 +511,10 @@ export function useController() {
         .Jobs()
         .then((jobs) => dispatch({ type: "jobs", jobs }))
         .catch(() => {});
+      app
+        .Effort()
+        .then((effort) => dispatch({ type: "effort", effort }))
+        .catch(() => {});
     });
 
     // Initial load — picks up the pre-build Meta (ready=false) and, if the
@@ -460,6 +526,10 @@ export function useController() {
     app
       .Balance()
       .then((balance) => dispatch({ type: "balance", balance }))
+      .catch(() => {});
+    app
+      .Effort()
+      .then((effort) => dispatch({ type: "effort", effort }))
       .catch(() => {});
     app
       .Jobs()
@@ -478,6 +548,10 @@ export function useController() {
     const submit = submitText.trim();
     const call = display !== submit ? app.SubmitDisplay(display, submit) : app.Submit(submit);
     call.catch(() => {});
+  }, []);
+
+  const notice = useCallback((text: string, level: "info" | "warn" = "info") => {
+    dispatch({ type: "local_notice", level, text });
   }, []);
 
   // cancel aborts the in-flight turn. If the server hasn't replied yet (the user
@@ -533,6 +607,10 @@ export function useController() {
     app.ContextUsage().then((context) => dispatch({ type: "context", context })).catch(() => {});
   }, []);
 
+  const previewSession = useCallback((path: string): Promise<HistoryMessage[]> => {
+    return app.PreviewSession(path).catch(() => []);
+  }, []);
+
   // Manage saved sessions: delete one, or give it a custom name (""=clear). Both
   // only touch on-disk state; the caller re-fetches the list to reflect the change.
   const deleteSession = useCallback((path: string) => {
@@ -549,6 +627,7 @@ export function useController() {
     try {
       dispatch({ type: "meta", meta: await app.Meta() });
       dispatch({ type: "context", context: await app.ContextUsage() });
+      dispatch({ type: "effort", effort: await app.Effort() });
     } catch {
       /* ignore */
     }
@@ -560,6 +639,7 @@ export function useController() {
       try {
         dispatch({ type: "meta", meta: await app.Meta() });
         dispatch({ type: "context", context: await app.ContextUsage() });
+        dispatch({ type: "effort", effort: await app.Effort() });
       } catch {
         /* ignore */
       }
@@ -591,6 +671,18 @@ export function useController() {
     try {
       dispatch({ type: "meta", meta: await app.Meta() });
       dispatch({ type: "context", context: await app.ContextUsage() });
+      dispatch({ type: "effort", effort: await app.Effort() });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
+  const setEffort = useCallback(async (level: string) => {
+    await app.SetEffort(level).catch(() => {});
+    try {
+      dispatch({ type: "meta", meta: await app.Meta() });
+      dispatch({ type: "context", context: await app.ContextUsage() });
+      dispatch({ type: "effort", effort: await app.Effort() });
     } catch {
       /* ignore */
     }
@@ -644,6 +736,7 @@ export function useController() {
   return {
     state,
     send,
+    notice,
     cancel,
     approve,
     answerQuestion,
@@ -652,6 +745,7 @@ export function useController() {
     newSession,
     listSessions,
     resumeSession,
+    previewSession,
     deleteSession,
     renameSession,
     refreshMeta,
@@ -660,6 +754,7 @@ export function useController() {
     compact,
     rewind,
     setModel,
+    setEffort,
     fetchMemory,
     remember,
     forget,

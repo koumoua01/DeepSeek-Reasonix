@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -63,8 +64,9 @@ type Controller struct {
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
 	// model/key switch — which rebuilds the controller — refreshes them.
-	balanceURL string
-	balanceKey string
+	balanceURL    string
+	balanceKey    string
+	balanceClient *http.Client
 
 	// jobs is the session-scoped background-job manager. The agent's background
 	// tools spawn into it; Compose drains its completion notes into the next turn;
@@ -158,8 +160,9 @@ type Options struct {
 	Cleanup      func()
 	// BalanceURL/BalanceKey wire the active provider's optional wallet-balance
 	// endpoint and bearer key; empty when the provider declares no balance_url.
-	BalanceURL string
-	BalanceKey string
+	BalanceURL    string
+	BalanceKey    string
+	BalanceClient *http.Client
 	// Jobs is the session-scoped background-job manager (nil disables background jobs).
 	Jobs *jobs.Manager
 	// Registry is the executor's live tool set, and PluginCtx the session-scoped
@@ -188,31 +191,32 @@ func New(opts Options) *Controller {
 		pluginCtx = context.Background()
 	}
 	c := &Controller{
-		runner:       opts.Runner,
-		executor:     opts.Executor,
-		sink:         sink,
-		policy:       opts.Policy,
-		label:        opts.Label,
-		systemPrompt: opts.SystemPrompt,
-		sessionDir:   opts.SessionDir,
-		sessionPath:  opts.SessionPath,
-		host:         opts.Host,
-		commands:     opts.Commands,
-		skills:       opts.Skills,
-		hooks:        opts.Hooks,
-		mem:          opts.Memory,
-		cleanup:      opts.Cleanup,
-		autoPlan:     normalizeAutoPlan(opts.AutoPlan),
-		classifier:   classifier,
-		balanceURL:   opts.BalanceURL,
-		balanceKey:   opts.BalanceKey,
-		jobs:         opts.Jobs,
-		reg:          opts.Registry,
-		pluginCtx:    pluginCtx,
-		cpRoot:       opts.WorkspaceRoot,
-		approvals:    map[string]chan approvalReply{},
-		asks:         map[string]chan []event.AskAnswer{},
-		granted:      map[string]bool{},
+		runner:        opts.Runner,
+		executor:      opts.Executor,
+		sink:          sink,
+		policy:        opts.Policy,
+		label:         opts.Label,
+		systemPrompt:  opts.SystemPrompt,
+		sessionDir:    opts.SessionDir,
+		sessionPath:   opts.SessionPath,
+		host:          opts.Host,
+		commands:      opts.Commands,
+		skills:        opts.Skills,
+		hooks:         opts.Hooks,
+		mem:           opts.Memory,
+		cleanup:       opts.Cleanup,
+		autoPlan:      normalizeAutoPlan(opts.AutoPlan),
+		classifier:    classifier,
+		balanceURL:    opts.BalanceURL,
+		balanceKey:    opts.BalanceKey,
+		balanceClient: opts.BalanceClient,
+		jobs:          opts.Jobs,
+		reg:           opts.Registry,
+		pluginCtx:     pluginCtx,
+		cpRoot:        opts.WorkspaceRoot,
+		approvals:     map[string]chan approvalReply{},
+		asks:          map[string]chan []event.AskAnswer{},
+		granted:       map[string]bool{},
 	}
 	// Checkpoints: bind a store to the session and route writer pre-edits into it.
 	c.rebindCheckpoints(opts.SessionPath)
@@ -284,12 +288,13 @@ func (c *Controller) runGuarded(body func(ctx context.Context) error) {
 	c.mu.Unlock()
 
 	go func() {
+		defer cancel()
 		err := body(ctx)
 		c.mu.Lock()
 		c.running = false
 		c.cancel = nil
 		c.mu.Unlock()
-		c.sink.Emit(event.Event{Kind: event.TurnDone, Err: err})
+		c.sink.Emit(event.Event{Kind: event.TurnDone, Err: explainError(err)})
 	}()
 }
 
@@ -334,6 +339,8 @@ func (c *Controller) runTurnWithRaw(ctx context.Context, input, raw string) erro
 	c.maybeSessionStart(ctx)
 	c.maybeAutoPlan(ctx, raw)
 	input = c.Compose(input)
+	startMessages := c.messageCount()
+	defer c.snapshotActivityIfChanged(startMessages)
 	// Open a checkpoint for this turn before the user message is appended, so the
 	// recorded message boundary precedes it and pre-edit snapshots land here.
 	c.beginCheckpoint(input)
@@ -409,6 +416,14 @@ func lastAssistantText(msgs []provider.Message) string {
 // turn with its @-references resolved first.
 func (c *Controller) Submit(input string) {
 	trimmed := strings.TrimSpace(input)
+	if note, ok := MemoryQuickAddNote(trimmed); ok {
+		c.rememberProjectNote(note)
+		return
+	}
+	if note, ok := RememberCommandNote(trimmed); ok {
+		c.rememberProjectNote(note)
+		return
+	}
 	switch {
 	case trimmed == "/compact" || strings.HasPrefix(trimmed, "/compact "):
 		focus := strings.TrimSpace(strings.TrimPrefix(trimmed, "/compact"))
@@ -430,20 +445,6 @@ func (c *Controller) Submit(input string) {
 				c.notice("new session")
 			}
 		}()
-	case strings.HasPrefix(trimmed, "#"):
-		// "#<note>" quick-adds a memory line — same shortcut as the chat TUI, so
-		// the desktop and HTTP frontends (which route raw input through Submit)
-		// get it for free. It never starts a model turn.
-		note := strings.TrimSpace(trimmed[1:])
-		if note == "" {
-			c.notice("nothing to remember")
-			return
-		}
-		if path, err := c.QuickAdd(memory.ScopeProject, note); err != nil {
-			c.notice("memory: " + err.Error())
-		} else {
-			c.notice("remembered → " + path)
-		}
 	case strings.HasPrefix(trimmed, "/mcp__"):
 		c.runGuarded(func(ctx context.Context) error {
 			sent, found, err := c.MCPPrompt(ctx, trimmed)
@@ -457,6 +458,10 @@ func (c *Controller) Submit(input string) {
 			return c.runTurnWithRaw(ctx, sent, sent)
 		})
 	case strings.HasPrefix(trimmed, "/"):
+		if ref, ok := FileRefLine(trimmed); ok {
+			c.runRefTurn(ref)
+			return
+		}
 		// Read-only management verbs (/model /memory /skill /hooks /mcp) emit a
 		// listing Notice, so Submit-based frontends (desktop, HTTP) get them with
 		// no extra wiring. (The chat TUI handles these itself with richer output.)
@@ -505,18 +510,36 @@ func (c *Controller) Submit(input string) {
 		}
 		c.notice("unknown command: " + trimmed)
 	default:
-		c.runGuarded(func(ctx context.Context) error {
-			block, errs := c.ResolveRefs(ctx, input)
-			for _, e := range errs {
-				c.notice(e)
-			}
-			sent := input
-			if block != "" {
-				sent = "Referenced context:\n\n" + block + "\n\n" + input
-			}
-			return c.runTurnWithRaw(ctx, sent, input)
-		})
+		c.runRefTurn(input)
 	}
+}
+
+func (c *Controller) rememberProjectNote(note string) {
+	if note == "" {
+		c.notice("nothing to remember")
+		return
+	}
+	if path, err := c.QuickAdd(memory.ScopeProject, note); err != nil {
+		c.notice("memory: " + err.Error())
+	} else {
+		c.notice("remembered → " + path)
+	}
+}
+
+// runRefTurn resolves a line's @references into a context block and starts a
+// turn with it prepended (or the raw line when nothing resolved).
+func (c *Controller) runRefTurn(input string) {
+	c.runGuarded(func(ctx context.Context) error {
+		block, errs := c.ResolveRefs(ctx, input)
+		for _, e := range errs {
+			c.notice(e)
+		}
+		sent := input
+		if block != "" {
+			sent = "Referenced context:\n\n" + block + "\n\n" + input
+		}
+		return c.runTurnWithRaw(ctx, sent, input)
+	})
 }
 
 // notice emits an informational Notice event.
@@ -529,6 +552,8 @@ func (c *Controller) notice(text string) {
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
 func (c *Controller) Run(ctx context.Context, input string) error {
 	c.maybeSessionStart(ctx)
+	startMessages := c.messageCount()
+	defer c.snapshotActivityIfChanged(startMessages)
 	if c.hooks.Enabled() {
 		c.turn++
 		if block, _ := c.hooks.PromptSubmit(ctx, input, c.turn); block {
@@ -937,6 +962,8 @@ func resolveBranch(branches []agent.BranchInfo, ref string) (agent.BranchInfo, e
 			matches = append(matches, b)
 		case strings.HasPrefix(strings.ToLower(b.ID), refLower):
 			matches = append(matches, b)
+		case strings.HasPrefix(strings.ToLower(shortBranchID(b.ID)), refLower):
+			matches = append(matches, b)
 		case b.Path == ref:
 			return b, nil
 		}
@@ -1023,6 +1050,18 @@ func (c *Controller) Resume(s *agent.Session, path string) {
 // interaction). Called after every turn so a crash loses at most one in-flight
 // prompt.
 func (c *Controller) Snapshot() error {
+	return c.snapshot(false)
+}
+
+// SnapshotActivity writes the active conversation and marks the session as
+// recently active. Use it only after a real user/model turn changes the
+// transcript; switch/close snapshots should call Snapshot so they do not reorder
+// recent-session pickers.
+func (c *Controller) SnapshotActivity() error {
+	return c.snapshot(true)
+}
+
+func (c *Controller) snapshot(markActivity bool) error {
 	c.mu.Lock()
 	path := c.sessionPath
 	c.mu.Unlock()
@@ -1033,10 +1072,34 @@ func (c *Controller) Snapshot() error {
 	if !s.HasContent() {
 		return nil
 	}
+	if !markActivity {
+		if _, err := agent.EnsureBranchMeta(path); err != nil {
+			return err
+		}
+	}
 	if err := s.Save(path); err != nil {
 		return err
 	}
-	return agent.TouchBranchMeta(path)
+	if markActivity {
+		return agent.TouchBranchMeta(path)
+	}
+	return nil
+}
+
+func (c *Controller) messageCount() int {
+	if c.executor == nil {
+		return 0
+	}
+	return len(c.executor.Session().Snapshot())
+}
+
+func (c *Controller) snapshotActivityIfChanged(startMessages int) {
+	if c.messageCount() <= startMessages {
+		return
+	}
+	if err := c.SnapshotActivity(); err != nil {
+		slog.Warn("controller: activity snapshot", "err", err)
+	}
 }
 
 // SetSessionPath pins where auto-save lands (a fresh session file minted by the
@@ -1117,7 +1180,7 @@ func (c *Controller) Balance(ctx context.Context) (*billing.Balance, error) {
 	if strings.TrimSpace(c.balanceURL) == "" {
 		return nil, nil
 	}
-	return billing.Fetch(ctx, c.balanceURL, c.balanceKey)
+	return billing.FetchWithClient(ctx, c.balanceClient, c.balanceURL, c.balanceKey)
 }
 
 // Host returns the running MCP host (nil when no plugins), for frontends that
@@ -1180,6 +1243,7 @@ func (c *Controller) connectMCPSpec(s plugin.Spec) (int, error) {
 		return 0, err
 	}
 	if c.reg != nil {
+		c.reg.RemovePrefix(plugin.ToolPrefix(s.Name))
 		for _, t := range tools {
 			c.reg.Add(t)
 		}
@@ -1273,6 +1337,9 @@ func (c *Controller) RemoveMCPServer(name string) (disconnected bool, err error)
 	}
 	inConfig := cfg.RemovePlugin(name)
 	if inConfig {
+		if !disconnected && c.reg != nil {
+			c.reg.RemovePrefix(plugin.ToolPrefix(name))
+		}
 		if serr := cfg.Save(); serr != nil {
 			return disconnected, serr
 		}
@@ -1288,14 +1355,20 @@ func (c *Controller) RemoveMCPServer(name string) (disconnected bool, err error)
 // on the next session start, or now via ConnectConfiguredMCPServer (the "on").
 // Reports whether a live server was actually disconnected.
 func (c *Controller) DisconnectMCPServer(name string) bool {
-	if c.host == nil {
-		return false
+	disconnected := false
+	if c.host != nil {
+		if prefix, ok := c.host.Remove(name); ok {
+			disconnected = true
+			if c.reg != nil {
+				c.reg.RemovePrefix(prefix)
+			}
+		}
 	}
-	prefix, ok := c.host.Remove(name)
-	if ok && c.reg != nil {
-		c.reg.RemovePrefix(prefix)
+	removedPlaceholder := 0
+	if !disconnected && c.reg != nil {
+		removedPlaceholder = c.reg.RemovePrefix(plugin.ToolPrefix(name))
 	}
-	return ok
+	return disconnected || removedPlaceholder > 0
 }
 
 // Label returns the human-readable model label, e.g. "deepseek-flash".
@@ -1594,7 +1667,10 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 	key := tool + "\x00" + subject
 
 	c.mu.Lock()
-	if c.granted[key] {
+	// YOLO/bypass and the just-approved-plan window auto-allow every approval
+	// without prompting; the plan gate routes through here too, so this is what
+	// stops a bypass session from blocking on plan approval. Deny rules bit upstream.
+	if c.bypass || c.autoApprove || c.granted[key] {
 		c.mu.Unlock()
 		return true, false, nil
 	}

@@ -8,6 +8,7 @@ export type EventKind =
   | "message"
   | "tool_dispatch"
   | "tool_result"
+  | "tool_progress"
   | "usage"
   | "notice"
   | "phase"
@@ -15,7 +16,8 @@ export type EventKind =
   | "ask_request"
   | "turn_done"
   | "compaction_started"
-  | "compaction_done";
+  | "compaction_done"
+  | "retrying";
 
 export interface WireCompaction {
   trigger?: string; // "auto" | "manual"
@@ -91,12 +93,15 @@ export interface WireEvent {
   ask?: WireAsk;
   compaction?: WireCompaction;
   err?: string;
+  retryAttempt?: number;
+  retryMax?: number;
 }
 
 // Bound-method payloads (desktop/app.go).
 export interface HistoryMessage {
   role: string;
   content: string;
+  reasoning?: string;
 }
 
 // CheckpointMeta is one rewind point (a user turn) for the rewind UI.
@@ -113,7 +118,9 @@ export interface SessionMeta {
   preview: string;
   title?: string; // user-chosen name; falls back to preview when empty
   turns: number;
-  modTime: number; // unix milliseconds
+  createdAt?: number; // unix milliseconds
+  lastActivityAt?: number; // unix milliseconds
+  modTime: number; // compatibility alias for lastActivityAt
   current: boolean;
 }
 
@@ -162,6 +169,27 @@ export interface FilePreview {
   err?: string;
 }
 
+export interface WorkspaceChangeView {
+  path: string;
+  oldPath?: string;
+  sources: string[];
+  gitStatus?: string;
+  turns?: number[];
+  latestPrompt?: string;
+  latestTime?: number;
+}
+
+export interface WorkspaceChangesView {
+  files: WorkspaceChangeView[];
+  gitAvailable: boolean;
+  gitErr?: string;
+}
+
+export interface ComposerInsertRequest {
+  id: number;
+  text: string;
+}
+
 // MCP & Skills drawer (desktop/app.go Capabilities) — the GUI counterpart to
 // /mcp + /skill: connected/failed servers and discoverable skills.
 export interface ServerView {
@@ -184,9 +212,19 @@ export interface SkillView {
   scope: string;
   runAs: string;
 }
+export interface SkillRootView {
+  dir: string;
+  scope: string;
+  priority: number;
+  status: string;
+  configured: boolean;
+  skills: number;
+  warning?: string;
+}
 export interface CapabilitiesView {
   servers: ServerView[];
   skills: SkillView[];
+  skillRoots: SkillRootView[];
 }
 export interface MCPServerInput {
   name: string;
@@ -202,6 +240,13 @@ export interface ModelInfo {
   provider: string;
   model: string;
   current: boolean;
+}
+
+export interface EffortInfo {
+  supported: boolean;
+  current: string; // "auto" | "low" | "medium" | "high" | "xhigh" | "max"
+  default: string;
+  levels: string[];
 }
 
 // Slash sub-command / argument completion (desktop/app.go SlashArgs). Mirrors the
@@ -290,6 +335,21 @@ export interface SandboxView {
   allowWrite: string[];
 }
 
+export interface NetworkProxyView {
+  type: string;
+  server: string;
+  port: number;
+  username: string;
+  password: string;
+}
+
+export interface NetworkView {
+  proxyMode: string; // "auto" | "custom" | "off" (backend may still return legacy "env")
+  proxyUrl: string;
+  noProxy: string;
+  proxy: NetworkProxyView;
+}
+
 export interface AgentView {
   temperature: number;
   maxSteps: number;
@@ -302,6 +362,7 @@ export interface SettingsView {
   providers: ProviderView[];
   permissions: PermissionsView;
   sandbox: SandboxView;
+  network: NetworkView;
   agent: AgentView;
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)

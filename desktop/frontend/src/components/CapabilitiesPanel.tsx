@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { app } from "../lib/bridge";
 import { useT } from "../lib/i18n";
-import type { CapabilitiesView, MCPServerInput, ServerView, SkillView } from "../lib/types";
+import type { CapabilitiesView, MCPServerInput, ServerView, SkillRootView, SkillView } from "../lib/types";
 import { ResizableDrawer } from "./ResizableDrawer";
+import { Tooltip } from "./Tooltip";
 
 // CapabilitiesPanel is the desktop MCP & Skills drawer — the GUI counterpart to
 // the CLI's /mcp + /skill, aligning with Claude Code's Customize → Connectors:
@@ -28,7 +29,7 @@ export function CapabilitiesPanel({
   const [expandedServers, setExpandedServers] = useState<Set<string>>(() => new Set());
 
   const reload = async () =>
-    setView(await app.Capabilities().catch(() => ({ servers: [], skills: [] })));
+    setView(await app.Capabilities().catch(() => ({ servers: [], skills: [], skillRoots: [] })));
   useEffect(() => {
     void reload();
   }, []);
@@ -111,9 +112,11 @@ export function CapabilitiesPanel({
             <div className="drawer__title">{t("caps.title")}</div>
             {view && <div className="drawer__summary">{summary}</div>}
           </div>
-          <button className="chip" onClick={onClose} title={t("common.close")}>
-            ✕
-          </button>
+          <Tooltip label={t("common.close")}>
+            <button className="chip" onClick={onClose}>
+              ✕
+            </button>
+          </Tooltip>
         </header>
 
         {!view ? (
@@ -193,6 +196,16 @@ export function CapabilitiesPanel({
                     onChange={(e) => setSkillQuery(e.target.value)}
                   />
                 </div>
+                <SkillSources
+                  roots={view.skillRoots ?? []}
+                  busy={busy}
+                  onAdd={() => mutate(async () => {
+                    const path = await app.PickSkillFolder();
+                    if (path) await app.AddSkillPath(path);
+                  })}
+                  onRefresh={() => mutate(() => app.RefreshSkills())}
+                  onRemove={(path) => mutate(() => app.RemoveSkillPath(path))}
+                />
                 {view.skills.length === 0 ? (
                   <div className="mem-empty">{t("caps.noSkills")}</div>
                 ) : filteredSkills.length === 0 ? (
@@ -215,6 +228,127 @@ export function CapabilitiesPanel({
         )}
     </ResizableDrawer>
   );
+}
+
+function SkillSources({
+  roots,
+  busy,
+  onAdd,
+  onRefresh,
+  onRemove,
+}: {
+  roots: SkillRootView[];
+  busy: boolean;
+  onAdd: () => void;
+  onRefresh: () => void;
+  onRemove: (path: string) => void;
+}) {
+  const t = useT();
+  const [expanded, setExpanded] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const visibleRoots = roots.filter((root) => root.skills > 0 || root.configured || Boolean(root.warning));
+  const hiddenRoots = roots.filter((root) => !visibleRoots.includes(root));
+  const shownRoots = showDiagnostics ? roots : visibleRoots;
+  const active = roots.filter((root) => root.skills > 0).length;
+  const missing = roots.filter((root) => root.status === "missing").length;
+  const empty = roots.filter((root) => root.status === "ok" && root.skills === 0).length;
+  return (
+    <div className={`cap-sources${expanded ? " cap-sources--expanded" : ""}`}>
+      <div className="cap-sources__head">
+        <div className="cap-sources__copy">
+          <div className="cap-sources__title">{t("caps.sources")}</div>
+          <div className="cap-sources__summary">{t("caps.sourcesSummary", { active, missing, empty })}</div>
+        </div>
+        <div className="cap-sources__actions">
+          <button className="btn btn--small" type="button" onClick={() => setExpanded((v) => !v)} aria-expanded={expanded}>
+            {expanded ? t("common.collapse") : t("caps.manageSkillSources")}
+          </button>
+        </div>
+      </div>
+      {!expanded && hiddenRoots.length > 0 && (
+        <button
+          className="cap-diagnostics cap-diagnostics--compact"
+          type="button"
+          onClick={() => {
+            setExpanded(true);
+            setShowDiagnostics(true);
+          }}
+        >
+          {t("caps.showDiagnostics", { count: hiddenRoots.length })}
+        </button>
+      )}
+      {expanded && (
+        <>
+          <div className="cap-sources__manage">
+            <button className="btn btn--small" disabled={busy} onClick={onRefresh}>
+              {t("caps.refreshSkills")}
+            </button>
+            <button className="btn btn--small" disabled={busy} onClick={onAdd}>
+              {t("caps.addSkillFolder")}
+            </button>
+          </div>
+          {shownRoots.length === 0 ? (
+            <div className="mem-empty">{t("caps.noSkillRoots")}</div>
+          ) : (
+            <div className="cap-source-list">
+              {shownRoots.map((root) => (
+                <div className={`cap-source cap-source--${skillRootTone(root)}`} key={`${root.scope}:${root.priority}:${root.dir}`}>
+                  <span className={`cap-dot cap-dot--${skillRootDot(root)}`} />
+                  <div className="cap-source__text">
+                    <div className="cap-source__label">{skillRootLabel(root, t)}</div>
+                    <div className="cap-source__path">{root.dir}</div>
+                    <div className="cap-source__meta">
+                      <span>{skillRootStatus(root, t)}</span>
+                      <span>{t("caps.skillRootCount", { skills: root.skills })}</span>
+                      {root.configured && <span>{t("caps.skillRootConfigured")}</span>}
+                    </div>
+                    {root.warning && <div className="cap-source__warning">{root.warning}</div>}
+                  </div>
+                  {root.scope === "custom" && root.configured && (
+                    <Tooltip label={t("caps.skillRootRemove")}>
+                      <button className="btn btn--small" disabled={busy} onClick={() => onRemove(root.dir)}>
+                        ✕
+                      </button>
+                    </Tooltip>
+                  )}
+                </div>
+              ))}
+            </div>
+          )}
+          {hiddenRoots.length > 0 && (
+            <button className="cap-diagnostics" type="button" onClick={() => setShowDiagnostics((v) => !v)}>
+              {showDiagnostics ? t("caps.hideDiagnostics") : t("caps.showDiagnostics", { count: hiddenRoots.length })}
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function skillRootTone(root: SkillRootView): "active" | "empty" | "problem" {
+  if (root.warning || root.status === "inactive" || root.status === "unreadable") return "problem";
+  if (root.skills > 0) return "active";
+  return "empty";
+}
+
+function skillRootDot(root: SkillRootView): "connected" | "disabled" | "failed" {
+  const tone = skillRootTone(root);
+  if (tone === "active") return "connected";
+  if (tone === "empty") return "disabled";
+  return "failed";
+}
+
+function skillRootStatus(root: SkillRootView, t: ReturnType<typeof useT>): string {
+  if (root.status === "ok" && root.skills > 0) return t("caps.skillRootActive");
+  if (root.status === "ok") return t("caps.skillRootEmpty");
+  return root.status;
+}
+
+function skillRootLabel(root: SkillRootView, t: ReturnType<typeof useT>): string {
+  const parts = root.dir.split(/[\\/]/).filter(Boolean);
+  const shortPath = parts.length >= 2 ? `${parts[parts.length - 2]}/${parts[parts.length - 1]}` : root.dir;
+  return `${skillScopeLabel(root.scope, t)} · ${shortPath}`;
 }
 
 function ServerGroup({
@@ -326,9 +460,11 @@ function FailedServersNotice({
                     <button className="btn btn--small" onClick={() => onToggle(s.name)} aria-expanded={open}>
                       {open ? t("common.collapse") : t("caps.showLog")}
                     </button>
-                    <button className="btn btn--small" disabled={busy} onClick={() => onConfirm(s.name)} title={t("caps.remove")}>
-                      ✕
-                    </button>
+                    <Tooltip label={t("caps.remove")}>
+                      <button className="btn btn--small" disabled={busy} onClick={() => onConfirm(s.name)}>
+                        ✕
+                      </button>
+                    </Tooltip>
                   </>
                 )}
               </div>
@@ -376,58 +512,65 @@ function ServerRow({
         : t("caps.counts", { tools: s.tools, prompts: s.prompts, resources: s.resources });
   return (
     <div className={`cap-server-entry${s.status === "disabled" ? " cap-server-entry--disabled" : ""}`}>
-      <div className={`cap-row${s.status === "disabled" ? " cap-row--disabled" : ""}`} title={s.error || undefined}>
-        <button
-          className="cap-disclosure"
-          disabled={!hasTools}
-          aria-expanded={hasTools ? expanded : undefined}
-          onClick={onToggleDetails}
-          title={hasTools ? (expanded ? t("caps.collapseTools") : t("caps.expandTools")) : t("caps.noToolDetails")}
-        >
-          {hasTools ? (expanded ? "⌄" : "›") : ""}
-        </button>
-        <span className={`cap-dot cap-dot--${s.status}`} />
-        <div className="cap-row__text">
-          <div className="cap-row__head">
-            <span className="cap-row__name">{s.name}</span>
-            <span className="cap-row__transport">{s.transport}</span>
+      <Tooltip label={s.error} disabled={!s.error} fill block>
+        <div className={`cap-row${s.status === "disabled" ? " cap-row--disabled" : ""}`}>
+          <Tooltip label={hasTools ? (expanded ? t("caps.collapseTools") : t("caps.expandTools")) : t("caps.noToolDetails")}>
+            <button
+              className="cap-disclosure"
+              disabled={!hasTools}
+              aria-expanded={hasTools ? expanded : undefined}
+              onClick={onToggleDetails}
+            >
+              {hasTools ? (expanded ? "⌄" : "›") : ""}
+            </button>
+          </Tooltip>
+          <span className={`cap-dot cap-dot--${s.status}`} />
+          <div className="cap-row__text">
+            <div className="cap-row__head">
+              <span className="cap-row__name">{s.name}</span>
+              <span className="cap-row__transport">{s.transport}</span>
+            </div>
+            <div className="cap-row__sub">{sub}</div>
           </div>
-          <div className="cap-row__sub">{sub}</div>
-        </div>
-        <div className="cap-row__actions">
-          {confirming ? (
-            <>
-              <button className="btn btn--small" disabled={busy} onClick={onRemove}>
-                {t("caps.confirmRemove")}
-              </button>
-              <button className="btn btn--small" disabled={busy} onClick={onCancelConfirm}>
-                {t("common.cancel")}
-              </button>
-            </>
-          ) : (
-            <>
-              {s.status === "failed" ? (
-                <button className="btn btn--small" disabled={busy} onClick={onRetry}>
-                  {actionLabel}
+          <div className="cap-row__actions">
+            {confirming ? (
+              <>
+                <button className="btn btn--small" disabled={busy} onClick={onRemove}>
+                  {t("caps.confirmRemove")}
                 </button>
-              ) : (
-                <label className="cap-switch" title={s.status === "connected" ? t("caps.disable") : t("caps.enable")}>
-                  <input
-                    type="checkbox"
-                    checked={s.status === "connected"}
-                    disabled={busy}
-                    onChange={(e) => onToggle(e.target.checked)}
-                  />
-                  <span className="cap-switch__track" />
-                </label>
-              )}
-              <button className="btn btn--small" disabled={busy} onClick={onConfirm} title={t("caps.remove")}>
-                ✕
-              </button>
-            </>
-          )}
+                <button className="btn btn--small" disabled={busy} onClick={onCancelConfirm}>
+                  {t("common.cancel")}
+                </button>
+              </>
+            ) : (
+              <>
+                {s.status === "failed" ? (
+                  <button className="btn btn--small" disabled={busy} onClick={onRetry}>
+                    {actionLabel}
+                  </button>
+                ) : (
+                  <Tooltip label={s.status === "connected" ? t("caps.disable") : t("caps.enable")}>
+                    <label className="cap-switch">
+                      <input
+                        type="checkbox"
+                        checked={s.status === "connected"}
+                        disabled={busy}
+                        onChange={(e) => onToggle(e.target.checked)}
+                      />
+                      <span className="cap-switch__track" />
+                    </label>
+                  </Tooltip>
+                )}
+                <Tooltip label={t("caps.remove")}>
+                  <button className="btn btn--small" disabled={busy} onClick={onConfirm}>
+                    ✕
+                  </button>
+                </Tooltip>
+              </>
+            )}
+          </div>
         </div>
-      </div>
+      </Tooltip>
       {hasTools && expanded && (
         <div className="cap-tool-list">
           <div className="cap-tool-list__title">{t("caps.tools")}</div>
@@ -487,7 +630,6 @@ function SkillRow({
       type="button"
       onClick={onToggle}
       aria-expanded={expanded}
-      title={skill.description}
     >
       <div className="cap-skill-card__head">
         <span className="cap-skill-card__icon">/</span>

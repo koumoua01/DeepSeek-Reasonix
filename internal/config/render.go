@@ -25,6 +25,55 @@ func RenderTOML(c *Config) string {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("[ui]\n")
+	fmt.Fprintf(&b, "theme = %q   # auto|dark|light; CLI colors only; REASONIX_THEME can override per run\n", c.UITheme())
+	if style := c.UIThemeStyle(); style != "" {
+		fmt.Fprintf(&b, "theme_style = %q   # accent palette; REASONIX_THEME_STYLE can override per run\n", style)
+	} else {
+		b.WriteString("# theme_style = \"graphite\"   # graphite|ember|aurora|midnight|sandstone|porcelain|linen|glacier\n")
+	}
+	b.WriteString("\n")
+
+	b.WriteString("[network]\n")
+	fmt.Fprintf(&b, "proxy_mode = %q   # auto|env|custom|off; auto currently uses env proxy\n", c.NetworkProxyMode())
+	if c.Network.ProxyURL != "" {
+		fmt.Fprintf(&b, "proxy_url  = %q   # custom override, e.g. socks5://127.0.0.1:7890\n", c.Network.ProxyURL)
+	} else {
+		b.WriteString("# proxy_url  = \"socks5://127.0.0.1:7890\"   # optional custom override\n")
+	}
+	if c.Network.NoProxy != "" {
+		fmt.Fprintf(&b, "no_proxy   = %q   # honored for proxy_mode = \"custom\"\n", c.Network.NoProxy)
+	} else {
+		b.WriteString("# no_proxy   = \"localhost,127.0.0.1,.local\"   # honored for proxy_mode = \"custom\"\n")
+	}
+	b.WriteString("\n[network.proxy]\n")
+	proxyType := c.Network.Proxy.Type
+	if proxyType == "" {
+		proxyType = "socks5"
+	}
+	fmt.Fprintf(&b, "type = %q   # http|https|socks5|socks5h\n", proxyType)
+	if c.Network.Proxy.Server != "" {
+		fmt.Fprintf(&b, "server = %q\n", c.Network.Proxy.Server)
+	} else {
+		b.WriteString("# server = \"127.0.0.1\"\n")
+	}
+	if c.Network.Proxy.Port > 0 {
+		fmt.Fprintf(&b, "port = %d\n", c.Network.Proxy.Port)
+	} else {
+		b.WriteString("# port = 7890\n")
+	}
+	if c.Network.Proxy.Username != "" {
+		fmt.Fprintf(&b, "username = %q\n", c.Network.Proxy.Username)
+	} else {
+		b.WriteString("# username = \"\"\n")
+	}
+	if c.Network.Proxy.Password != "" {
+		fmt.Fprintf(&b, "password = %q   # supports ${VAR} expansion\n", c.Network.Proxy.Password)
+	} else {
+		b.WriteString("# password = \"${REASONIX_PROXY_PASSWORD}\"   # optional; supports ${VAR} expansion\n")
+	}
+	b.WriteString("\n")
+
 	b.WriteString("[agent]\n")
 	b.WriteString("system_prompt = \"\"\"\n")
 	b.WriteString(c.Agent.SystemPrompt)
@@ -81,6 +130,9 @@ func RenderTOML(c *Config) string {
 		} else if p.Model != "" {
 			fmt.Fprintf(&b, "model       = %q\n", p.Model)
 		}
+		if p.ModelsURL != "" {
+			fmt.Fprintf(&b, "models_url  = %q   # auto-fetch models from this URL on startup\n", p.ModelsURL)
+		}
 		fmt.Fprintf(&b, "api_key_env = %q\n", p.APIKeyEnv)
 		if p.BalanceURL != "" {
 			fmt.Fprintf(&b, "balance_url = %q   # optional; wallet-balance endpoint shown in the status bar\n", p.BalanceURL)
@@ -91,6 +143,12 @@ func RenderTOML(c *Config) string {
 		if p.Price != nil {
 			fmt.Fprintf(&b, "price       = { cache_hit = %v, input = %v, output = %v, currency = %q }   # per 1M tokens\n",
 				p.Price.CacheHit, p.Price.Input, p.Price.Output, p.Price.Symbol())
+		}
+		if p.Thinking != "" {
+			fmt.Fprintf(&b, "thinking    = %q\n", p.Thinking)
+		}
+		if p.Effort != "" {
+			fmt.Fprintf(&b, "effort      = %q\n", p.Effort)
 		}
 		b.WriteString("\n")
 	}
@@ -107,6 +165,13 @@ func RenderTOML(c *Config) string {
 			fmt.Fprintf(&b, "%q", t)
 		}
 		b.WriteString("]\n\n")
+	}
+
+	b.WriteString("[skills]\n")
+	if len(c.Skills.Paths) > 0 {
+		fmt.Fprintf(&b, "paths = %s   # extra custom skill roots\n\n", renderStringArray(c.Skills.Paths))
+	} else {
+		b.WriteString("# paths = [\"~/my-skills\", \"../shared/skills\"]   # extra custom skill roots\n\n")
 	}
 
 	b.WriteString("[permissions]\n")

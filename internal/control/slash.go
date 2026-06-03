@@ -37,7 +37,8 @@ type ArgData struct {
 // (everything after the command word). It returns the suggestions filtered by
 // the token being typed and the byte offset where that token begins, so a caller
 // replaces just that token. Only structured commands participate (/mcp /model
-// /skill /hooks); others yield nil. Single source of truth for CLI + desktop.
+// /skill /hooks /effort /theme /language); others yield nil. Single source of truth for CLI +
+// desktop.
 func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 	cmdEnd := strings.IndexAny(line, " \t")
 	if cmdEnd < 0 {
@@ -56,10 +57,95 @@ func SlashArgItems(line string, d ArgData) ([]SlashItem, int) {
 		raw = skillArgItems(prior, d)
 	case "/hooks":
 		raw = hooksArgItems(prior)
+	case "/effort":
+		raw = effortArgItems(prior, d)
+	case "/theme":
+		raw = themeArgItems(prior)
+	case "/language":
+		raw = languageArgItems(prior)
 	default:
 		return nil, from
 	}
 	return filterSlash(raw, line, from, cur), from
+}
+
+func languageArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	return []SlashItem{
+		{Label: "auto", Insert: "auto", Hint: i18n.M.ArgLanguageAuto},
+		{Label: "en", Insert: "en", Hint: i18n.M.ArgLanguageEn},
+		{Label: "zh", Insert: "zh", Hint: i18n.M.ArgLanguageZh},
+	}
+}
+
+func themeArgItems(prior []string) []SlashItem {
+	if len(prior) > 1 {
+		return nil
+	}
+	items := []SlashItem{
+		{Label: "auto", Insert: "auto", Hint: "mode · detect system or terminal background"},
+		{Label: "light", Insert: "light", Hint: "mode · force light shell"},
+		{Label: "dark", Insert: "dark", Hint: "mode · force dark shell"},
+	}
+	for _, st := range []struct {
+		name string
+		mode string
+		desc string
+	}{
+		{"graphite", "dark", "warm clay accent"},
+		{"ember", "dark", "hot orange accent"},
+		{"aurora", "dark", "cool teal accent"},
+		{"midnight", "dark", "quiet violet accent"},
+		{"sandstone", "light", "default warm light accent"},
+		{"porcelain", "light", "soft violet light accent"},
+		{"linen", "light", "muted coral light accent"},
+		{"glacier", "light", "cool blue accent"},
+	} {
+		items = append(items, SlashItem{Label: st.name, Insert: st.name, Hint: st.mode + " · " + st.desc})
+	}
+	return items
+}
+
+func effortArgItems(prior []string, d ArgData) []SlashItem {
+	if len(prior) <= 1 {
+		entry := currentEffortEntry(d)
+		cap := config.EffortCapabilityForEntry(entry)
+		var out []SlashItem
+		for _, level := range cap.Levels {
+			hint := ""
+			switch level {
+			case "auto":
+				hint = i18n.M.ArgEffortAuto
+			case "low":
+				hint = i18n.M.ArgEffortLow
+			case "medium":
+				hint = i18n.M.ArgEffortMedium
+			case "high":
+				hint = i18n.M.ArgEffortHigh
+			case "xhigh":
+				hint = i18n.M.ArgEffortXHigh
+			case "max":
+				hint = i18n.M.ArgEffortMax
+			}
+			out = append(out, SlashItem{Label: level, Insert: level, Hint: hint})
+		}
+		return out
+	}
+	return nil
+}
+
+func currentEffortEntry(d ArgData) *config.ProviderEntry {
+	if strings.TrimSpace(d.CurrentModel) == "" {
+		return nil
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return nil
+	}
+	entry, _ := cfg.ResolveModel(d.CurrentModel)
+	return entry
 }
 
 func mcpArgItems(prior []string, cur string, d ArgData) []SlashItem {

@@ -12,6 +12,7 @@ import (
 	"reasonix/internal/diff"
 	"reasonix/internal/event"
 	"reasonix/internal/evidence"
+	"reasonix/internal/instruction"
 	"reasonix/internal/jobs"
 	"reasonix/internal/memory"
 	"reasonix/internal/nilutil"
@@ -24,6 +25,8 @@ import (
 // grep, while preventing one accidental "read this 5 MB log" from blowing the
 // window before the next compaction runs.
 const maxToolOutputBytes = 32 * 1024
+
+const maxFinalReadinessBlocks = 3
 
 // Renderer redraws the assistant's final-answer text as styled output. It is
 // applied only after a turn's text stream completes, so the user sees raw
@@ -173,6 +176,10 @@ type Agent struct {
 	// complete_step validate that cited evidence happened before the claim.
 	evidence *evidence.Ledger
 
+	// projectChecks are structured project instructions that complete_step can
+	// verify against same-turn bash receipts after a write-backed completion.
+	projectChecks []instruction.VerifyCheck
+
 	// memQueue, when non-nil, lets the remember/forget tools fold a turn-tail note
 	// about a just-made memory change into the next turn, so it applies this
 	// session without touching the cache-stable prefix. Set via SetMemoryQueue.
@@ -297,6 +304,9 @@ type Options struct {
 	// Jobs is the session's background-job manager (nil disables background tools).
 	Jobs *jobs.Manager
 
+	// ProjectChecks are host-observable structured checks extracted during boot.
+	ProjectChecks []instruction.VerifyCheck
+
 	// Context management. ContextWindow <= 0 disables compaction. CompactRatio
 	// is the trigger fraction; RecentKeep is the minimum recent messages kept
 	// verbatim (the tail is otherwise token-bounded). Both fall back to defaults.
@@ -340,6 +350,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		hooks:         hooks,
 		jobs:          opts.Jobs,
 		evidence:      evidence.NewLedger(),
+		projectChecks: append([]instruction.VerifyCheck(nil), opts.ProjectChecks...),
 		contextWindow: opts.ContextWindow,
 		compactRatio:  opts.CompactRatio,
 		recentKeep:    opts.RecentKeep,
@@ -360,6 +371,7 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	a.sink.Emit(event.Event{Kind: event.TurnStarted})
 	a.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
 
+	finalReadinessBlocks := 0
 	for step := 0; a.maxSteps <= 0 || step < a.maxSteps; step++ {
 		text, reasoning, signature, calls, usage, err := a.stream(ctx, step+1)
 		if err != nil {
@@ -386,6 +398,16 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 		})
 
 		if len(calls) == 0 {
+			if reason := a.finalReadinessFailure(); reason != "" {
+				finalReadinessBlocks++
+				if finalReadinessBlocks >= maxFinalReadinessBlocks {
+					return fmt.Errorf("final-answer readiness failed %d times: %s", finalReadinessBlocks, reason)
+				}
+				a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "final-answer readiness blocked: " + reason})
+				a.session.Add(provider.Message{Role: provider.RoleUser, Content: finalReadinessRetryMessage(reason)})
+				a.maybeCompact(ctx, usage)
+				continue
+			}
 			return nil // model gave a final answer
 		}
 
@@ -409,12 +431,63 @@ func (a *Agent) Run(ctx context.Context, input string) error {
 	return fmt.Errorf("paused after %d tool-call rounds (agent.max_steps) — the work so far is saved; send another message to continue, or set max_steps higher or to 0 for no limit", a.maxSteps)
 }
 
+func (a *Agent) finalReadinessFailure() string {
+	if a.evidence == nil {
+		return ""
+	}
+	writer, hasWriter := a.evidence.LatestSuccessfulWriterIndex()
+	if !hasWriter {
+		return ""
+	}
+	hasProjectChecks := len(a.projectChecks) > 0
+	hasTodoReceipt := a.evidence.HasSuccessfulTodoWrite()
+	if !hasProjectChecks && !hasTodoReceipt {
+		return ""
+	}
+
+	var missing []string
+	for _, check := range a.projectChecks {
+		command := strings.TrimSpace(check.Command)
+		if command == "" {
+			continue
+		}
+		if !a.evidence.HasSuccessfulCommandAfter(command, writer) {
+			missing = append(missing, fmt.Sprintf("run %q from %s after the latest write", command, finalReadinessCheckSource(check)))
+		}
+	}
+	if hasTodoReceipt && !a.evidence.HasSuccessfulCompleteStepAfter(writer) {
+		missing = append(missing, "call complete_step after the latest write")
+	}
+	if len(missing) == 0 {
+		return ""
+	}
+	return strings.Join(missing, "; ")
+}
+
+func finalReadinessCheckSource(check instruction.VerifyCheck) string {
+	source := strings.TrimSpace(check.SourcePath)
+	if source == "" {
+		source = "project memory"
+	}
+	if check.Line > 0 {
+		return fmt.Sprintf("%s:%d", source, check.Line)
+	}
+	return source
+}
+
+func finalReadinessRetryMessage(reason string) string {
+	return "Host final-answer readiness check failed. Before giving a final answer, address the missing host-observable receipts: " + reason + ". Run the required tool calls, then answer when readiness is satisfied."
+}
+
 // stream runs one completion, emitting reasoning and text deltas as typed
 // events and collecting complete tool calls. A Message event closes the text
 // stream so a sink can re-render the streamed raw text as styled markdown. The
 // accumulated text and reasoning are also returned so the caller can round-trip
 // reasoning on the next turn.
 func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, []provider.ToolCall, *provider.Usage, error) {
+	ctx = provider.WithRetryNotify(ctx, func(info provider.RetryInfo) {
+		a.sink.Emit(event.Event{Kind: event.Retrying, RetryAttempt: info.Attempt, RetryMax: info.Max})
+	})
 	ch, err := a.prov.Stream(ctx, provider.Request{
 		Messages:    a.session.Messages,
 		Tools:       a.tools.Schemas(),
@@ -507,12 +580,13 @@ func (a *Agent) stream(ctx context.Context, turn int) (string, string, string, [
 func (a *Agent) executeBatch(ctx context.Context, calls []provider.ToolCall) []string {
 	for _, c := range calls {
 		t, ok := a.tools.Get(c.Name)
-		a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{
-			ID:       c.ID,
-			Name:     c.Name,
-			Args:     c.Arguments,
-			ReadOnly: ok && t.ReadOnly(),
-		}})
+		ev := event.Tool{ID: c.ID, Name: c.Name, Args: c.Arguments, ReadOnly: ok && t.ReadOnly()}
+		if ok {
+			if ch, ok := tool.PreviewChange(t, json.RawMessage(c.Arguments)); ok {
+				ev.FileDiff = event.FileDiff{Diff: ch.Diff, Added: ch.Added, Removed: ch.Removed}
+			}
+		}
+		a.sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: ev})
 	}
 
 	results := make([]string, len(calls))
@@ -755,12 +829,19 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)
 	}
+	if len(a.projectChecks) > 0 {
+		cctx = instruction.WithChecks(cctx, a.projectChecks)
+	}
 	if a.jobs != nil {
 		cctx = jobs.WithManager(cctx, a.jobs)
 	}
 	if a.memQueue != nil {
 		cctx = memory.WithQueue(cctx, a.memQueue)
 	}
+	callID := call.ID
+	cctx = tool.WithProgress(cctx, func(chunk string) {
+		a.sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: callID, Output: chunk}})
+	})
 	result, err := t.Execute(cctx, json.RawMessage(call.Arguments))
 	if a.evidence != nil {
 		if call.Name == "complete_step" {

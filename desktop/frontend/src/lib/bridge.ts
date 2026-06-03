@@ -12,6 +12,7 @@ import type {
   CommandInfo,
   ContextInfo,
   DirEntry,
+  EffortInfo,
   FilePreview,
   HistoryMessage,
   JobView,
@@ -19,16 +20,19 @@ import type {
   MemoryView,
   Meta,
   ModelInfo,
+  NetworkView,
   ProviderView,
   QuestionAnswer,
   ServerView,
   SessionMeta,
   SettingsView,
+  SkillRootView,
   SkillView,
   SlashArgsResult,
   UpdateInfo,
   UpdateProgress,
   WireEvent,
+  WorkspaceChangesView,
   WorkspaceView,
 } from "./types";
 
@@ -52,9 +56,10 @@ export interface AppBindings {
   SummarizeFrom(turn: number): Promise<void>;
   SummarizeUpTo(turn: number): Promise<void>;
   // Session history: list saved sessions, resume one (returns its transcript),
-  // delete one, or give one a custom display name ("" clears it).
+  // preview one read-only, delete one, or give one a custom display name ("" clears it).
   ListSessions(): Promise<SessionMeta[]>;
   ResumeSession(path: string): Promise<HistoryMessage[]>;
+  PreviewSession(path: string): Promise<HistoryMessage[]>;
   DeleteSession(path: string): Promise<void>;
   RenameSession(path: string, title: string): Promise<void>;
   // Workspace: open a folder chooser and switch to that project (fresh session);
@@ -78,18 +83,26 @@ export interface AppBindings {
   AddMCPServer(input: MCPServerInput): Promise<number>;
   RemoveMCPServer(name: string): Promise<void>;
   RetryMCPServer(name: string): Promise<void>;
+  PickSkillFolder(): Promise<string>;
+  AddSkillPath(path: string): Promise<void>;
+  RemoveSkillPath(path: string): Promise<void>;
+  RefreshSkills(): Promise<void>;
   // SetMCPServerEnabled is the per-session connector toggle (on reconnects, off
   // disconnects; config untouched).
   SetMCPServerEnabled(name: string, enabled: boolean): Promise<void>;
   SlashArgs(input: string): Promise<SlashArgsResult>;
   ListDir(rel: string): Promise<DirEntry[]>;
   ReadFile(rel: string): Promise<FilePreview>;
+  WorkspaceChanges(): Promise<WorkspaceChangesView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   SavePastedImage(dataUrl: string): Promise<string>;
+  SavePastedFile(name: string, dataUrl: string): Promise<string>;
   AttachmentDataURL(path: string): Promise<string>;
   Models(): Promise<ModelInfo[]>;
   SetModel(name: string): Promise<void>;
+  Effort(): Promise<EffortInfo>;
+  SetEffort(level: string): Promise<void>;
   // Memory panel: read the loaded REASONIX.md hierarchy + saved auto-memories,
   // quick-add a note to a scope's REASONIX.md (≡ "#<note>"), and overwrite a doc
   // from the in-place editor.
@@ -109,6 +122,7 @@ export interface AppBindings {
   AddPermissionRule(list: string, rule: string): Promise<void>;
   RemovePermissionRule(list: string, rule: string): Promise<void>;
   SetSandbox(bash: string, network: boolean, workspaceRoot: string, allowWrite: string[]): Promise<void>;
+  SetNetwork(n: NetworkView): Promise<void>;
   SetAgentParams(temperature: number, maxSteps: number, systemPrompt: string): Promise<void>;
   // SetBypass toggles YOLO mode (auto-approve every tool call this session; deny
   // rules still apply). Runtime-only — not written to config.
@@ -120,6 +134,10 @@ export interface AppBindings {
   CheckUpdate(): Promise<UpdateInfo | null>;
   ApplyUpdate(): Promise<void>;
   OpenDownloadPage(): Promise<void>;
+  // First-run overlay: NeedsOnboarding is true when the default provider key is
+  // unset; ConnectKey validates, persists to ./.env, and rebuilds the controller.
+  NeedsOnboarding(): Promise<boolean>;
+  ConnectKey(apiKey: string): Promise<void>;
 }
 
 interface WailsRuntime {
@@ -235,6 +253,7 @@ function makeMockApp(): AppBindings {
   let cancelled = false;
   let cwd = "~/projects/reasonix"; // mutable so PickWorkspace is visible in dev
   let workspaces = ["~/projects/reasonix", "~/projects/blade", "~/projects/deepseek-forge", "~/projects/cc-switch-light", "~/projects/SuperRig"];
+  let mockEffort = "auto";
   const day = 86_400_000;
   const t0 = Date.now();
   // Mutable so MCP add/remove/retry are observable in browser dev.
@@ -262,6 +281,11 @@ function makeMockApp(): AppBindings {
     { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline" },
     { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline" },
   ];
+  let capSkillRoots: SkillRootView[] = [
+    { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, skills: 0 },
+    { dir: "~/my-skills", scope: "custom", priority: 5, status: "ok", configured: true, skills: 1 },
+    { dir: "~/.reasonix/skills", scope: "global", priority: 6, status: "ok", configured: false, skills: 2 },
+  ];
   const mockSwitchWorkspace = async (path: string) => {
     cwd = path || "~";
     workspaces = [cwd, ...workspaces.filter((p) => p !== cwd)].slice(0, 12);
@@ -269,10 +293,10 @@ function makeMockApp(): AppBindings {
   };
   // Mutable so delete/rename are observable in browser dev.
   const sessions: SessionMeta[] = [
-    { path: "/mock/sessions/a.jsonl", preview: "fix the login bug in auth.go", turns: 12, modTime: t0 - 3_600_000, current: true },
-    { path: "/mock/sessions/b.jsonl", preview: "refactor the payment module", turns: 5, modTime: t0 - 6 * 3_600_000, current: false },
-    { path: "/mock/sessions/c.jsonl", preview: "write the README and badges", turns: 8, modTime: t0 - day - 3_600_000, current: false },
-    { path: "/mock/sessions/d.jsonl", preview: "explain the plugin host design", turns: 3, modTime: t0 - 4 * day, current: false },
+    { path: "/mock/sessions/a.jsonl", preview: "fix the login bug in auth.go", turns: 12, createdAt: t0 - 2 * day, lastActivityAt: t0 - 3_600_000, modTime: t0 - 3_600_000, current: true },
+    { path: "/mock/sessions/b.jsonl", preview: "refactor the payment module", turns: 5, createdAt: t0 - 3 * day, lastActivityAt: t0 - 6 * 3_600_000, modTime: t0 - 6 * 3_600_000, current: false },
+    { path: "/mock/sessions/c.jsonl", preview: "write the README and badges", turns: 8, createdAt: t0 - 4 * day, lastActivityAt: t0 - day - 3_600_000, modTime: t0 - day - 3_600_000, current: false },
+    { path: "/mock/sessions/d.jsonl", preview: "explain the plugin host design", turns: 3, createdAt: t0 - 5 * day, lastActivityAt: t0 - 4 * day, modTime: t0 - 4 * day, current: false },
   ];
   // Mutable settings so the Settings panel's edits are observable in browser dev.
   const settings: SettingsView = {
@@ -284,6 +308,12 @@ function makeMockApp(): AppBindings {
     ],
     permissions: { mode: "ask", allow: ["ls", "read_file"], ask: [], deny: ["bash(rm *)"] },
     sandbox: { bash: "enforce", network: true, workspaceRoot: "", allowWrite: [] },
+    network: {
+      proxyMode: "auto",
+      proxyUrl: "",
+      noProxy: "",
+      proxy: { type: "socks5", server: "127.0.0.1", port: 7890, username: "", password: "" },
+    },
     agent: { temperature: 0.2, maxSteps: 0, systemPrompt: "You are Reasonix, a coding agent." },
     configPath: "~/projects/reasonix/reasonix.toml",
     providerKinds: ["openai"],
@@ -363,9 +393,23 @@ function makeMockApp(): AppBindings {
       return sessions.map((s) => ({ ...s }));
     },
     async ResumeSession(path: string) {
+      sessions.forEach((s) => {
+        s.current = s.path === path;
+      });
       return [
         { role: "user", content: `(mock) resumed ${path}` },
         { role: "assistant", content: "This is a mock resumed transcript — the real one comes from the kernel." },
+      ];
+    },
+    async PreviewSession(path: string) {
+      const s = sessions.find((x) => x.path === path);
+      return [
+        { role: "user", content: s?.preview || `(mock) preview ${path}` },
+        {
+          role: "assistant",
+          content: "This is a read-only mock preview. The active conversation is unchanged.",
+          reasoning: "Preview reads the saved session without resuming it.",
+        },
       ];
     },
     async DeleteSession(path: string) {
@@ -417,13 +461,18 @@ function makeMockApp(): AppBindings {
         { name: "new", description: "Start a new session", kind: "builtin" as const },
         { name: "compact", description: "Summarize older history to free up context", kind: "builtin" as const },
         { name: "model", description: "Switch model", kind: "builtin" as const },
+        { name: "effort", description: "Set reasoning effort", kind: "builtin" as const },
         { name: "skill", description: "List skills", kind: "builtin" as const },
         { name: "explore", description: "Investigate the codebase in an isolated subagent", kind: "skill" as const },
         { name: "review", description: "Review the staged diff", hint: "[focus]", kind: "custom" as const },
       ];
     },
     async Capabilities() {
-      return { servers: capServers.map((s) => ({ ...s })), skills: capSkills.map((s) => ({ ...s })) };
+      return {
+        servers: capServers.map((s) => ({ ...s })),
+        skills: capSkills.map((s) => ({ ...s })),
+        skillRoots: capSkillRoots.map((s) => ({ ...s })),
+      };
     },
     async AddMCPServer(input: MCPServerInput) {
       const tools = input.transport === "stdio" ? 3 : 5;
@@ -449,6 +498,26 @@ function makeMockApp(): AppBindings {
         s.name === name ? { ...s, status: "connected", tools: s.tools || 4, error: undefined } : s,
       );
     },
+    async PickSkillFolder() {
+      return "~/my-skills";
+    },
+    async AddSkillPath(path: string) {
+      const dir = path.trim() || "~/my-skills";
+      if (!capSkillRoots.some((r) => r.scope === "custom" && r.dir === dir)) {
+        capSkillRoots.push({ dir, scope: "custom", priority: capSkillRoots.length + 1, status: "ok", configured: true, skills: 1 });
+      }
+      if (!capSkills.some((s) => s.name === "local-dev")) {
+        capSkills.push({ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" });
+      }
+    },
+    async RemoveSkillPath(path: string) {
+      capSkillRoots = capSkillRoots.filter((r) => !(r.scope === "custom" && r.dir === path));
+      if (!capSkillRoots.some((r) => r.scope === "custom")) {
+        const idx = capSkills.findIndex((s) => s.name === "local-dev");
+        if (idx >= 0) capSkills.splice(idx, 1);
+      }
+    },
+    async RefreshSkills() {},
     async SetMCPServerEnabled(name: string, enabled: boolean) {
       capServers = capServers.map((s) =>
         s.name === name
@@ -475,6 +544,11 @@ function makeMockApp(): AppBindings {
         "/model": [
           { label: "deepseek/deepseek-v4-flash", insert: "deepseek/deepseek-v4-flash", hint: "current" },
           { label: "deepseek/deepseek-v4-pro", insert: "deepseek/deepseek-v4-pro", hint: "" },
+        ],
+        "/effort": [
+          { label: "auto", insert: "auto", hint: "use the model default" },
+          { label: "high", insert: "high", hint: "deeper reasoning" },
+          { label: "max", insert: "max", hint: "maximum reasoning" },
         ],
       };
       const items = (subs[cmd] ?? [])
@@ -516,6 +590,23 @@ function makeMockApp(): AppBindings {
         binary: false,
       };
     },
+    async WorkspaceChanges() {
+      return {
+        gitAvailable: true,
+        files: [
+          {
+            path: "desktop/frontend/src/components/WorkspacePanel.tsx",
+            sources: ["session", "git"],
+            gitStatus: "M",
+            turns: [0, 2],
+            latestPrompt: "Mock session edited the workspace panel.",
+            latestTime: Date.now() - 60_000,
+          },
+          { path: "README.md", sources: ["git"], gitStatus: "??" },
+          { path: "internal/control/controller.go", sources: ["session"], turns: [1], latestTime: Date.now() - 120_000 },
+        ],
+      };
+    },
     async OpenWorkspacePath(rel: string) {
       console.info("mock OpenWorkspacePath", rel);
     },
@@ -524,6 +615,9 @@ function makeMockApp(): AppBindings {
     },
     async SavePastedImage(_dataUrl: string) {
       return ".reasonix/attachments/mock.png";
+    },
+    async SavePastedFile(name: string, _dataUrl: string) {
+      return `.reasonix/attachments/mock-${name}`;
     },
     async AttachmentDataURL(_path: string) {
       return "data:image/png;base64,iVBORw0KGgo=";
@@ -535,6 +629,12 @@ function makeMockApp(): AppBindings {
       ];
     },
     async SetModel() {},
+    async Effort() {
+      return { supported: true, current: mockEffort, default: "high", levels: ["auto", "high", "max"] };
+    },
+    async SetEffort(level: string) {
+      mockEffort = level || "auto";
+    },
     async Memory() {
       return {
         available: true,
@@ -610,9 +710,12 @@ function makeMockApp(): AppBindings {
       const k = list as "allow" | "ask" | "deny";
       settings.permissions[k] = settings.permissions[k].filter((r) => r !== rule);
     },
-    async SetSandbox(bash: string, network: boolean, workspaceRoot: string, allowWrite: string[]) {
-      settings.sandbox = { bash, network, workspaceRoot, allowWrite };
-    },
+	    async SetSandbox(bash: string, network: boolean, workspaceRoot: string, allowWrite: string[]) {
+	      settings.sandbox = { bash, network, workspaceRoot, allowWrite };
+	    },
+	    async SetNetwork(n: NetworkView) {
+	      settings.network = n;
+	    },
     async SetAgentParams(temperature: number, maxSteps: number, systemPrompt: string) {
       settings.agent = { temperature, maxSteps, systemPrompt };
     },
@@ -652,6 +755,18 @@ function makeMockApp(): AppBindings {
       if (typeof window !== "undefined") {
         window.open("https://github.com/esengine/reasonix/releases/latest", "_blank", "noopener");
       }
+    },
+    // Dev seam: drives the overlay flow in the browser until ConnectKey sets the
+    // key. Matches ConnectKey on apiKeyEnv so the two stay in sync.
+    async NeedsOnboarding() {
+      return !settings.providers.find((p) => p.apiKeyEnv === "DEEPSEEK_API_KEY")?.keySet;
+    },
+    async ConnectKey(apiKey: string) {
+      if (!apiKey.trim()) throw new Error("key is required");
+      settings.providers.forEach((p) => {
+        if (p.apiKeyEnv === "DEEPSEEK_API_KEY") p.keySet = true;
+      });
+      await delay(300);
     },
   };
 }

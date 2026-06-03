@@ -8,16 +8,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"math/rand"
-	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
 
+	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
 
@@ -39,37 +37,64 @@ func New(cfg provider.Config) (provider.Provider, error) {
 	}
 	keyEnv, _ := cfg.Extra["api_key_env"].(string) // for actionable auth errors
 	effort, _ := cfg.Extra["effort"].(string)
+	deepseek := isDeepSeekBaseURL(cfg.BaseURL)
+	if deepseek {
+		effort = strings.ToLower(strings.TrimSpace(effort))
+		switch effort {
+		case "", "off": // "off" is a retired level (disabled thinking); fall back to the default depth
+			effort = "high"
+		case "high", "max":
+		default:
+			return nil, fmt.Errorf("openai: provider %q uses DeepSeek thinking; effort must be high or max", name)
+		}
+	}
+	httpClient, err := newHTTPClient(cfg)
+	if err != nil {
+		return nil, fmt.Errorf("openai: network: %w", err)
+	}
 	return &client{
-		name:    name,
-		apiKey:  cfg.APIKey,
-		keyEnv:  keyEnv,
-		baseURL: strings.TrimRight(cfg.BaseURL, "/"),
-		model:   cfg.Model,
-		effort:  effort,
-		http: &http.Client{
-			Transport: &http.Transport{
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				TLSHandshakeTimeout:   15 * time.Second,
-				ResponseHeaderTimeout: 120 * time.Second, // models can think for a while before the first token
-			},
-		},
+		name:     name,
+		apiKey:   cfg.APIKey,
+		keyEnv:   keyEnv,
+		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
+		model:    cfg.Model,
+		deepseek: deepseek,
+		effort:   effort,
+		http:     httpClient,
 	}, nil
 }
 
+func newHTTPClient(cfg provider.Config) (*http.Client, error) {
+	spec, _ := cfg.Extra["proxy_spec"].(netclient.ProxySpec)
+	return netclient.NewHTTPClient(spec, 0, netclient.TransportOptions{
+		DialTimeout:           30 * time.Second,
+		KeepAlive:             30 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ResponseHeaderTimeout: 120 * time.Second, // models can think for a while before the first token
+	})
+}
+
 type client struct {
-	name    string
-	apiKey  string
-	keyEnv  string // api_key_env name, surfaced in auth errors
-	baseURL string
-	model   string
-	http    *http.Client
-	effort  string // reasoning_effort forwarded to thinking-capable models; "" = omit
+	name     string
+	apiKey   string
+	keyEnv   string // api_key_env name, surfaced in auth errors
+	baseURL  string
+	model    string
+	http     *http.Client
+	deepseek bool
+	effort   string // reasoning_effort forwarded to thinking-capable models; "" = omit
 }
 
 func (c *client) Name() string { return c.name }
+
+func isDeepSeekBaseURL(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	return host == "api.deepseek.com" || strings.HasSuffix(host, ".deepseek.com")
+}
 
 func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provider.Chunk, error) {
 	body, err := json.Marshal(c.buildRequest(req))
@@ -77,7 +102,17 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 		return nil, fmt.Errorf("%s: marshal request: %w", c.name, err)
 	}
 
-	resp, err := c.sendWithRetry(ctx, body)
+	newReq := func(ctx context.Context) (*http.Request, error) {
+		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
+		if err != nil {
+			return nil, err
+		}
+		httpReq.Header.Set("Content-Type", "application/json")
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+		httpReq.Header.Set("Accept", "text/event-stream")
+		return httpReq, nil
+	}
+	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
 	if err != nil {
 		return nil, err
 	}
@@ -85,87 +120,6 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 	out := make(chan provider.Chunk)
 	go c.readStream(ctx, resp, out)
 	return out, nil
-}
-
-// sendWithRetry POSTs the request body and returns the streaming response,
-// retrying on transient network errors and retryable HTTP statuses (408, 429,
-// 5xx) with exponential backoff + jitter. Retries only cover the connection +
-// header phase; once we hand the response to readStream, mid-stream failures
-// surface as ChunkError without retry, since the model has already started
-// emitting tokens we'd otherwise duplicate.
-func (c *client) sendWithRetry(ctx context.Context, body []byte) (*http.Response, error) {
-	const maxAttempts = 3
-	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			delay := time.Duration(1<<(attempt-1))*500*time.Millisecond + time.Duration(rand.Intn(250))*time.Millisecond
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-time.After(delay):
-			}
-		}
-
-		httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/chat/completions", bytes.NewReader(body))
-		if err != nil {
-			return nil, fmt.Errorf("%s: build request: %w", c.name, err)
-		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
-		httpReq.Header.Set("Accept", "text/event-stream")
-
-		resp, err := c.http.Do(httpReq)
-		if err != nil {
-			if !isTransientErr(err) {
-				return nil, fmt.Errorf("%s: request failed: %w", c.name, err)
-			}
-			lastErr = fmt.Errorf("%s: request failed: %w", c.name, err)
-			continue
-		}
-		if resp.StatusCode == http.StatusOK {
-			return resp, nil
-		}
-		msg, readErr := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		if readErr != nil {
-			msg = []byte(fmt.Sprintf("(could not read error body: %v)", readErr))
-		}
-		// Drain any remaining body so the HTTP connection can be reused by the
-		// transport pool, then close.
-		_, _ = io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		// A rejected key is a configuration problem, not a transient one — give
-		// an actionable error instead of dumping the raw status body.
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-			return nil, &provider.AuthError{Provider: c.name, KeyEnv: c.keyEnv, Status: resp.StatusCode}
-		}
-		statusErr := fmt.Errorf("%s: status %d: %s", c.name, resp.StatusCode, strings.TrimSpace(string(msg)))
-		if !isRetryableStatus(resp.StatusCode) {
-			return nil, statusErr
-		}
-		lastErr = statusErr
-	}
-	return nil, lastErr
-}
-
-// isRetryableStatus returns true for HTTP status codes a transient backoff can
-// reasonably recover from: 408 (request timeout), 429 (rate limit), and 5xx.
-// 4xx other than 408/429 (auth, validation, not-found) are caller bugs and
-// won't fix themselves on retry.
-func isRetryableStatus(s int) bool {
-	return s == http.StatusRequestTimeout || s == http.StatusTooManyRequests || (s >= 500 && s <= 599)
-}
-
-// isTransientErr classifies HTTP client errors. ctx cancellation and deadline
-// expiry are caller intent — never retry those. Everything else (DNS failures,
-// connection resets, abrupt EOF, etc.) gets one more shot.
-func isTransientErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	return true
 }
 
 func (c *client) buildRequest(req provider.Request) chatRequest {
@@ -204,7 +158,7 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		})
 	}
 
-	return chatRequest{
+	out := chatRequest{
 		Model:           c.model,
 		Messages:        msgs,
 		Tools:           tools,
@@ -214,6 +168,10 @@ func (c *client) buildRequest(req provider.Request) chatRequest {
 		MaxTokens:       req.MaxTokens,
 		ReasoningEffort: c.effort,
 	}
+	if c.deepseek {
+		out.Thinking = &thinkingMode{Type: "enabled"}
+	}
+	return out
 }
 
 // readStream parses the SSE stream, emits text deltas live, accumulates tool-call
@@ -225,10 +183,17 @@ func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<-
 	defer close(out)
 
 	// Close the response body when the context is canceled so scanner.Scan()
-	// unblocks instead of hanging indefinitely on a stalled connection.
+	// unblocks instead of hanging on a stalled connection. done lets the goroutine
+	// exit when readStream returns normally — otherwise it outlives the call, and
+	// blocks forever on a non-cancellable context whose Done() is nil.
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
-		<-ctx.Done()
-		resp.Body.Close()
+		select {
+		case <-ctx.Done():
+			resp.Body.Close()
+		case <-done:
+		}
 	}()
 
 	acc := map[int]*provider.ToolCall{}
@@ -375,6 +340,11 @@ type chatRequest struct {
 	Temperature     float64        `json:"temperature,omitempty"`
 	MaxTokens       int            `json:"max_tokens,omitempty"`
 	ReasoningEffort string         `json:"reasoning_effort,omitempty"`
+	Thinking        *thinkingMode  `json:"thinking,omitempty"`
+}
+
+type thinkingMode struct {
+	Type string `json:"type"`
 }
 
 type streamOptions struct {

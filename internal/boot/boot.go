@@ -10,10 +10,12 @@ package boot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/codegraph"
@@ -22,9 +24,11 @@ import (
 	"reasonix/internal/control"
 	"reasonix/internal/event"
 	"reasonix/internal/hook"
+	"reasonix/internal/instruction"
 	"reasonix/internal/jobs"
 	"reasonix/internal/lsp"
 	"reasonix/internal/memory"
+	"reasonix/internal/netclient"
 	"reasonix/internal/outputstyle"
 	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
@@ -34,6 +38,11 @@ import (
 	"reasonix/internal/tool"
 	"reasonix/internal/tool/builtin"
 )
+
+// ErrUnknownModel is returned by Build when the configured model can't be
+// resolved to a provider — e.g. a default_model left over from a renamed or
+// removed provider. Callers can detect it (errors.Is) to re-run setup.
+var ErrUnknownModel = errors.New("unknown model")
 
 // Options carries the per-run knobs a frontend chooses; everything else is read
 // from configuration. Model "" falls back to the configured default_model;
@@ -72,7 +81,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	}
 	entry, ok := cfg.ResolveModel(modelName)
 	if !ok {
-		return nil, fmt.Errorf("unknown model %q (configured: %s)", modelName, providerNames(cfg))
+		return nil, fmt.Errorf("%w %q (configured: %s); note: defining [[providers]] replaces the built-in presets, so add a [[providers]] entry for it or use a configured name, or run `reasonix setup` to reconfigure", ErrUnknownModel, modelName, providerNames(cfg))
 	}
 	if opts.RequireKey {
 		if err := cfg.Validate(modelName); err != nil {
@@ -85,9 +94,25 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// shares this synchronized sink. The job manager is session-scoped — its jobs
 	// outlive a turn and are cancelled by Controller.Close.
 	sink := event.Sync(opts.Sink)
+
+	// A resolvable model whose API key env is unset would otherwise build fine
+	// (RequireKey is false so the UI stays reachable) and then fail silently on the
+	// first request, showing as an empty/dead model. Surface the cause up front.
+	if !opts.RequireKey && entry.APIKeyEnv != "" && entry.APIKey() == "" {
+		sink.Emit(event.Event{Kind: event.Notice, Text: fmt.Sprintf("model %q is selected but its API key %s is not set — requests will fail until you set it", modelName, entry.APIKeyEnv)})
+	}
 	jm := jobs.NewManager(sink)
 
-	execProv, err := NewProvider(entry)
+	proxySpec := cfg.NetworkProxySpec()
+	if err := netclient.Validate(proxySpec); err != nil {
+		return nil, err
+	}
+	balanceClient, err := netclient.NewHTTPClient(proxySpec, 12*time.Second, netclient.TransportOptions{})
+	if err != nil {
+		return nil, err
+	}
+
+	execProv, err := NewProviderWithProxy(entry, proxySpec)
 	if err != nil {
 		return nil, err
 	}
@@ -110,6 +135,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// turn. Mid-session changes never touch this prefix — they ride the
 	// controller's transient turn-injection and fold in on the next session.
 	mem := memory.Load(memory.Options{CWD: ".", UserDir: config.MemoryUserDir()})
+	projectChecks := instruction.ExtractHostChecks(mem.Docs)
 	sysPrompt = memory.Compose(sysPrompt, mem)
 
 	// Skills: discover playbooks (built-in + project/custom/global) and fold their
@@ -129,11 +155,39 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	if sandbox.ResolveShell().Kind == sandbox.ShellPowerShell {
 		fmt.Fprintln(stderr, "warning: bash not found on PATH; the shell tool will run commands under Windows PowerShell. Install Git for Windows or WSL to use bash.")
 	}
-	addBuiltins(reg, cfg.Tools.Enabled, cfg.WriteRoots(), bashSpec, stderr)
+	searchSpec := builtin.ResolveSearch(cfg.Tools.Search.Engine, cfg.Tools.Search.RgPath, stderr)
+	addBuiltins(reg, cfg.Tools.Enabled, cfg.WriteRoots(), bashSpec, searchSpec, stderr)
 	// Always construct a host, even with no plugins configured, so the controller's
 	// host pointer is stable for the session and `/mcp add` can hot-add into it.
 	pluginHost := plugin.NewHost()
-	specs := PluginSpecs(cfg.AutoStartPlugins())
+
+	// Partition configured plugins by tier so eager/lazy/background can each
+	// take the path that fits them. User entries default to lazy — they don't
+	// slow the next launch unless the user explicitly opts in to eager.
+	eagerEntries, lazyEntries, bgEntries := partitionByTier(cfg.AutoStartPlugins())
+
+	// Auto-demote: any eager plugin that has been chronically slow (recent
+	// samples repeatedly hit the blocking startup budget) drops to lazy
+	// for this session. The user keeps eager intent, just doesn't pay for it
+	// on a server that's been misbehaving. A notice surfaces the demotion.
+	var demoteMessages []string
+	budget := plugin.DefaultStartupBudget()
+	kept := eagerEntries[:0]
+	for _, e := range eagerEntries {
+		rec := plugin.Recommend(e.Name, budget, 0)
+		if rec.Demote {
+			demoteMessages = append(demoteMessages, rec.Reason)
+			lazyEntries = append(lazyEntries, e)
+			continue
+		}
+		kept = append(kept, e)
+	}
+	eagerEntries = kept
+
+	eagerSpecs := PluginSpecs(eagerEntries)
+	lazySpecs := PluginSpecs(lazyEntries)
+	bgSpecs := PluginSpecs(bgEntries)
+
 	// CodeGraph is a built-in MCP server fetched on first use. When it resolves,
 	// inject it as one more stdio plugin pinned to the project root (it is
 	// cwd-aware); EnsureInit only creates .codegraph/ (fast, size-independent),
@@ -142,6 +196,9 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 	// (one-time, ~45MB) if auto_install is on — startup still never blocks, the
 	// tools come online next session — otherwise point the user at the explicit
 	// install command. A failed init or fetch is a notice, not fatal.
+	//
+	// Codegraph stays eager regardless of user tier — symbol-graph tools land
+	// in the system prompt, so the agent must see them on first turn.
 	if cfg.Codegraph.Enabled {
 		bin, ok := codegraph.Resolve(cfg.Codegraph.Path)
 		switch {
@@ -150,38 +207,76 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 				sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn,
 					Text: "codegraph: init failed (" + err.Error() + ") — symbol-graph tools disabled this session"})
 			}
-			specs = append(specs, plugin.Spec{Name: "codegraph", Command: bin, Args: []string{"serve", "--mcp"}, Dir: cwd})
+			eagerSpecs = append(eagerSpecs, plugin.Spec{Name: "codegraph", Command: bin, Args: []string{"serve", "--mcp"}, Dir: cwd})
 		case cfg.Codegraph.AutoInstall:
 			notify := func(msg string) { sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: msg}) }
 			notify("codegraph: fetching code-intelligence runtime in the background (one-time) — symbol-graph tools available next session")
-			go func() {
-				if _, err := codegraph.Install(context.WithoutCancel(ctx), nil); err != nil {
-					notify("codegraph: install failed (" + err.Error() + ") — using grep/glob; retries next session")
-				} else {
-					notify("codegraph: installed — symbol-graph tools available next session")
-				}
-			}()
+			codegraphClient, err := netclient.NewHTTPClient(proxySpec, 0, netclient.TransportOptions{})
+			if err != nil {
+				notify("codegraph: install skipped (" + err.Error() + ")")
+			} else {
+				go func() {
+					if _, err := codegraph.InstallWithClient(context.WithoutCancel(ctx), codegraphClient, nil); err != nil {
+						notify("codegraph: install failed (" + err.Error() + ") — using grep/glob; retries next session")
+					} else {
+						notify("codegraph: installed — symbol-graph tools available next session")
+					}
+				}()
+			}
 		default:
 			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 				Text: "codegraph: not installed — run `reasonix codegraph install` to enable symbol-graph tools"})
 		}
 	}
-	if len(specs) > 0 {
-		// Apply caller-supplied stderr override to all plugin specs.
-		if opts.Stderr != nil {
-			for i := range specs {
-				specs[i].Stderr = opts.Stderr
-			}
+
+	// Apply caller-supplied stderr override to every spec across tiers.
+	if opts.Stderr != nil {
+		for i := range eagerSpecs {
+			eagerSpecs[i].Stderr = opts.Stderr
 		}
-		host, ptools := plugin.StartAvailable(ctx, specs)
+		for i := range lazySpecs {
+			lazySpecs[i].Stderr = opts.Stderr
+		}
+		for i := range bgSpecs {
+			bgSpecs[i].Stderr = opts.Stderr
+		}
+	}
+
+	// Eager: block until handshake. Failures show up in /mcp.
+	if len(eagerSpecs) > 0 {
+		host, ptools := plugin.StartAvailable(ctx, eagerSpecs)
 		pluginHost = host
 		for _, t := range ptools {
 			reg.Add(t)
 		}
+		// PhaseB (prompts + resources) runs on the boot ctx — which is the
+		// controller's session-scoped PluginCtx — so the auxiliary surfaces
+		// keep streaming in after Start returns without holding up the agent.
+		go host.StartPhaseB(ctx, sink)
 		if text, ok := MCPStartupNotice(host.Failures()); ok {
 			sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: text})
 		}
 	}
+
+	// Lazy / background: register placeholder tools now; the real spawn waits
+	// for either the first model call (lazy) or a goroutine kicked off here
+	// (background). Both share the same pluginHost so /mcp status, hot-add,
+	// and Close see one cohesive set of servers regardless of tier.
+	registerDeferred := func(specs []plugin.Spec, kick bool) {
+		for _, s := range specs {
+			cs, _ := plugin.LoadCachedSchema(s.Name, plugin.SpecFingerprint(s))
+			for _, t := range plugin.LazyToolset(s, cs, pluginHost, reg, ctx, kick) {
+				reg.Add(t)
+			}
+		}
+	}
+	registerDeferred(lazySpecs, false)
+	registerDeferred(bgSpecs, true)
+
+	for _, msg := range demoteMessages {
+		sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: msg})
+	}
+
 	cleanup := pluginHost.Close
 
 	// LSP tools resolve their servers on PATH and spawn lazily on first query, so
@@ -257,7 +352,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		prov, price, ctxWin := execProv, entry.Price, entry.ContextWindow
 		if modelRef := subagentModelRef(cfg, sk); modelRef != "" {
 			if me, ok := cfg.ResolveModel(modelRef); ok {
-				if p, err := NewProvider(me); err == nil {
+				if p, err := NewProviderWithProxy(me, proxySpec); err == nil {
 					prov, price, ctxWin = p, me.Price, me.ContextWindow
 				}
 			}
@@ -292,6 +387,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Gate:          headlessGate,
 		Hooks:         hookRunner,
 		Jobs:          jm,
+		ProjectChecks: projectChecks,
 		ContextWindow: entry.ContextWindow,
 		ArchiveDir:    config.ArchiveDir(),
 	}, sink)
@@ -336,7 +432,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 			return nil, fmt.Errorf("planner_model %q is not a configured provider", pm)
 		}
 		if pe.Model != entry.Model {
-			plannerProv, err := NewProvider(pe)
+			plannerProv, err := NewProviderWithProxy(pe, proxySpec)
 			if err != nil {
 				return nil, fmt.Errorf("planner %q: %w", pm, err)
 			}
@@ -351,7 +447,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		if !ok {
 			return nil, fmt.Errorf("auto_plan_classifier %q is not a configured provider", cm)
 		}
-		classifierProv, err := NewProvider(ce)
+		classifierProv, err := NewProviderWithProxy(ce, proxySpec)
 		if err != nil {
 			return nil, fmt.Errorf("auto_plan_classifier %q: %w", cm, err)
 		}
@@ -374,6 +470,7 @@ func Build(ctx context.Context, opts Options) (*control.Controller, error) {
 		Cleanup:       cleanup,
 		BalanceURL:    entry.BalanceURL,
 		BalanceKey:    entry.APIKey(),
+		BalanceClient: balanceClient,
 		Jobs:          jm,
 		Registry:      reg,
 		PluginCtx:     ctx,
@@ -434,6 +531,12 @@ func subagentModelKeys(name string) []string {
 // custom assemblers (e.g. the ACP per-session factory) can reuse it without
 // going through the full Build.
 func NewProvider(e *config.ProviderEntry) (provider.Provider, error) {
+	return NewProviderWithProxy(e, netclient.ProxySpec{Mode: netclient.ModeAuto})
+}
+
+// NewProviderWithProxy builds a provider.Provider with the configured ordinary
+// network proxy settings.
+func NewProviderWithProxy(e *config.ProviderEntry, proxy netclient.ProxySpec) (provider.Provider, error) {
 	return provider.New(e.Kind, provider.Config{
 		Name:    e.Name,
 		BaseURL: e.BaseURL,
@@ -446,6 +549,7 @@ func NewProvider(e *config.ProviderEntry) (provider.Provider, error) {
 			"api_key_env": e.APIKeyEnv,
 			"thinking":    e.Thinking,
 			"effort":      e.Effort,
+			"proxy_spec":  proxy,
 		},
 	})
 }
@@ -454,7 +558,7 @@ func NewProvider(e *config.ProviderEntry) (provider.Provider, error) {
 // them. writeRoots confines the file-writing built-ins to the workspace: after
 // the (unconfined) defaults are added, each enabled writer is replaced by an
 // instance bound to writeRoots (preserving registry order).
-func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, stderr io.Writer) {
+func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sandbox.Spec, searchSpec builtin.SearchSpec, stderr io.Writer) {
 	if len(enabled) == 0 {
 		for _, t := range tool.Builtins() {
 			reg.Add(t)
@@ -471,12 +575,30 @@ func addBuiltins(reg *tool.Registry, enabled, writeRoots []string, bashSpec sand
 	// Replace the unconfined defaults with confined instances (registry order is
 	// preserved on replace): file-writers bound to the workspace, bash to the OS
 	// sandbox. Only replace tools actually enabled/present.
-	confined := append(builtin.ConfineWriters(writeRoots), builtin.ConfineBash(bashSpec))
+	confined := append(builtin.ConfineWriters(writeRoots), builtin.ConfineBash(bashSpec), builtin.ConfineSearch(searchSpec))
 	for _, t := range confined {
 		if _, ok := reg.Get(t.Name()); ok {
 			reg.Add(t)
 		}
 	}
+}
+
+// partitionByTier splits configured plugin entries into the three startup
+// buckets — eager (block boot until ready), lazy (placeholder until first
+// model use), background (placeholder + start spawn now). Entries with an
+// unrecognised or empty tier land in lazy (the default).
+func partitionByTier(entries []config.PluginEntry) (eager, lazy, bg []config.PluginEntry) {
+	for _, e := range entries {
+		switch e.ResolvedTier() {
+		case "eager":
+			eager = append(eager, e)
+		case "background":
+			bg = append(bg, e)
+		default:
+			lazy = append(lazy, e)
+		}
+	}
+	return eager, lazy, bg
 }
 
 // PluginSpecs maps configured plugin entries to plugin.Spec, expanding ${VAR}

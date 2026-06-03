@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"reasonix/internal/event"
@@ -43,6 +44,21 @@ func TestToWireNoticeWarn(t *testing.T) {
 	}
 }
 
+func TestToWireRetrying(t *testing.T) {
+	e := event.Event{Kind: event.Retrying, RetryAttempt: 3, RetryMax: 10}
+	w := toWire(e)
+	if w.Kind != "retrying" || w.RetryAttempt != 3 || w.RetryMax != 10 {
+		t.Errorf("retrying wire = %+v", w)
+	}
+	b, err := json.Marshal(w)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if s := string(b); !strings.Contains(s, `"retryAttempt":3`) || !strings.Contains(s, `"retryMax":10`) {
+		t.Errorf("retrying JSON = %s", s)
+	}
+}
+
 func TestToWireToolDispatch(t *testing.T) {
 	e := event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "1", Name: "bash", Args: `{"c":"echo"}`, ReadOnly: false}}
 	w := toWire(e)
@@ -56,6 +72,14 @@ func TestToWireToolResult(t *testing.T) {
 	w := toWire(e)
 	if w.Tool == nil || w.Tool.Output != "ok" || !w.Tool.Truncated {
 		t.Errorf("tool result = %+v", w.Tool)
+	}
+}
+
+func TestToWireToolProgress(t *testing.T) {
+	e := event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: "1", Output: "chunk"}}
+	w := toWire(e)
+	if w.Kind != "tool_progress" || w.Tool == nil || w.Tool.Output != "chunk" {
+		t.Errorf("tool progress = kind:%q tool:%+v", w.Kind, w.Tool)
 	}
 }
 
@@ -128,14 +152,11 @@ func TestToWireTurnDoneNoError(t *testing.T) {
 // --- kindNames completeness ---
 
 func TestKindNamesComplete(t *testing.T) {
-	allKinds := []event.Kind{
-		event.TurnStarted, event.Reasoning, event.Text, event.Message,
-		event.ToolDispatch, event.ToolResult, event.Usage, event.Notice,
-		event.Phase, event.ApprovalRequest, event.AskRequest, event.TurnDone,
-	}
-	for _, k := range allKinds {
-		if _, ok := kindNames[k]; !ok {
-			t.Errorf("kind %d not in kindNames", k)
+	// ToolProgress is the last Kind; every value through it must have a wire name,
+	// or toWire emits kind:"" and the frontend reducer falls through to undefined.
+	for k := event.Kind(0); k <= event.ToolProgress; k++ {
+		if kindNames[k] == "" {
+			t.Errorf("kind %d has no wire name — toWire would emit kind:\"\"", k)
 		}
 	}
 }

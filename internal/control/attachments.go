@@ -8,17 +8,62 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"reasonix/internal/proc"
 )
 
 const maxImageAttachmentBytes = 10 * 1024 * 1024
+const maxFileAttachmentBytes = 25 * 1024 * 1024
 const maxAttachmentCreateAttempts = 1000
 
 var attachmentPathSeq atomic.Uint64
 var attachmentNow = time.Now
+var safeAttachmentExt = regexp.MustCompile(`^\.[a-z0-9]{1,12}$`)
+
+// SaveAttachmentDataURL stores a non-image file (dropped/pasted in the desktop
+// app, where the browser exposes bytes but not a real path) under
+// .reasonix/attachments and returns its repo-relative path for @referencing.
+// origName supplies only the extension; the stored name is generated.
+func SaveAttachmentDataURL(origName, dataURL string) (string, error) {
+	const marker = ";base64,"
+	i := strings.Index(dataURL, marker)
+	if !strings.HasPrefix(dataURL, "data:") || i < 0 {
+		return "", fmt.Errorf("unsupported pasted file")
+	}
+	raw, err := base64.StdEncoding.DecodeString(dataURL[i+len(marker):])
+	if err != nil {
+		return "", fmt.Errorf("decode pasted file: %w", err)
+	}
+	if len(raw) == 0 || len(raw) > maxFileAttachmentBytes {
+		return "", fmt.Errorf("attachment must be between 1 byte and 25 MB")
+	}
+	ext := strings.ToLower(filepath.Ext(origName))
+	if !safeAttachmentExt.MatchString(ext) {
+		ext = ".bin"
+	}
+	if err := ensureAttachmentRoot(); err != nil {
+		return "", err
+	}
+	rel, f, err := createAttachmentFile(ext)
+	if err != nil {
+		return "", err
+	}
+	if _, err := f.Write(raw); err != nil {
+		_ = f.Close()
+		_ = os.Remove(rel)
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		_ = os.Remove(rel)
+		return "", err
+	}
+	return filepath.ToSlash(rel), nil
+}
 
 func SaveImageDataURL(dataURL string) (string, error) {
 	const prefix = "data:"
@@ -134,7 +179,9 @@ if ($null -eq $img) { [Console]::Error.WriteLine('clipboard has no image'); exit
 $ms = New-Object System.IO.MemoryStream
 $img.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
 [Convert]::ToBase64String($ms.ToArray())`
-	out, err := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script).Output()
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
+	proc.HideWindow(cmd)
+	out, err := cmd.Output()
 	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok && len(ee.Stderr) > 0 {
 			return "", fmt.Errorf("read clipboard image: %s", strings.TrimSpace(string(ee.Stderr)))

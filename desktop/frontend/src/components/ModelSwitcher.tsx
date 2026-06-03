@@ -25,7 +25,7 @@ export function ModelSwitcher({ label, onPick }: { label: string; onPick: (name:
 
   return (
     <div className="modelsw">
-      <button className="modelsw__trigger" onClick={() => setOpen((v) => !v)} title={t("status.switchModel")}>
+      <button className="modelsw__trigger" onClick={() => setOpen((v) => !v)}>
         <span className="modelsw__label">{label}</span>
         <ChevronsUpDown size={11} />
       </button>

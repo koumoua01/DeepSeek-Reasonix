@@ -1,16 +1,55 @@
 package cli
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	tea "charm.land/bubbletea/v2"
 
+	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/event"
+	"reasonix/internal/i18n"
 	"reasonix/internal/provider"
 )
+
+type blockingTurnRunner struct{ started chan struct{} }
+
+func (r *blockingTurnRunner) Run(ctx context.Context, _ string) error {
+	close(r.started)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// TestEscCancelsRunningTurnWithCompletionOpen reproduces the report that Esc
+// (unlike Ctrl+C) did not stop a running turn: an active completion menu
+// captured Esc to close itself and returned before reaching the running-turn
+// cancel branch, while Ctrl+C — not in the completion switch — fell through.
+func TestEscCancelsRunningTurnWithCompletionOpen(t *testing.T) {
+	r := &blockingTurnRunner{started: make(chan struct{})}
+	ctrl := control.New(control.Options{Runner: r, Sink: event.Discard, SessionDir: t.TempDir(), Label: "test"})
+	ctrl.Send("hi")
+	<-r.started // the turn is in flight and cancellable
+
+	m := newTestChatTUI()
+	m.ctrl = ctrl
+	m.state = tuiRunning
+	m.completion.active = true // e.g. a "/" typed into the composer while waiting
+
+	_, _ = m.update(tea.KeyPressMsg{Code: tea.KeyEscape})
+
+	deadline := time.Now().Add(2 * time.Second)
+	for ctrl.Running() {
+		if time.Now().After(deadline) {
+			t.Fatal("Esc did not cancel the running turn (completion menu swallowed it)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
 
 // TestTranscriptMirrorsCommits proves the alt-screen migration's foundation:
 // every line commitLine sends to native scrollback is also captured in the
@@ -55,18 +94,18 @@ func TestTranscriptViewportSizing(t *testing.T) {
 }
 
 // TestIngestEventRoutesByKind proves each event Kind lands in the right place:
-// reasoning shows a collapsed live marker at once, while tool dispatch, blocked
+// reasoning shows a live marker with streaming text, while tool dispatch, blocked
 // results, usage, notices, and coordinator phases each commit as their own
 // scrollback line. Routing is by Kind, not by sniffing line prefixes.
 func TestIngestEventRoutesByKind(t *testing.T) {
-	// Reasoning shows a collapsed live marker at once, without the raw thinking.
+	// Reasoning shows a marker plus the live thinking text streamed below it.
 	m := newTestChatTUI()
 	m.ingestEvent(event.Event{Kind: event.Reasoning, Text: "weighing options"})
-	if len(m.transcript) != 1 || !strings.Contains(m.transcript[0], "thinking") {
+	if len(m.transcript) != 2 || !strings.Contains(m.transcript[0], "thinking") {
 		t.Errorf("reasoning should show a live marker, transcript=%v", m.transcript)
 	}
-	if strings.Contains(m.transcript[0], "weighing options") {
-		t.Errorf("reasoning text should stay hidden by default, transcript=%v", m.transcript)
+	if !strings.Contains(m.transcript[1], "weighing options") {
+		t.Errorf("reasoning text should stream live, transcript=%v", m.transcript)
 	}
 
 	for _, tc := range []struct {
@@ -74,8 +113,8 @@ func TestIngestEventRoutesByKind(t *testing.T) {
 		ev   event.Event
 		want string
 	}{
-		{"dispatch", event.Event{Kind: event.ToolDispatch, Tool: event.Tool{Name: "read_file", Args: `{"path":"x"}`}}, "  -> read_file {\"path\":\"x\"}"},
-		{"blocked", event.Event{Kind: event.ToolResult, Tool: event.Tool{Name: "bash", Err: "blocked by permission policy"}}, "  ⊘ bash blocked by permission policy"},
+		{"dispatch", event.Event{Kind: event.ToolDispatch, Tool: event.Tool{Name: "read_file", Args: `{"path":"x"}`}}, "● Read(x)"},
+		{"blocked", event.Event{Kind: event.ToolResult, Tool: event.Tool{Name: "bash", Err: "blocked by permission policy"}}, "● Bash ⊘ blocked by permission policy"},
 		{"usage", event.Event{Kind: event.Usage, Usage: &provider.Usage{PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200, CacheHitTokens: 900, CacheMissTokens: 100}}, "  · 1200 tok"},
 		{"notice-info", event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "compacted 8 messages → summary"}, "  · compacted 8 messages → summary"},
 		{"notice-warn", event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "response truncated: hit max output tokens"}, "  ! response truncated: hit max output tokens"},
@@ -202,6 +241,215 @@ func TestInsertNewlineKeyBinding(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("newChatTUI InsertNewline should include shift+enter, got %v", keys)
+	}
+}
+
+func TestEchoLocalCommandAddsTranscriptMarker(t *testing.T) {
+	m := newTestChatTUI()
+	m.echoLocalCommand("  /tree  ")
+	if len(*m.pendingCommit) != 1 {
+		t.Fatalf("pending commits = %d, want 1", len(*m.pendingCommit))
+	}
+	if got := (*m.pendingCommit)[0]; !strings.Contains(got, "› /tree") {
+		t.Fatalf("command echo = %q, want /tree marker", got)
+	}
+}
+
+func isolateUserConfig(t *testing.T) {
+	t.Helper()
+	root := t.TempDir()
+	t.Setenv("HOME", root)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(root, "config"))
+	t.Setenv("AppData", filepath.Join(root, "AppData")) // os.UserConfigDir reads AppData on Windows
+	t.Chdir(root)
+}
+
+func TestEffortCommandWritesCurrentDeepSeekProvider(t *testing.T) {
+	isolateUserConfig(t)
+
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Label: "deepseek-flash"})
+	m.modelRef = "deepseek-flash/deepseek-v4-flash"
+	m.buildController = func(_ string, _ []provider.Message) (*control.Controller, error) {
+		return control.New(control.Options{Label: "deepseek-flash"}), nil
+	}
+
+	cmd := m.runEffortCommand("/effort max")
+	if cmd == nil {
+		t.Fatal("/effort max should return a rebuild command")
+	}
+
+	configPath := config.UserConfigPath()
+	body, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(body), `effort      = "max"`) {
+		t.Fatalf("saved config missing effort=max:\n%s", body)
+	}
+}
+
+func TestEffortCommandRejectsUnsupportedProvider(t *testing.T) {
+	isolateUserConfig(t)
+
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Label: "mimo-pro"})
+	m.modelRef = "mimo-pro/mimo-v2.5-pro"
+	m.buildController = func(_ string, _ []provider.Message) (*control.Controller, error) {
+		return control.New(control.Options{Label: "mimo-pro"}), nil
+	}
+
+	if cmd := m.runEffortCommand("/effort max"); cmd != nil {
+		t.Fatal("unsupported provider should not rebuild")
+	}
+	if _, err := os.Stat(config.UserConfigPath()); !os.IsNotExist(err) {
+		t.Fatalf("unsupported provider should not write config, stat err=%v", err)
+	}
+}
+
+func TestEffortCommandAutoClearsProviderEffort(t *testing.T) {
+	isolateUserConfig(t)
+
+	m := newTestChatTUI()
+	m.ctrl = control.New(control.Options{Label: "deepseek-flash"})
+	m.modelRef = "deepseek-flash/deepseek-v4-flash"
+	m.buildController = func(_ string, _ []provider.Message) (*control.Controller, error) {
+		return control.New(control.Options{Label: "deepseek-flash"}), nil
+	}
+
+	if cmd := m.runEffortCommand("/effort max"); cmd == nil {
+		t.Fatal("/effort max should return a rebuild command")
+	}
+	if cmd := m.runEffortCommand("/effort auto"); cmd == nil {
+		t.Fatal("/effort auto should return a rebuild command")
+	}
+	body, err := os.ReadFile(config.UserConfigPath())
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	section := providerSection(string(body), "deepseek-flash")
+	if strings.Contains(section, `effort      = "`) {
+		t.Fatalf("auto should clear saved deepseek-flash effort:\n%s", section)
+	}
+}
+
+func TestLanguageCommandSwitchesImmediatelyAndPersists(t *testing.T) {
+	isolateUserConfig(t)
+	i18n.DetectLanguage("en")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	m := newTestChatTUI()
+	m.runLanguageSubcommand("/language zh")
+
+	if i18n.M.ChatStatusIdle != "就绪" {
+		t.Fatalf("/language zh did not switch active catalogue, idle=%q", i18n.M.ChatStatusIdle)
+	}
+	body, err := os.ReadFile(config.UserConfigPath())
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(body), `language      = "zh"`) {
+		t.Fatalf("saved config missing language=zh:\n%s", body)
+	}
+}
+
+func TestLanguageCommandAutoClearsPinnedLanguage(t *testing.T) {
+	isolateUserConfig(t)
+	i18n.DetectLanguage("en")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	m := newTestChatTUI()
+	m.runLanguageSubcommand("/language zh")
+	m.runLanguageSubcommand("/language auto")
+
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if cfg.Language != "" {
+		t.Fatalf("auto should clear saved language override, got %q", cfg.Language)
+	}
+}
+
+func TestLanguageCommandAutoClearsLowerPriorityUserOverride(t *testing.T) {
+	isolateUserConfig(t)
+	t.Setenv("REASONIX_LANG", "")
+	t.Setenv("LC_ALL", "")
+	t.Setenv("LC_MESSAGES", "")
+	t.Setenv("LANG", "")
+	i18n.DetectLanguage("en")
+	t.Cleanup(func() { i18n.DetectLanguage("en") })
+
+	userPath := config.UserConfigPath()
+	userCfg := config.LoadForEdit(userPath)
+	if err := userCfg.SetLanguage("zh"); err != nil {
+		t.Fatalf("set user language: %v", err)
+	}
+	if err := userCfg.SaveTo(userPath); err != nil {
+		t.Fatalf("save user config: %v", err)
+	}
+	projectCfg := config.Default()
+	if err := projectCfg.SaveTo("reasonix.toml"); err != nil {
+		t.Fatalf("save project config: %v", err)
+	}
+
+	m := newTestChatTUI()
+	m.runLanguageSubcommand("/language auto")
+
+	userCfg = config.LoadForEdit(userPath)
+	if userCfg.Language != "" {
+		t.Fatalf("/language auto should clear lower-priority user override, got %q", userCfg.Language)
+	}
+	loaded, err := config.Load()
+	if err != nil {
+		t.Fatalf("load merged config: %v", err)
+	}
+	if loaded.Language != "" {
+		t.Fatalf("merged config should be auto-detect after clearing overrides, got %q", loaded.Language)
+	}
+}
+
+func providerSection(body, name string) string {
+	needle := `name        = "` + name + `"`
+	start := strings.Index(body, needle)
+	if start < 0 {
+		return ""
+	}
+	end := strings.Index(body[start+len(needle):], "\n[[providers]]")
+	if end < 0 {
+		return body[start:]
+	}
+	return body[start : start+len(needle)+end]
+}
+
+func TestSubmittedInputRecallWithArrowKeys(t *testing.T) {
+	m := newTestChatTUI()
+	m.rememberSubmittedInput("first")
+	m.rememberSubmittedInput("second")
+	m.input.SetValue("draft")
+
+	up := tea.KeyPressMsg{Code: tea.KeyUp}
+	down := tea.KeyPressMsg{Code: tea.KeyDown}
+
+	model, _ := m.Update(up)
+	m = model.(chatTUI)
+	if got := m.input.Value(); got != "second" {
+		t.Fatalf("first up should recall latest input, got %q", got)
+	}
+
+	model, _ = m.Update(up)
+	m = model.(chatTUI)
+	if got := m.input.Value(); got != "first" {
+		t.Fatalf("second up should recall older input, got %q", got)
+	}
+
+	model, _ = m.Update(down)
+	m = model.(chatTUI)
+	if got := m.input.Value(); got != "second" {
+		t.Fatalf("down should move toward newer input, got %q", got)
+	}
+
+	model, _ = m.Update(down)
+	m = model.(chatTUI)
+	if got := m.input.Value(); got != "draft" {
+		t.Fatalf("down past newest should restore draft, got %q", got)
 	}
 }
 
@@ -390,5 +638,72 @@ func TestDoubleCtrlCQuit(t *testing.T) {
 	// lastCtrlCAt should be refreshed to now.
 	if time.Since(m4.lastCtrlCAt) > time.Second {
 		t.Error("expired Ctrl+C should refresh lastCtrlCAt")
+	}
+}
+
+// TestCtrlCClearsInput verifies that a single Ctrl+C while idle with non-empty
+// input clears the composer without arming the double-press quit gesture.
+func TestCtrlCClearsInput(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("hello world")
+	ctrlC := tea.KeyPressMsg{Code: 'c', Mod: 4}
+
+	out, _ := m.Update(ctrlC)
+	m2 := out.(chatTUI)
+
+	if strings.TrimSpace(m2.input.Value()) != "" {
+		t.Errorf("Ctrl+C should clear non-empty input, got %q", m2.input.Value())
+	}
+	if !m2.lastCtrlCAt.IsZero() {
+		t.Error("Ctrl+C on non-empty input should not arm the quit gesture")
+	}
+}
+
+// TestCtrlCClearsThenDoublePressQuits verifies the full user flow: Ctrl+C on
+// non-empty input clears it, then two more presses on the empty composer quit.
+func TestCtrlCClearsThenDoublePressQuits(t *testing.T) {
+	m := newTestChatTUI()
+	m.input.SetValue("draft text")
+	ctrlC := tea.KeyPressMsg{Code: 'c', Mod: 4}
+
+	// First press: clear input.
+	out, _ := m.Update(ctrlC)
+	m2 := out.(chatTUI)
+	if strings.TrimSpace(m2.input.Value()) != "" {
+		t.Fatal("first Ctrl+C should clear input")
+	}
+
+	// Second press (on empty): arm quit.
+	out2, _ := m2.Update(ctrlC)
+	m3 := out2.(chatTUI)
+	if m3.lastCtrlCAt.IsZero() {
+		t.Error("Ctrl+C on empty input should arm quit")
+	}
+
+	// Third press (within window): quit.
+	out3, cmd := m3.Update(ctrlC)
+	if cmd == nil {
+		t.Error("double Ctrl+C on empty input should quit")
+	}
+	_ = out3
+}
+
+// TestAgentEventCoalescesBurst proves one update drains the buffered event burst
+// behind the delivered event, so a flood collapses into a single re-render.
+func TestAgentEventCoalescesBurst(t *testing.T) {
+	m := newTestChatTUI()
+	m.eventCh = make(chan event.Event, 16)
+	m.eventCh <- event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: "b1", Output: "l1\n"}}
+	m.eventCh <- event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: "b1", Output: "l2\n"}}
+	m.eventCh <- event.Event{Kind: event.ToolProgress, Tool: event.Tool{ID: "b1", Output: "l3\n"}}
+
+	next, _ := m.update(agentEventMsg(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "b1", Name: "bash", Args: `{"command":"x"}`}}))
+	cm := next.(chatTUI)
+
+	if cm.toolLineCount != 3 {
+		t.Fatalf("burst not coalesced into one update: toolLineCount=%d, want 3", cm.toolLineCount)
+	}
+	if len(m.eventCh) != 0 {
+		t.Errorf("channel should be fully drained, %d left", len(m.eventCh))
 	}
 }

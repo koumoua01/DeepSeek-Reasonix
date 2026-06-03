@@ -13,7 +13,8 @@ TypeScript line; a new codebase that becomes the default (`main-v2`).
 
 - **Go kernel**: a single static binary (CGO-free), cross-compiled for
   darwin/linux/windows on amd64 + arm64. Distributed via npm (the package wraps
-  the native binary) and release archives; no Node runtime needed to run it.
+  the native binary), Homebrew (`esengine/reasonix` tap), and release archives;
+  no Node runtime needed to run it.
 - **Agent core**: the loop, built-in tools (read/write/edit/multi_edit/glob/grep/
   ls/bash/web_fetch/todo_write), permission gate, sandboxed bash, and the
   DeepSeek prefix-cache–oriented design.
@@ -30,6 +31,14 @@ TypeScript line; a new codebase that becomes the default (`main-v2`).
 - **Memory**: `REASONIX.md` hierarchy + auto-memory, folded into the cache-stable
   prefix.
 - **ACP** (`reasonix acp`) and an HTTP/SSE server frontend; desktop app (Wails).
+
+### Fixed
+
+- **File encoding support restored** — GBK/GB18030 (and other non-UTF-8) files
+  can now be read, edited, and grepped correctly. The v2 rewrite had dropped
+  v1's encoding detection; files in CJK Windows charsets were silently misread
+  or rejected as binary. The read/edit/write round-trip now preserves the
+  original file encoding. (#2637)
 
 ### Notes
 

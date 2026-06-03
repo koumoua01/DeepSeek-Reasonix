@@ -20,6 +20,43 @@ func TestSetDefaultModel(t *testing.T) {
 	}
 }
 
+func TestUIThemeNormalizes(t *testing.T) {
+	c := Default()
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"", "auto"},
+		{"AUTO", "auto"},
+		{"dark", "dark"},
+		{" light ", "light"},
+		{"unknown", "auto"},
+	} {
+		c.UI.Theme = tt.in
+		if got := c.UITheme(); got != tt.want {
+			t.Errorf("UITheme(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
+func TestUIThemeStyleNormalizes(t *testing.T) {
+	c := Default()
+	for _, tt := range []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"AURORA", "aurora"},
+		{" glacier ", "glacier"},
+		{"unknown", ""},
+	} {
+		c.UI.ThemeStyle = tt.in
+		if got := c.UIThemeStyle(); got != tt.want {
+			t.Errorf("UIThemeStyle(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestSetPlannerModel(t *testing.T) {
 	c := Default()
 	if err := c.SetPlannerModel("deepseek-pro"); err != nil {
@@ -70,6 +107,107 @@ func TestUpsertProvider(t *testing.T) {
 		if err := c.UpsertProvider(bad); err == nil {
 			t.Errorf("expected validation error for %+v", bad)
 		}
+	}
+}
+
+func TestSetProviderEffort(t *testing.T) {
+	c := Default()
+	if err := c.SetProviderEffort("deepseek-flash", "MAX"); err != nil {
+		t.Fatalf("SetProviderEffort: %v", err)
+	}
+	p, _ := c.Provider("deepseek-flash")
+	if p.Effort != "max" {
+		t.Fatalf("effort = %q, want max", p.Effort)
+	}
+	if err := c.SetProviderEffort("missing", "high"); err == nil {
+		t.Fatal("SetProviderEffort should reject unknown provider")
+	}
+}
+
+func TestSetLanguage(t *testing.T) {
+	c := Default()
+	if err := c.SetLanguage("zh"); err != nil {
+		t.Fatalf("SetLanguage zh: %v", err)
+	}
+	if c.Language != "zh" {
+		t.Fatalf("language = %q, want zh", c.Language)
+	}
+	if err := c.SetLanguage("auto"); err != nil {
+		t.Fatalf("SetLanguage auto: %v", err)
+	}
+	if c.Language != "" {
+		t.Fatalf("language = %q, want cleared", c.Language)
+	}
+}
+
+func TestNormalizeEffortDeepSeek(t *testing.T) {
+	e := &ProviderEntry{Name: "deepseek", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4"}
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported || len(cap.Levels) != 3 || cap.Levels[0] != "auto" || cap.Levels[1] != "high" || cap.Levels[2] != "max" {
+		t.Fatalf("DeepSeek levels = %+v, want auto/high/max", cap)
+	}
+	for in, want := range map[string]string{"auto": "", "high": "high", "max": "max", "low": "high", "medium": "high", "xhigh": "max"} {
+		got, err := NormalizeEffort(e, in)
+		if err != nil || got != want {
+			t.Fatalf("NormalizeEffort(%q) = %q/%v, want %q/nil", in, got, err, want)
+		}
+	}
+	if _, err := NormalizeEffort(e, "off"); err == nil {
+		t.Fatal("DeepSeek /effort must reject off")
+	}
+}
+
+func TestNormalizeLegacyEffortMigratesOff(t *testing.T) {
+	c := &Config{Providers: []ProviderEntry{
+		{Name: "deepseek", Effort: "off"},
+		{Name: "deepseek-upper", Effort: "OFF"},
+		{Name: "keep", Effort: "high"},
+	}}
+	normalizeLegacyEffort(c)
+	if c.Providers[0].Effort != "" || c.Providers[1].Effort != "" {
+		t.Fatalf("legacy off should migrate to empty, got %q/%q", c.Providers[0].Effort, c.Providers[1].Effort)
+	}
+	if c.Providers[2].Effort != "high" {
+		t.Fatalf("non-legacy effort changed: %q", c.Providers[2].Effort)
+	}
+}
+
+func TestNormalizeEffortAnthropic(t *testing.T) {
+	e := &ProviderEntry{Name: "claude", Kind: "anthropic", Model: "claude-opus-4-8"}
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported || len(cap.Levels) != 6 {
+		t.Fatalf("Anthropic levels = %+v, want auto plus five levels", cap)
+	}
+	for _, level := range []string{"low", "medium", "high", "xhigh", "max"} {
+		got, err := NormalizeEffort(e, level)
+		if err != nil || got != level {
+			t.Fatalf("NormalizeEffort(%q) = %q/%v, want %q/nil", level, got, err, level)
+		}
+	}
+	got, err := NormalizeEffort(e, "auto")
+	if err != nil || got != "" {
+		t.Fatalf("NormalizeEffort(auto) = %q/%v, want empty/nil", got, err)
+	}
+}
+
+func TestResolveModelPreservesProviderEffort(t *testing.T) {
+	c := Default()
+	c.Providers = append(c.Providers, ProviderEntry{
+		Name:      "deepseek",
+		Kind:      "openai",
+		BaseURL:   "https://api.deepseek.com",
+		Model:     "deepseek-v4-flash",
+		Models:    []string{"deepseek-v4-flash", "deepseek-v4-pro"},
+		Default:   "deepseek-v4-flash",
+		APIKeyEnv: "DEEPSEEK_API_KEY",
+		Effort:    "max",
+	})
+	e, ok := c.ResolveModel("deepseek/deepseek-v4-pro")
+	if !ok {
+		t.Fatal("ResolveModel did not find deepseek/deepseek-v4-pro")
+	}
+	if e.Name != "deepseek" || e.Model != "deepseek-v4-pro" || e.Effort != "max" {
+		t.Fatalf("resolved entry = %+v, want provider deepseek model deepseek-v4-pro effort max", e)
 	}
 }
 
@@ -131,6 +269,33 @@ func TestPermissionMutators(t *testing.T) {
 	}
 	if removed, _ := c.RemovePermissionRule("deny", "absent"); removed {
 		t.Error("removing absent rule should report false")
+	}
+}
+
+func TestSkillPathMutators(t *testing.T) {
+	c := Default()
+	root := t.TempDir()
+	if err := c.AddSkillPath(root); err != nil {
+		t.Fatalf("add skill path: %v", err)
+	}
+	if err := c.AddSkillPath(filepath.Join(root, ".")); err != nil {
+		t.Fatalf("duplicate skill path: %v", err)
+	}
+	if len(c.Skills.Paths) != 1 {
+		t.Fatalf("paths = %v, want one deduped entry", c.Skills.Paths)
+	}
+	if err := c.AddSkillPath(" "); err == nil {
+		t.Fatal("empty skill path should error")
+	}
+	removed, err := c.RemoveSkillPath(filepath.Join(root, "."))
+	if err != nil || !removed {
+		t.Fatalf("remove skill path: removed=%v err=%v", removed, err)
+	}
+	if len(c.Skills.Paths) != 0 {
+		t.Fatalf("paths after remove = %v", c.Skills.Paths)
+	}
+	if removed, err := c.RemoveSkillPath(root); err != nil || removed {
+		t.Fatalf("remove absent: removed=%v err=%v", removed, err)
 	}
 }
 
@@ -208,6 +373,16 @@ func TestSaveToRoundTrips(t *testing.T) {
 	if err := c.AddPermissionRule("allow", "bash(go test*)"); err != nil {
 		t.Fatal(err)
 	}
+	if err := c.SetNetwork(NetworkConfig{
+		ProxyMode: "custom",
+		Proxy: NetworkProxyConfig{
+			Type:   "socks5",
+			Server: "127.0.0.1",
+			Port:   7890,
+		},
+	}); err != nil {
+		t.Fatal(err)
+	}
 	autoStart := false
 	if err := c.UpsertPlugin(PluginEntry{Name: "stripe", Type: "http", URL: "https://mcp.stripe.com", AutoStart: &autoStart}); err != nil {
 		t.Fatal(err)
@@ -237,10 +412,20 @@ func TestSaveToRoundTrips(t *testing.T) {
 	if len(got.Permissions.Allow) != 1 || got.Permissions.Allow[0] != "bash(go test*)" {
 		t.Errorf("allow list = %v", got.Permissions.Allow)
 	}
+	if got.Network.ProxyMode != "custom" || got.Network.Proxy.Server != "127.0.0.1" || got.Network.Proxy.Port != 7890 {
+		t.Errorf("network = %+v", got.Network)
+	}
 	if len(got.Plugins) != 1 || got.Plugins[0].Name != "stripe" {
 		t.Errorf("plugins = %+v", got.Plugins)
 	}
 	if got.Plugins[0].AutoStart == nil || *got.Plugins[0].AutoStart {
 		t.Errorf("auto_start should round-trip false, got %+v", got.Plugins[0].AutoStart)
+	}
+}
+
+func TestSetNetworkRejectsIncompleteCustomProxy(t *testing.T) {
+	c := Default()
+	if err := c.SetNetwork(NetworkConfig{ProxyMode: "custom"}); err == nil {
+		t.Fatal("custom proxy without server/port should be rejected")
 	}
 }
