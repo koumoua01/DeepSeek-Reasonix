@@ -91,6 +91,10 @@ type chatTUI struct {
 	// untouched.
 	planMode bool
 
+	// pendingInterject queues input typed while a turn runs; each TurnDone
+	// dequeues the front and submits it as the next turn.
+	pendingInterject []string
+
 	// history is a resumed session's messages, committed to scrollback once on
 	// the first WindowSizeMsg so a reopened chat shows its prior transcript.
 	history []provider.Message
@@ -854,7 +858,16 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case "enter":
 			if m.state == tuiRunning {
-				return m, nil // ignore Enter while a turn is in flight
+				line := strings.TrimSpace(m.input.Value())
+				if line == "" {
+					return m, nil
+				}
+				m.pendingInterject = append(m.pendingInterject, line)
+				m.input.Reset()
+				m.input.SetHeight(1)
+				m.pastedBlocks = nil
+				m.notice("feedback queued — will send when the current turn finishes")
+				return m, finalize(m, cmds)
 			}
 			if m.modelSwitchPending {
 				return m, nil // ignore Enter while /model switch is building
@@ -950,6 +963,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if c := m.runStatusline(); c != nil {
 				cmds = append(cmds, c)
 			}
+			if len(m.pendingInterject) > 0 {
+				interject := m.pendingInterject[0]
+				m.pendingInterject = m.pendingInterject[1:]
+				cmds = append(cmds, m.startTurn(interject, interject, interject))
+			}
 		}
 		if turnDone || gitMaybeChanged {
 			if c := m.refreshGitStatus(); c != nil {
@@ -996,6 +1014,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.notice(fmt.Sprintf(i18n.M.ModelSwitchedFmt, m.label))
 			cmds = append(cmds, fetchBalance(m.ctrl))
+			if c := m.runStatusline(); c != nil {
+				cmds = append(cmds, c)
+			}
 			// Do NOT re-issue waitForAgentEvent here — the goroutine from the
 			// last agentEventMsg handler is still blocked on the same channel.
 			// Starting a second one creates a race: two goroutines compete on
@@ -1651,6 +1672,13 @@ func (m chatTUI) View() tea.View {
 			if m.turnTokens > 0 {
 				working += " · ↓" + shortTokens(m.turnTokens)
 			}
+			if n := len(m.pendingInterject); n > 0 {
+				if n == 1 {
+					working += dim(" · ✎ feedback queued")
+				} else {
+					working += dim(fmt.Sprintf(" · ✎ %d queued", n))
+				}
+			}
 		}
 	}
 	// Second status row: the live data (model, git, effort, context gauge, cache
@@ -1880,13 +1908,13 @@ func (m chatTUI) effortTag() string {
 	return dim(body)
 }
 
-// shortTokens prints token counts compactly: 142_000 → "142K", 1_000_000 → "1M".
+// shortTokens prints token counts compactly: 1_500 → "1.5K", 142_000 → "142.0K", 1_000_000 → "1.0M".
 func shortTokens(n int) string {
 	switch {
-	case n >= 1_000_000:
+	case n >= 999_950:
 		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
 	case n >= 1_000:
-		return fmt.Sprintf("%dK", n/1_000)
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	default:
 		return fmt.Sprintf("%d", n)
 	}
@@ -1997,11 +2025,7 @@ func truncateSubject(s string, width int) string {
 	if max < 16 {
 		max = 16
 	}
-	r := []rune(s)
-	if len(r) > max {
-		return string(r[:max]) + "…"
-	}
-	return s
+	return ansi.Truncate(s, max, "…")
 }
 
 // clampStatusLine truncates a status line to `width` visible columns, ANSI-aware,
@@ -2500,7 +2524,7 @@ func (m *chatTUI) ingestEvent(e event.Event) {
 		if e.Usage != nil {
 			m.turnTokens += e.Usage.CompletionTokens
 		}
-		if line := agent.FormatUsageLine(e.Usage, e.Pricing); line != "" {
+		if line := agent.FormatUsageLine(e.Usage, e.Pricing, e.CacheDiagnostics); line != "" {
 			m.finalizeStreamed()
 			m.commitLine(line)
 		}

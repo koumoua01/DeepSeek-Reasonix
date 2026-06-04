@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -303,6 +304,7 @@ func TestIngestEventRoutesByKind(t *testing.T) {
 		{"dispatch", event.Event{Kind: event.ToolDispatch, Tool: event.Tool{Name: "read_file", Args: `{"path":"x"}`}}, "● Read(x)"},
 		{"blocked", event.Event{Kind: event.ToolResult, Tool: event.Tool{Name: "bash", Err: "blocked by permission policy"}}, "● Bash ⊘ blocked by permission policy"},
 		{"usage", event.Event{Kind: event.Usage, Usage: &provider.Usage{PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200, CacheHitTokens: 900, CacheMissTokens: 100}}, "  · 1200 tok"},
+		{"usage-diagnostics", event.Event{Kind: event.Usage, Usage: &provider.Usage{PromptTokens: 1000, CompletionTokens: 200, TotalTokens: 1200}, CacheDiagnostics: &event.CacheDiagnostics{PrefixChanged: true, PrefixChangeReasons: []string{"tools"}}}, "cache prefix changed: tools"},
 		{"notice-info", event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "compacted 8 messages → summary"}, "  · compacted 8 messages → summary"},
 		{"notice-warn", event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "response truncated: hit max output tokens"}, "  ! response truncated: hit max output tokens"},
 		{"phase", event.Event{Kind: event.Phase, Text: "planner · planning"}, "[planner · planning]"},
@@ -892,5 +894,57 @@ func TestAgentEventCoalescesBurst(t *testing.T) {
 	}
 	if len(m.eventCh) != 0 {
 		t.Errorf("channel should be fully drained, %d left", len(m.eventCh))
+	}
+}
+
+func TestShortTokens(t *testing.T) {
+	cases := []struct {
+		n    int
+		want string
+	}{
+		{0, "0"},
+		{999, "999"},
+		{1000, "1.0K"},
+		{1500, "1.5K"},
+		{1999, "2.0K"},
+		{9999, "10.0K"},
+		{142000, "142.0K"},
+		{999999, "1.0M"},
+		{1000000, "1.0M"},
+		{1500000, "1.5M"},
+	}
+	for _, tc := range cases {
+		t.Run(fmt.Sprintf("n=%d", tc.n), func(t *testing.T) {
+			got := shortTokens(tc.n)
+			if got != tc.want {
+				t.Errorf("shortTokens(%d) = %q, want %q", tc.n, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTruncateSubject(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		width int
+	}{
+		{"short ASCII", "rm file", 60},
+		{"long ASCII", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 60},
+		{"CJK at 60", "日本語の文章は通常、表示幅が広いため、端末の横幅を超えてしまうことがあります。", 60},
+		{"CJK at 30", "日本語の文章は通常、表示幅が広いため、端末の横幅を超えてしまうことがあります。", 30},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := truncateSubject(tc.input, tc.width)
+			wantMax := tc.width - 28
+			if wantMax < 16 {
+				wantMax = 16
+			}
+			w := ansi.StringWidth(got)
+			if w > wantMax {
+				t.Errorf("truncateSubject(%q, %d) = %q (width %d), want visible width <= %d", tc.input, tc.width, got, w, wantMax)
+			}
+		})
 	}
 }
