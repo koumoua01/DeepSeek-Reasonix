@@ -11,6 +11,7 @@ import type {
   CheckpointMeta,
   CommandInfo,
   ContextInfo,
+  ContextPanelInfo,
   DirEntry,
   DroppedItem,
   EffortInfo,
@@ -22,6 +23,7 @@ import type {
   Meta,
   ModelInfo,
   NetworkView,
+  ProjectNode,
   ProviderView,
   QuestionAnswer,
   ServerView,
@@ -30,6 +32,8 @@ import type {
   SkillRootView,
   SkillView,
   SlashArgsResult,
+  TabMeta,
+  TopicMeta,
   UpdateInfo,
   UpdateProgress,
   WireEvent,
@@ -43,7 +47,7 @@ export interface AppBindings {
   Submit(input: string): Promise<void>;
   SubmitDisplay(display: string, input: string): Promise<void>;
   Cancel(): Promise<void>;
-  Approve(id: string, allow: boolean, session: boolean): Promise<void>;
+  Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
   // SetMode applies plan/yolo/normal gating atomically (one IPC, no half-applied
@@ -88,16 +92,19 @@ export interface AppBindings {
   UpdateMCPServer(name: string, input: MCPServerInput): Promise<void>;
   RemoveMCPServer(name: string): Promise<void>;
   RetryMCPServer(name: string): Promise<void>;
+  ClearMCPServerAuthentication(name: string): Promise<void>;
   PickSkillFolder(): Promise<string>;
   AddSkillPath(path: string): Promise<void>;
   RemoveSkillPath(path: string): Promise<void>;
   RefreshSkills(): Promise<void>;
+  SetSkillEnabled(name: string, enabled: boolean): Promise<void>;
   // SetMCPServerEnabled is the per-session connector toggle (on reconnects, off
   // disconnects; config untouched).
   SetMCPServerEnabled(name: string, enabled: boolean): Promise<void>;
   SetMCPServerTier(name: string, tier: string): Promise<void>;
   SlashArgs(input: string): Promise<SlashArgsResult>;
   ListDir(rel: string): Promise<DirEntry[]>;
+  SearchFileRefs(query: string): Promise<DirEntry[]>;
   ReadFile(rel: string): Promise<FilePreview>;
   WorkspaceChanges(): Promise<WorkspaceChangesView>;
   OpenWorkspacePath(rel: string): Promise<void>;
@@ -147,6 +154,19 @@ export interface AppBindings {
   // unset; ConnectKey validates, persists to ./.env, and rebuilds the controller.
   NeedsOnboarding(): Promise<boolean>;
   ConnectKey(apiKey: string): Promise<void>;
+  // Tab management (desktop/tabs.go).
+  ListTabs(): Promise<TabMeta[]>;
+  OpenProjectTab(workspaceRoot: string, topicID: string): Promise<TabMeta>;
+  OpenGlobalTab(topicID: string): Promise<TabMeta>;
+  SetActiveTab(tabID: string): Promise<void>;
+  CloseTab(tabID: string): Promise<void>;
+  // Project tree (desktop/tabs.go).
+  ListProjectTree(): Promise<ProjectNode[]>;
+  CreateTopic(scope: string, workspaceRoot: string, title: string): Promise<TopicMeta>;
+  RenameTopic(topicID: string, title: string): Promise<void>;
+  DeleteTopic(topicID: string): Promise<void>;
+  // Context panel (desktop/tabs.go).
+  ContextPanel(tabID: string): Promise<ContextPanelInfo>;
 }
 
 interface WailsRuntime {
@@ -288,14 +308,14 @@ function makeMockApp(): AppBindings {
     {
       name: "codegraph",
       transport: "stdio",
-      status: "connected",
+      status: "disabled",
       builtIn: true,
       configured: true,
-      autoStart: true,
-      tier: "background",
-      tools: 4,
+      autoStart: false,
+      tier: "lazy",
+      tools: 0,
       prompts: 0,
-      resources: 1,
+      resources: 0,
       toolList: [
         { name: "search", description: "Search symbols, files, and text in the workspace." },
         { name: "context", description: "Fetch surrounding source context for a symbol or file." },
@@ -312,6 +332,8 @@ function makeMockApp(): AppBindings {
       autoStart: true,
       tier: "lazy",
       url: "https://mcp.linear.app/mcp",
+      authStatus: "possible",
+      authUrl: "https://mcp.linear.app/mcp",
       tools: 8,
       prompts: 0,
       resources: 0,
@@ -326,17 +348,36 @@ function makeMockApp(): AppBindings {
         { name: "search", description: "Search Linear workspace objects." },
       ],
     },
-    { name: "figma", transport: "http", status: "failed", configured: true, autoStart: true, tier: "lazy", url: "https://mcp.figma.com/mcp", tools: 0, prompts: 0, resources: 0, error: "connect: 401 unauthorized" },
+    { name: "figma", transport: "http", status: "failed", configured: true, autoStart: true, tier: "lazy", url: "https://mcp.figma.com/mcp", authStatus: "required", authUrl: "https://mcp.figma.com/mcp", tools: 0, prompts: 0, resources: 0, error: "connect: 401 unauthorized" },
   ];
   const capSkills: SkillView[] = [
-    { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent" },
-    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline" },
-    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline" },
+    { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "builtin", runAs: "subagent", enabled: true },
+    { name: "review", description: "Review the staged diff", scope: "project", runAs: "inline", enabled: false },
+    { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline", enabled: true },
   ];
   let capSkillRoots: SkillRootView[] = [
     { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, skills: 0 },
-    { dir: "~/my-skills", scope: "custom", priority: 5, status: "ok", configured: true, skills: 1 },
-    { dir: "~/.reasonix/skills", scope: "global", priority: 6, status: "ok", configured: false, skills: 2 },
+    {
+      dir: "~/my-skills",
+      scope: "custom",
+      priority: 5,
+      status: "ok",
+      configured: true,
+      skills: 1,
+      skillItems: [{ name: "review", description: "Review the staged diff", scope: "custom", runAs: "inline" }],
+    },
+    {
+      dir: "~/.reasonix/skills",
+      scope: "global",
+      priority: 6,
+      status: "ok",
+      configured: false,
+      skills: 2,
+      skillItems: [
+        { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "global", runAs: "subagent" },
+        { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "global", runAs: "inline" },
+      ],
+    },
   ];
   const mockSwitchWorkspace = async (path: string) => {
     cwd = path || "~";
@@ -493,12 +534,13 @@ function makeMockApp(): AppBindings {
       cancelled = true;
       emit({ kind: "turn_done" });
     },
-    async Approve(_id, allow, session) {
+    async Approve(_id, allow, session, persist) {
       if (!pendingApprovalPreview) return;
       pendingApprovalPreview = false;
+      const suffix = persist ? "persisted" : session ? "allowed for session" : "allowed once";
       emit({
         kind: "message",
-        text: `approval preview answered: ${allow ? (session ? "allowed for session" : "allowed once") : "denied"}`,
+        text: `approval preview answered: ${allow ? suffix : "denied"}`,
       });
       emit({ kind: "turn_done" });
     },
@@ -649,6 +691,8 @@ function makeMockApp(): AppBindings {
           envKeys: input.env ? Object.keys(input.env).sort() : s.envKeys,
           tools: nextTools,
           error: undefined,
+          authStatus: nextStatus !== "connected" && input.transport !== "stdio" ? "possible" : undefined,
+          authUrl: nextStatus !== "connected" && input.transport !== "stdio" ? input.url : undefined,
         };
       });
     },
@@ -657,7 +701,22 @@ function makeMockApp(): AppBindings {
     },
     async RetryMCPServer(name: string) {
       capServers = capServers.map((s) =>
-        s.name === name ? { ...s, status: "connected", tools: s.tools || 4, error: undefined } : s,
+        s.name === name ? { ...s, status: "connected", tools: s.tools || 4, error: undefined, authStatus: undefined, authUrl: undefined } : s,
+      );
+    },
+    async ClearMCPServerAuthentication(name: string) {
+      capServers = capServers.map((s) =>
+        s.name === name
+          ? {
+              ...s,
+              status: s.tier === "background" || s.tier === "eager" ? "initializing" : "deferred",
+              tools: 0,
+              error: undefined,
+              authStatus: s.transport !== "stdio" ? "possible" : undefined,
+              authUrl: s.transport !== "stdio" ? s.url : undefined,
+              authConfigured: undefined,
+            }
+          : s,
       );
     },
     async PickSkillFolder() {
@@ -666,10 +725,18 @@ function makeMockApp(): AppBindings {
     async AddSkillPath(path: string) {
       const dir = path.trim() || "~/my-skills";
       if (!capSkillRoots.some((r) => r.scope === "custom" && r.dir === dir)) {
-        capSkillRoots.push({ dir, scope: "custom", priority: capSkillRoots.length + 1, status: "ok", configured: true, skills: 1 });
+        capSkillRoots.push({
+          dir,
+          scope: "custom",
+          priority: capSkillRoots.length + 1,
+          status: "ok",
+          configured: true,
+          skills: 1,
+          skillItems: [{ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" }],
+        });
       }
       if (!capSkills.some((s) => s.name === "local-dev")) {
-        capSkills.push({ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" });
+        capSkills.push({ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline", enabled: true });
       }
     },
     async RemoveSkillPath(path: string) {
@@ -680,19 +747,31 @@ function makeMockApp(): AppBindings {
       }
     },
     async RefreshSkills() {},
+    async SetSkillEnabled(name: string, enabled: boolean) {
+      const skill = capSkills.find((s) => s.name === name);
+      if (skill) skill.enabled = enabled;
+    },
     async SetMCPServerEnabled(name: string, enabled: boolean) {
       capServers = capServers.map((s) =>
         s.name === name
-          ? { ...s, status: enabled ? "connected" : "disabled", tools: enabled ? s.tools || 4 : 0, error: undefined }
+          ? {
+              ...s,
+              status: enabled ? "connected" : "disabled",
+              autoStart: s.builtIn ? enabled : s.autoStart,
+              tools: enabled ? s.tools || 4 : 0,
+              error: undefined,
+              authStatus: !enabled && s.transport !== "stdio" ? "possible" : undefined,
+              authUrl: !enabled && s.transport !== "stdio" ? s.url : undefined,
+            }
           : s,
       );
     },
     async SetMCPServerTier(name: string, tier: string) {
       capServers = capServers.map((s) => {
         if (s.name !== name) return s;
-        if (tier === "lazy") return { ...s, tier };
+        if (tier === "lazy") return { ...s, tier, autoStart: true };
         const tools = s.tools || (s.transport === "stdio" ? 3 : 5);
-        return { ...s, tier, status: "connected", tools, error: undefined };
+        return { ...s, tier, autoStart: true, status: "connected", tools, error: undefined, authStatus: undefined, authUrl: undefined };
       });
     },
     async SlashArgs(input: string) {
@@ -704,6 +783,8 @@ function makeMockApp(): AppBindings {
         "/skill": [
           { label: "list", insert: "list", hint: "list skills" },
           { label: "show", insert: "show ", hint: "show a skill's body", descend: true },
+          { label: "enable", insert: "enable ", hint: "enable a disabled skill", descend: true },
+          { label: "disable", insert: "disable ", hint: "disable an enabled skill", descend: true },
           { label: "new", insert: "new ", hint: "scaffold a new skill" },
           { label: "paths", insert: "paths", hint: "show discovery paths" },
         ],
@@ -744,6 +825,12 @@ function makeMockApp(): AppBindings {
         ];
       }
       return [{ name: "file.go", isDir: false }];
+    },
+    async SearchFileRefs(query: string) {
+      const q = query.toLowerCase();
+      return ["desktop/frontend/src/lib/bridge.ts", "frontend/wailsjs/runtime/runtime.js", "internal/control/refs.go"]
+        .filter((path) => path.split("/").pop()?.toLowerCase().includes(q))
+        .map((name) => ({ name, isDir: false }));
     },
     async ReadFile(rel: string) {
       const samples: Record<string, string> = {
@@ -941,6 +1028,124 @@ function makeMockApp(): AppBindings {
         if (p.apiKeyEnv === "DEEPSEEK_API_KEY") p.keySet = true;
       });
       await delay(300);
+    },
+    // Tab management mocks.
+    async ListTabs() {
+      return [
+        {
+          id: "tab_mock_1",
+          scope: "global",
+          workspaceRoot: "",
+          workspaceName: "Global",
+          topicId: "",
+          topicTitle: "Global",
+          label: "deepseek-v4-flash",
+          ready: true,
+          running: false,
+          active: true,
+          cwd: "~/projects/reasonix",
+        },
+        {
+          id: "tab_mock_2",
+          scope: "project",
+          workspaceRoot: "~/projects/blade",
+          workspaceName: "blade",
+          topicId: "topic_mock_1",
+          topicTitle: "Fix login bug",
+          label: "deepseek-v4-pro",
+          ready: true,
+          running: false,
+          active: false,
+          cwd: "~/projects/blade",
+        },
+      ];
+    },
+    async OpenProjectTab(workspaceRoot: string, _topicID: string) {
+      return {
+        id: "tab_" + Date.now(),
+        scope: "project",
+        workspaceRoot,
+        workspaceName: workspaceRoot.split("/").filter(Boolean).pop() ?? workspaceRoot,
+        topicId: _topicID,
+        topicTitle: "New topic",
+        label: "deepseek-v4-flash",
+        ready: true,
+        running: false,
+        active: true,
+        cwd: workspaceRoot,
+      };
+    },
+    async OpenGlobalTab(_topicID: string) {
+      return {
+        id: "tab_" + Date.now(),
+        scope: "global",
+        workspaceRoot: "",
+        workspaceName: "Global",
+        topicId: _topicID,
+        topicTitle: "Global",
+        label: "deepseek-v4-flash",
+        ready: true,
+        running: false,
+        active: true,
+        cwd: "",
+      };
+    },
+    async SetActiveTab(_tabID: string) {},
+    async CloseTab(_tabID: string) {},
+    async ListProjectTree() {
+      return [
+        {
+          key: "global_folder",
+          kind: "global_folder" as const,
+          label: "Global",
+          children: [
+            { key: "global_topic_1", kind: "global_topic" as const, label: "● General", topicId: "topic_global_1" },
+          ],
+        },
+        {
+          key: "project_~/projects/reasonix",
+          kind: "project" as const,
+          label: "reasonix",
+          root: "~/projects/reasonix",
+          children: [
+            { key: "topic_t1", kind: "topic" as const, label: "● Fix auth flow", root: "~/projects/reasonix", topicId: "topic_t1" },
+            { key: "topic_t2", kind: "topic" as const, label: "Refactor config", root: "~/projects/reasonix", topicId: "topic_t2" },
+          ],
+        },
+        {
+          key: "project_~/projects/blade",
+          kind: "project" as const,
+          label: "blade",
+          root: "~/projects/blade",
+          children: [
+            { key: "topic_t3", kind: "topic" as const, label: "● Fix login bug", root: "~/projects/blade", topicId: "topic_t3" },
+          ],
+        },
+      ];
+    },
+    async CreateTopic(_scope: string, _workspaceRoot: string, title: string) {
+      return { id: "topic_" + Date.now(), title, createdAt: Date.now() };
+    },
+    async RenameTopic(_topicID: string, _title: string) {},
+    async DeleteTopic(_topicID: string) {},
+    async ContextPanel(_tabID: string) {
+      return {
+        usedTokens: 1280,
+        windowTokens: 1000000,
+        promptTokens: 1200,
+        completionTokens: 80,
+        reasoningTokens: 0,
+        cacheHitTokens: 1024,
+        cacheMissTokens: 256,
+        sessionCostUsd: 0.05,
+        readFiles: [
+          { path: "src/app.ts", turn: 1, time: Date.now() - 60000 },
+          { path: "src/lib/bridge.ts", turn: 1, time: Date.now() - 55000, offset: 100, limit: 50 },
+        ],
+        changedFiles: [
+          { path: "src/lib/bridge.ts", sources: ["session"], turns: [1], latestPrompt: "add tab management", latestTime: Date.now() - 60000 },
+        ],
+      };
     },
   };
 }
