@@ -55,3 +55,7 @@ Thumbs.db
 .idea/
 .vscode/
 build-windows.txt
+
+# Scratch / agent working dirs (never committed)
+/tmp/
+/.codex/
