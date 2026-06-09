@@ -479,6 +479,13 @@ func configureChatTextarea(ti *textarea.Model) {
 	ti.Focus()
 }
 
+func isTermuxTerminal() bool {
+	if os.Getenv("TERMUX_VERSION") != "" || os.Getenv("TERMUX_APP_PID") != "" || os.Getenv("TERMUX__PREFIX") != "" {
+		return true
+	}
+	return strings.Contains(os.Getenv("PREFIX"), "/com.termux/")
+}
+
 func (m *chatTUI) rememberSubmittedInput(input string) {
 	if strings.TrimSpace(input) == "" {
 		return
@@ -862,15 +869,12 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.completion = completion{}
 					break // fall through to regular Enter and submit the command
 				}
-				// When Enter is pressed and the completion has exactly one item
-				// already fully present in the input, close the menu and let Enter
-				// fall through to submit the command (/resume 3 → resume session 3).
-				if msg.String() == "enter" && len(m.completion.items) == 1 {
-					tok := m.input.Value()[m.completion.replaceFrom:]
-					if tok == m.completion.items[0].insert {
-						m.completion = completion{}
-						break // fall through to regular Enter
-					}
+				// When Enter is pressed and the selected completion is already fully
+				// present in the input, close the menu and submit instead of accepting
+				// the same item again (/resume 1 still has /resume 10 as a prefix match).
+				if msg.String() == "enter" && m.completionSelectedInsertPresent() {
+					m.completion = completion{}
+					break // fall through to regular Enter
 				}
 				m.acceptCompletion()
 				return m, nil
@@ -2063,7 +2067,9 @@ func (m chatTUI) View() tea.View {
 	}
 	v := tea.NewView(mainArea + "\n" + strings.Join(parts, "\n"))
 	v.AltScreen = true
-	v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
+	if !isTermuxTerminal() {
+		v.MouseMode = tea.MouseModeCellMotion // wheel scrolls the transcript
+	}
 	// Anchor the real terminal cursor at the textarea's insertion point only when
 	// the composer is visible. input.Cursor() is relative to the textarea; offset
 	// by the viewport height + rows above + the box's top border row (+1 column
@@ -2963,7 +2969,7 @@ func (m *chatTUI) runSlashCommand(input string) tea.Cmd {
 		// guidance steering what the summary keeps.
 		focus := strings.TrimSpace(strings.TrimPrefix(input, cmd))
 		return func() tea.Msg { return compactDoneMsg{err: m.ctrl.Compact(context.Background(), focus)} }
-	case "/new":
+	case "/new", "/clear":
 		m.echoLocalCommand(input)
 		if err := m.ctrl.NewSession(); err != nil {
 			m.notice(fmt.Sprintf("%s: %v", i18n.M.SlashNewFailed, err))

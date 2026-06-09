@@ -62,6 +62,7 @@ func (m *chatTUI) slashItems() []compItem {
 	items := []compItem{
 		{label: "/compact", insert: "/compact ", hint: i18n.M.CmdCompact},
 		{label: "/new", insert: "/new ", hint: i18n.M.CmdNew},
+		{label: "/clear", insert: "/clear", hint: i18n.M.CmdNew},
 		{label: "/resume", insert: "/resume ", hint: i18n.M.CmdResume},
 		{label: "/rewind", insert: "/rewind", hint: i18n.M.CmdRewind},
 		{label: "/tree", insert: "/tree", hint: i18n.M.CmdTree},
@@ -472,6 +473,17 @@ func (m *chatTUI) completionBareOverlayCommand() bool {
 	default:
 		return false
 	}
+}
+
+func (m *chatTUI) completionSelectedInsertPresent() bool {
+	if !m.completion.active || m.completion.sel >= len(m.completion.items) {
+		return false
+	}
+	val := m.input.Value()
+	if m.completion.replaceFrom > len(val) {
+		return false
+	}
+	return val[m.completion.replaceFrom:] == m.completion.items[m.completion.sel].insert
 }
 
 // acceptCompletion applies the selected item to the input, then recomputes the

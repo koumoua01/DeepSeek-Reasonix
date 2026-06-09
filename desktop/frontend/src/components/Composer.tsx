@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
 import { AlertTriangle, ArrowUp, Check, ChevronDown, Eye, FileText, Folder, FolderGit2, FolderPlus, List, MessageSquare, Search, Square, Trash2, X, Zap } from "lucide-react";
 import { asArray } from "../lib/array";
+import { DedupIndex, sha256 } from "../lib/attachDedup";
 import { app, onFilesDropped } from "../lib/bridge";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
@@ -14,7 +15,7 @@ import {
 } from "../lib/workspaceDrag";
 import { SlashMenu } from "./SlashMenu";
 import { ArgMenu } from "./ArgMenu";
-import { FileMenu } from "./FileMenu";
+import { VirtualMenu } from "./VirtualMenu";
 import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
@@ -23,6 +24,11 @@ import { AnchoredPopover } from "./AnchoredPopover";
 interface Attachment {
   path: string;
   previewUrl?: string;
+}
+
+interface AttachmentDedupKey {
+  hash: string;
+  source: string;
 }
 
 interface WorkspaceReference {
@@ -327,7 +333,6 @@ export function Composer({
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
-  const pastChatsItemRef = useRef<HTMLButtonElement>(null);
   const composerCardRef = useRef<HTMLDivElement>(null);
   const workspaceAnchorRef = useRef<HTMLDivElement>(null);
   const wasRunning = useRef(running);
@@ -336,6 +341,8 @@ export function Composer({
   const lastSelectionRef = useRef({ start: 0, end: 0 });
   const consumedInsertIdRef = useRef(0);
   const submittingRef = useRef(false);
+  const attachmentDedupRef = useRef(new DedupIndex());
+  const attachmentDedupKeysRef = useRef<Record<string, AttachmentDedupKey>>({});
 
   useEffect(() => {
     if (wasRunning.current && !running && text.trim() === "") {
@@ -357,7 +364,7 @@ export function Composer({
     return text.slice(1).toLowerCase();
   }, [text]);
   const slashMatches = useMemo(
-    () => (slashQuery === null ? [] : commands.filter((c) => c.name.toLowerCase().includes(slashQuery)).slice(0, 8)),
+    () => (slashQuery === null ? [] : commands.filter((c) => c.name.toLowerCase().includes(slashQuery))),
     [slashQuery, commands],
   );
 
@@ -478,7 +485,7 @@ export function Composer({
         const basename = e.name.split("/").pop()?.toLowerCase() ?? "";
         return basename.includes(atFrag) && !seen.has(e.name);
       });
-      return [...local, ...searched].slice(0, 10);
+      return [...local, ...searched];
     },
     [atRaw, atFrag, entries, searchEntries],
   );
@@ -605,6 +612,36 @@ export function Composer({
     return expanded;
   };
 
+  const rememberAttachment = (path: string, key: AttachmentDedupKey) => {
+    attachmentDedupRef.current.add(key.hash, key.source);
+    attachmentDedupKeysRef.current[path] = key;
+  };
+
+  const forgetAttachment = (path: string) => {
+    const key = attachmentDedupKeysRef.current[path];
+    if (key) {
+      attachmentDedupRef.current.forget(key.hash, key.source);
+      delete attachmentDedupKeysRef.current[path];
+    }
+  };
+
+  const clearAttachments = () => {
+    setAttachments([]);
+    attachmentDedupRef.current.clear();
+    attachmentDedupKeysRef.current = {};
+  };
+
+  const removeAttachment = (path: string) => {
+    forgetAttachment(path);
+    setAttachments((prev) => prev.filter((x) => x.path !== path));
+    requestAnimationFrame(() => taRef.current?.focus());
+  };
+
+  const fileDedupKey = async (file: File): Promise<AttachmentDedupKey> => ({
+    hash: await sha256(file),
+    source: `file:${file.name}:${file.size}:${file.lastModified}`,
+  });
+
   const submit = async () => {
     if (disabled || submittingRef.current) return;
     const t = text.trim();
@@ -626,7 +663,7 @@ export function Composer({
     const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
     onSend(displayText, submitText);
     setText("");
-    setAttachments([]);
+    clearAttachments();
     setWorkspaceRefs([]);
     setSessionRefs([]);
     } finally {
@@ -649,9 +686,12 @@ export function Composer({
     for (const file of images) {
       setPendingPaste((n) => n + 1);
       try {
+        const key = await fileDedupKey(file);
+        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
         const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedImage(dataUrl);
         const previewUrl = await app.AttachmentDataURL(path);
+        rememberAttachment(path, key);
         setAttachments((prev) => [...prev, { path, previewUrl }]);
       } catch {
         // non-fatal: a failed image attach must not block normal text input
@@ -669,8 +709,11 @@ export function Composer({
     for (const file of others) {
       setPendingPaste((n) => n + 1);
       try {
+        const key = await fileDedupKey(file);
+        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
         const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedFile(file.name, dataUrl);
+        rememberAttachment(path, key);
         setAttachments((prev) => [...prev, { path }]);
       } catch {
         // non-fatal: a failed attach must not block normal text input
@@ -693,10 +736,13 @@ export function Composer({
     for (const path of paths) {
       setPendingPaste((n) => n + 1);
       try {
+        const key = { hash: "", source: `path:${path}` };
+        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
         const item = await app.AttachDropped(path);
         if (item.kind === "workspace") {
           addWorkspaceReference({ path: item.path, isDir: item.isDir });
         } else {
+          rememberAttachment(item.path, key);
           setAttachments((prev) => [...prev, { path: item.path, previewUrl: item.previewUrl }]);
         }
       } catch {
@@ -1059,11 +1105,6 @@ export function Composer({
     setActive((prev) => (prev > maxIdx ? 0 : prev));
   }, [count]);
 
-  useEffect(() => {
-    if (menuMode === "at" && !showPastChats && includePastChatsItem && active === 0) {
-      pastChatsItemRef.current?.scrollIntoView({ block: "nearest" });
-    }
-  }, [active, includePastChatsItem, menuMode, showPastChats]);
 
   const removeAtToken = (value: string) => {
     return value.replace(/(?:^|\s)@[^\s]*$/, "").trimEnd();
@@ -1418,28 +1459,47 @@ export function Composer({
             </button>
           </div>
         ) : (
-          <div className="slashmenu" role="listbox">
-            {includePastChatsItem && (
-              <button
-                ref={pastChatsItemRef}
-                className={`slashmenu__item${active === 0 ? " slashmenu__item--active" : ""}`}
-                onMouseDown={(ev) => {
-                  ev.preventDefault();
-                  void openPastChats();
-                }}
-                onMouseMove={() => setActive(0)}
-              >
-                <MessageSquare size={13} className="filemenu__icon" />
-                <span className="slashmenu__name">{PAST_CHATS_MENU_ITEM}</span>
-              </button>
-            )}
-            <FileMenu
-              items={atMatches}
-              activeIndex={active - (includePastChatsItem ? 1 : 0)}
-              onPick={pickEntry}
-              onHover={(i) => setActive(i + (includePastChatsItem ? 1 : 0))}
-            />
-          </div>
+          <VirtualMenu
+            items={atMenuItems}
+            activeIndex={active}
+            itemKey={(it) => (it.kind === "pastChats" ? "past:chats" : (it.entry.isDir ? "d:" : "f:") + it.entry.name)}
+            renderItem={(it, i) =>
+              it.kind === "pastChats" ? (
+                <button
+                  className={`slashmenu__item${i === active ? " slashmenu__item--active" : ""}`}
+                  onMouseDown={(ev) => {
+                    ev.preventDefault();
+                    void openPastChats();
+                  }}
+                  onMouseMove={() => setActive(i)}
+                >
+                  <MessageSquare size={13} className="filemenu__icon" />
+                  <span className="slashmenu__name">{PAST_CHATS_MENU_ITEM}</span>
+                </button>
+              ) : (
+                <button
+                  role="option"
+                  aria-selected={i === active}
+                  className={`slashmenu__item ${i === active ? "slashmenu__item--active" : ""}`}
+                  onMouseDown={(ev) => {
+                    ev.preventDefault();
+                    pickEntry(it.entry);
+                  }}
+                  onMouseMove={() => setActive(i)}
+                >
+                  {it.entry.isDir ? (
+                    <Folder size={13} className="filemenu__icon filemenu__icon--dir" />
+                  ) : (
+                    <FileText size={13} className="filemenu__icon" />
+                  )}
+                  <span className="slashmenu__name slashmenu__name--file">
+                    {it.entry.name}
+                    {it.entry.isDir ? "/" : ""}
+                  </span>
+                </button>
+              )
+            }
+          />
         )
       )}
       <div className="composer-toolbar">
@@ -1480,14 +1540,14 @@ export function Composer({
             >
               <Tooltip label={a.path}>
                 <span className="composer-context__label">
-                  {a.previewUrl ? <img src={a.previewUrl} alt="" /> : <FileText size={15} />}
+                  {a.previewUrl ? <img src={a.previewUrl} alt="" draggable={false} /> : <FileText size={15} />}
                   <span>{a.path.split("/").pop()}</span>
                 </span>
               </Tooltip>
               <Tooltip label={t("composer.removeImage")}>
                 <button
                   type="button"
-                  onClick={() => setAttachments((prev) => prev.filter((x) => x.path !== a.path))}
+                  onClick={() => removeAttachment(a.path)}
                 >
                   <X size={14} />
                 </button>
