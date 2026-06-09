@@ -44,6 +44,9 @@ func Run(args []string, version string) int {
 	if len(args) > 0 {
 		cmd = args[0]
 	}
+	if cmd == "--acp" {
+		cmd = "acp"
+	}
 	if shouldMigrateLegacyConfigForCLI(cmd) {
 		migrateLegacyConfigForCLI()
 	}
@@ -90,6 +93,9 @@ func Run(args []string, version string) int {
 	case "doctor":
 		configureCLIThemeFromConfigNoProbe()
 		return doctorCommand(rest, version)
+	case "review":
+		configureCLIThemeFromConfigNoProbe()
+		return reviewCommand(rest)
 	case "version", "--version", "-v":
 		fmt.Println("reasonix", version)
 		return 0
@@ -199,6 +205,9 @@ func runAgent(args []string) int {
 	showThinking := fs.Bool("show-thinking", false, "show thinking text instead of the collapsed thinking marker")
 	metricsPath := fs.String("metrics", "", "write a JSON token/cache/cost summary of the run to this path")
 	dir := fs.String("dir", "", "change to this directory first (project root); config, sandbox and file tools resolve from here")
+	cont := fs.Bool("continue", false, "resume the most recent saved session")
+	fs.BoolVar(cont, "c", false, "shorthand for --continue")
+	resume := fs.String("resume", "", "resume a specific session file (non-interactive; takes precedence over --continue)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -246,6 +255,38 @@ func runAgent(args []string) int {
 		return 1
 	}
 	defer ctrl.Close()
+
+	// --resume: load a specific session file (non-interactive, meant for
+	// MCP/API callers that manage their own per-project session). Takes
+	// precedence over --continue.
+	// --continue: resume the most recent saved session.
+	if *resume != "" {
+		loaded, err := agent.LoadSession(*resume)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		ctrl.Resume(loaded, *resume)
+	} else if *cont {
+		sessions, err := agent.ListSessions(config.SessionDir())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		if len(sessions) == 0 {
+			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
+			return 1
+		}
+		loaded, err := agent.LoadSession(sessions[0].Path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		ctrl.Resume(loaded, sessions[0].Path)
+	}
+	if ctrl.SessionPath() == "" && ctrl.SessionDir() != "" {
+		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+	}
 
 	runErr := ctrl.Run(ctx, prompt)
 	if cfg != nil {
@@ -429,6 +470,7 @@ func chatREPL(args []string) int {
 	if cfg, err := config.Load(); err == nil {
 		m.outputStyle = cfg.Agent.OutputStyle    // shown as the active entry in /output-style
 		m.statuslineCmd = cfg.Statusline.Command // custom status-line command, "" = built-in row
+		m.cfg = cfg
 	}
 
 	// /model support: a pure builder the TUI calls to rebuild on a different
@@ -465,9 +507,13 @@ func chatREPL(args []string) int {
 	}
 	m.refreshEffortStatus()
 
-	// No alt-screen: finalized transcript lines are committed to the terminal's
-	// normal buffer (via tea.Println) so native scrollback, the wheel, and copy
-	// all work — the bubbletea-managed region is just the bottom input/status.
+	if m.nativeScrollback {
+		reserveNativeScrollbackFrame(os.Stdout, m.bottomRows())
+	}
+
+	// Non-Termux terminals use an alt-screen transcript viewport. Termux stays
+	// in the normal buffer so native touch scrollback and soft-keyboard focus
+	// keep working; finalized transcript lines are emitted via tea.Println.
 	p := tea.NewProgram(m)
 	final, runErr := p.Run()
 	// Close the active controller plus any retired ones from /model switches.
@@ -492,6 +538,12 @@ func chatREPL(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func reserveNativeScrollbackFrame(w io.Writer, rows int) {
+	for i := 0; i < rows; i++ {
+		fmt.Fprintln(w)
+	}
 }
 
 // setupTargets is where the wizard writes: the TOML config and the secrets file.
@@ -1318,17 +1370,12 @@ func providersWithMissingKeys(cfg *config.Config) []config.ProviderEntry {
 }
 
 // configureKeys reconciles each enabled provider's API key with the
-// environment. For every distinct api_key_env: if the variable is already
-// set — either by loadDotEnv from .env, or by an earlier wizard step that
-// called os.Setenv (the URL-fetch flow asks for the key once so it can call
-// /models) — the existing value is reused and a single-line confirmation is
-// printed so the user can see why no prompt appeared. Otherwise the user is
-// asked once per env var (deduped across providers that share one, e.g.
-// both DeepSeek models). Returns KEY=value lines to append to .env: any
-// env var that was already set in the process goes through too, so a
-// re-run of `reasonix setup` re-pins the current value into .env (a
-// loadDotEnv is first-wins, so without re-pinning, an old .env line would
-// shadow the fresh value).
+// environment. For every distinct api_key_env: if the variable is already set,
+// setup asks whether to re-enter it; Enter keeps and re-pins the existing value.
+// Otherwise the user is asked once per env var (deduped across providers that
+// share one, e.g. both DeepSeek models). Returns KEY=value lines to append to
+// .env. Re-pinning matters because loadDotEnv is first-wins, so a stale key left
+// earlier in the credentials file would otherwise keep shadowing the fresh value.
 func configureKeys(selected []config.ProviderEntry, r io.Reader, w io.Writer) []string {
 	in := bufio.NewScanner(r)
 	fmt.Fprintln(w, "\n"+i18n.M.EnterAPIKeysHeader)
@@ -1341,11 +1388,14 @@ func configureKeys(selected []config.ProviderEntry, r io.Reader, w io.Writer) []
 		}
 		seen[p.APIKeyEnv] = true
 
-		// Reuse any value the wizard or .env already set. The URL-fetch
-		// flow (promptCustomProviderFromURL) calls os.Setenv(keyEnv, apiKey)
-		// before the /models probe; that value is the user's "real" key
-		// and we'd be wrong to discard it by asking again.
 		if cur := os.Getenv(p.APIKeyEnv); cur != "" {
+			reset := ask(in, w, "  "+fmt.Sprintf(i18n.M.APIKeyResetPromptFmt, p.APIKeyEnv), "y/N")
+			if reset == "y" || reset == "Y" {
+				if key := ask(in, w, "  "+p.APIKeyEnv, ""); key != "" {
+					envLines = append(envLines, p.APIKeyEnv+"="+key)
+					continue
+				}
+			}
 			fmt.Fprintf(w, "  %s %s\n", green("✓"), fmt.Sprintf(i18n.M.APIKeyAlreadySetFmt, p.APIKeyEnv))
 			envLines = append(envLines, p.APIKeyEnv+"="+cur)
 			continue

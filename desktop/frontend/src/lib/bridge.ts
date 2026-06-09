@@ -42,6 +42,8 @@ import type {
   UpdateProgress,
   WireEvent,
   WorkspaceChangesView,
+  GitCommitView,
+  GitCommitDetailView,
   WorkspaceView,
 } from "./types";
 
@@ -82,10 +84,13 @@ export interface AppBindings {
   SubmitDisplay(display: string, input: string): Promise<void>;
   SubmitDisplayToTab(tabID: string, display: string, input: string): Promise<void>;
   RunShell(command: string): Promise<void>;
+  RunShellForTab(tabID: string, command: string): Promise<void>;
   Cancel(): Promise<void>;
   CancelTab(tabID: string): Promise<void>;
   Approve(id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
+  ApproveWithScope(id: string, allow: boolean, session: boolean, persist: boolean, scope: string): Promise<void>;
   ApproveTab(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean): Promise<void>;
+  ApproveTabWithScope(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean, scope: string): Promise<void>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   AnswerQuestionForTab(tabID: string, id: string, answers: QuestionAnswer[]): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
@@ -141,6 +146,10 @@ export interface AppBindings {
   SearchFileRefs(query: string): Promise<DirEntry[]>;
   ReadFile(rel: string): Promise<FilePreview>;
   WorkspaceChanges(): Promise<WorkspaceChangesView>;
+  GitBranches(): Promise<string[]>;
+  GitCheckout(branch: string): Promise<void>;
+  WorkspaceGitHistory(path: string): Promise<GitCommitView[]>;
+  WorkspaceGitCommitDetail(hash: string, path: string): Promise<GitCommitDetailView>;
   OpenWorkspacePath(rel: string): Promise<void>;
   RevealWorkspacePath(rel: string): Promise<void>;
   RevealPath(path: string): Promise<void>;
@@ -167,8 +176,12 @@ export interface AppBindings {
   SetSubagentEffort(level: string): Promise<void>;
   SetAutoPlan(mode: string): Promise<void>;
   SaveProvider(p: ProviderView): Promise<void>;
+  AddOfficialProviderAccess(kind: string, key: string): Promise<void>;
+  FetchProviderModels(p: ProviderView): Promise<string[]>;
   DeleteProvider(name: string): Promise<void>;
+  RemoveProviderAccess(name: string): Promise<void>;
   SetProviderKey(apiKeyEnv: string, value: string): Promise<void>;
+  ClearProviderKey(apiKeyEnv: string): Promise<void>;
   SetPermissionMode(mode: string): Promise<void>;
   AddPermissionRule(list: string, rule: string): Promise<void>;
   RemovePermissionRule(list: string, rule: string): Promise<void>;
@@ -178,7 +191,7 @@ export interface AppBindings {
   SetDesktopLanguage(lang: string): Promise<void>;
   SetDesktopAppearance(theme: string, style: string): Promise<void>;
   MigrateDesktopPreferences(language: string, theme: string, style: string): Promise<void>;
-  SetAgentParams(temperature: number, maxSteps: number, systemPrompt: string): Promise<void>;
+  SetAgentParams(temperature: number, maxSteps: number, plannerMaxSteps: number, systemPrompt: string): Promise<void>;
   SetTrayLocale(locale: "en" | "zh"): Promise<void>;
   // SetBypass toggles YOLO mode (auto-approve every tool call this session; deny
   // rules still apply). Runtime-only — not written to config.
@@ -283,10 +296,32 @@ export function onUpdaterProgress(cb: (p: UpdateProgress) => void): () => void {
 export function onFilesDropped(cb: (paths: string[]) => void): () => void {
   const rt = typeof window !== "undefined" ? window.runtime : undefined;
   if (!rt?.OnFileDrop) return () => {};
+
+  // Wails' internal ResolveFilePaths throws when a non-file object (e.g. the
+  // window icon) is dragged onto the webview. The error is uncaught and crashes
+  // the app. Intercept it here so only real file drops reach the callback.
+  const suppressNonFileDragError = (e: ErrorEvent) => {
+    if (e.message?.includes("additional File object is not a file on the disk")) {
+      e.preventDefault();
+    }
+  };
+  const suppressNonFileDragRejection = (e: PromiseRejectionEvent) => {
+    const msg = e.reason?.message ?? String(e.reason);
+    if (msg.includes("additional File object is not a file on the disk")) {
+      e.preventDefault();
+    }
+  };
+  window.addEventListener("error", suppressNonFileDragError);
+  window.addEventListener("unhandledrejection", suppressNonFileDragRejection);
+
   rt.OnFileDrop((_x, _y, paths) => {
     if (Array.isArray(paths) && paths.length > 0) cb(paths);
   }, true);
-  return () => rt.OnFileDropOff?.();
+  return () => {
+    rt.OnFileDropOff?.();
+    window.removeEventListener("error", suppressNonFileDragError);
+    window.removeEventListener("unhandledrejection", suppressNonFileDragRejection);
+  };
 }
 
 // onReady subscribes to the agent:ready event fired when boot.Build completes.
@@ -359,13 +394,26 @@ function baseName(path: string): string {
   return path.replace(/[/\\]+$/, "").split(/[/\\]/).filter(Boolean).pop() ?? path;
 }
 
+function browserPlatformOverride(): "darwin" | "windows" | "linux" | "" {
+  if (typeof window === "undefined" || window.runtime) return "";
+  const value = new URLSearchParams(window.location.search).get("platform");
+  return value === "darwin" || value === "windows" || value === "linux" ? value : "";
+}
+
+function mockScenario(): "demo" | "fresh" {
+  if (typeof window === "undefined") return "demo";
+  const value = new URLSearchParams(window.location.search).get("mock")?.trim().toLowerCase();
+  return value === "fresh" || value === "empty" || value === "first-run" ? "fresh" : "demo";
+}
+
 function makeMockApp(): AppBindings {
+  const freshMock = mockScenario() === "fresh";
   let cancelled = false;
   let pendingAskPreview = false;
   let pendingApprovalPreview = false;
-  let cwd = "~/projects/joyquant-db"; // mutable so PickWorkspace is visible in dev
   const globalWorkspaceRoot = "~/Library/Application Support/reasonix/global-workspace";
-  let workspaces = ["~/projects/joyquant-db", "~/projects/joyquant-sys", "~/projects/reasonix", "~/projects/blade"];
+  let cwd = freshMock ? globalWorkspaceRoot : "~/projects/joyquant-db"; // mutable so PickWorkspace is visible in dev
+  let workspaces = freshMock ? [] : ["~/projects/joyquant-db", "~/projects/joyquant-sys", "~/projects/reasonix", "~/projects/blade"];
   let mockEffort = "auto";
   const day = 86_400_000;
   const t0 = Date.now();
@@ -422,13 +470,14 @@ function makeMockApp(): AppBindings {
     { name: "init", description: "Scaffold a REASONIX.md for this repo", scope: "builtin", runAs: "inline", enabled: true },
   ];
   let capSkillRoots: SkillRootView[] = [
-    { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, skills: 0 },
+    { dir: "~/projects/reasonix/.reasonix/skills", scope: "project", priority: 1, status: "missing", configured: false, removable: true, skills: 0 },
     {
       dir: "~/my-skills",
       scope: "custom",
       priority: 5,
       status: "ok",
       configured: true,
+      removable: true,
       skills: 1,
       skillItems: [{ name: "review", description: "Review the staged diff", scope: "custom", runAs: "inline" }],
     },
@@ -438,6 +487,7 @@ function makeMockApp(): AppBindings {
       priority: 6,
       status: "ok",
       configured: false,
+      removable: true,
       skills: 2,
       skillItems: [
         { name: "explore", description: "Investigate the codebase in an isolated subagent", scope: "global", runAs: "subagent" },
@@ -515,18 +565,27 @@ function makeMockApp(): AppBindings {
       topicTitle: t("mock.trashGlobalProductTitle"),
     },
   ];
+  if (freshMock) {
+    sessions.splice(0);
+    trashedSessions.splice(0);
+  }
   // Mutable settings so the Settings panel's edits are observable in browser dev.
   const settings: SettingsView = {
-    defaultModel: "deepseek-flash",
+    defaultModel: "deepseek",
     plannerModel: "",
     subagentModel: "",
     subagentEffort: "",
     autoPlan: "off",
     providers: [
-      { name: "deepseek-flash", kind: "openai", baseUrl: "https://api.deepseek.com", models: ["deepseek-v4-flash"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", keySet: true, balanceUrl: "https://api.deepseek.com/user/balance", contextWindow: 1_000_000, supportedEfforts: [], defaultEffort: "" },
-      { name: "mimo-pro", kind: "openai", baseUrl: "https://api.xiaomimimo.com/v1", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: false, balanceUrl: "", contextWindow: 1_000_000, supportedEfforts: [], defaultEffort: "" },
+      { name: "deepseek", builtIn: true, added: false, kind: "openai", baseUrl: "https://api.deepseek.com", modelsUrl: "", models: ["deepseek-v4-flash"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", keySet: true, balanceUrl: "https://api.deepseek.com/user/balance", contextWindow: 1_000_000, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+      { name: "mimo-token-plan", builtIn: true, added: false, kind: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", modelsUrl: "", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: false, balanceUrl: "", contextWindow: 1_048_576, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
     ],
-    permissions: { mode: "ask", allow: ["ls", "read_file"], ask: [], deny: ["bash(rm *)"] },
+    officialProviders: [
+      { name: "deepseek", builtIn: true, added: false, kind: "openai", baseUrl: "https://api.deepseek.com", modelsUrl: "", models: ["deepseek-v4-flash", "deepseek-v4-pro"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", keySet: true, balanceUrl: "https://api.deepseek.com/user/balance", contextWindow: 1_000_000, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+      { name: "mimo-api", builtIn: true, added: false, kind: "openai", baseUrl: "https://api.xiaomimimo.com/v1", modelsUrl: "", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: false, balanceUrl: "", contextWindow: 1_048_576, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+      { name: "mimo-token-plan", builtIn: true, added: false, kind: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", modelsUrl: "", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: false, balanceUrl: "", contextWindow: 1_048_576, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+    ],
+    permissions: { mode: "ask", allow: ["ls", "read_file"], ask: [], deny: ["Bash(rm:*)"] },
     sandbox: { bash: "enforce", network: true, workspaceRoot: "", allowWrite: [] },
     network: {
       proxyMode: "auto",
@@ -534,7 +593,7 @@ function makeMockApp(): AppBindings {
       noProxy: "",
       proxy: { type: "socks5", server: "127.0.0.1", port: 7890, username: "", password: "" },
     },
-    agent: { temperature: 0.2, maxSteps: 0, systemPrompt: "You are Reasonix, a coding agent." },
+    agent: { temperature: 0.2, maxSteps: 0, plannerMaxSteps: 12, systemPrompt: "You are Reasonix, a coding agent." },
     desktopLanguage: "",
     desktopTheme: "dark",
     desktopThemeStyle: "graphite",
@@ -543,7 +602,13 @@ function makeMockApp(): AppBindings {
     providerKinds: ["openai"],
     bypass: false,
   };
-  const mockProjectTree: ProjectNode[] = [
+  settings.providers = settings.providers.map((provider) =>
+    provider.apiKeyEnv === "DEEPSEEK_API_KEY" ? { ...provider, keySet: !freshMock } : provider,
+  );
+  if (freshMock) {
+    settings.configPath = "~/.config/reasonix/config.toml";
+  }
+  const mockProjectTree: ProjectNode[] = freshMock ? [] : [
     {
       key: "project_~/projects/joyquant-db",
       kind: "project",
@@ -600,7 +665,22 @@ function makeMockApp(): AppBindings {
   const setMockActiveTab = (tabId: string) => {
     mockTabs = mockTabs.map((tab) => ({ ...tab, active: tab.id === tabId }));
   };
-  let mockTabs: TabMeta[] = [
+  let mockTabs: TabMeta[] = freshMock ? [
+    {
+      id: "tab_global",
+      scope: "global",
+      workspaceRoot: globalWorkspaceRoot,
+      workspaceName: "Global",
+      topicId: "",
+      topicTitle: "Global",
+      label: "DeepSeek-R1",
+      ready: true,
+      running: false,
+      mode: "normal",
+      active: true,
+      cwd: globalWorkspaceRoot,
+    },
+  ] : [
     {
       id: "tab_joyquant_db",
       scope: "project",
@@ -648,6 +728,8 @@ function makeMockApp(): AppBindings {
   ];
   return {
     async Platform() {
+      const override = browserPlatformOverride();
+      if (override) return override;
       // Mirror the OS the browser dev mock runs on.
       const ua = typeof navigator !== "undefined" ? navigator.userAgent : "";
       if (/Win/i.test(ua)) return "windows";
@@ -757,8 +839,32 @@ function makeMockApp(): AppBindings {
             }),
             output: "todo list updated",
             readOnly: false,
+            durationMs: 150,
           },
         });
+        emit({ kind: "turn_done" });
+        return;
+      }
+      if (trimmedInput === "/process-preview" || trimmedInput === "process preview" || trimmedInput === "过程预览") {
+        await delay(200);
+        if (cancelled) return;
+        emit({ kind: "phase", text: "Preparing context" });
+        await delay(120);
+        emit({ kind: "notice", level: "info", text: "Loaded project instructions from AGENTS.md." });
+        await delay(120);
+        emit({ kind: "notice", level: "warn", text: "Network access is enabled; external results may change over time." });
+        await delay(120);
+        emit({ kind: "compaction_started", compaction: { trigger: "manual" } });
+        await delay(320);
+        emit({
+          kind: "compaction_done",
+          compaction: {
+            trigger: "manual",
+            messages: 6,
+            summary: "Preserved the active task, relevant files, and UI decisions while trimming earlier exploratory context.",
+          },
+        });
+        emit({ kind: "message", text: "Process card preview complete." });
         emit({ kind: "turn_done" });
         return;
       }
@@ -790,7 +896,7 @@ function makeMockApp(): AppBindings {
       await delay(350);
       emit({
         kind: "tool_result",
-        tool: { id: "t1", name: "edit_file", output: "edited main.go", readOnly: false },
+        tool: { id: "t1", name: "edit_file", output: "edited main.go", readOnly: false, durationMs: 350 },
       });
       emit({
         kind: "usage",
@@ -827,8 +933,11 @@ function makeMockApp(): AppBindings {
           emit({ kind: "tool_progress", tool: { id, name: "bash", output: `$ ${command}\n(mock output)\n`, readOnly: false } });
           await delay(100);
           if (cancelled) return;
-          emit({ kind: "tool_result", tool: { id, name: "bash", output: `$ ${command}\n(mock output)\n`, readOnly: false } });
+          emit({ kind: "tool_result", tool: { id, name: "bash", output: `$ ${command}\n(mock output)\n`, readOnly: false, durationMs: 300 } });
           emit({ kind: "turn_done" });
+        },
+        async RunShellForTab(_tabID, command) {
+          await this.RunShell(command);
         },
         async Cancel() {
           cancelled = true;
@@ -838,17 +947,24 @@ function makeMockApp(): AppBindings {
           await this.Cancel();
         },
         async Approve(_id, allow, session, persist) {
+          await this.ApproveWithScope(_id, allow, session, persist, "");
+        },
+        async ApproveWithScope(_id, allow, session, persist, scope) {
           if (!pendingApprovalPreview) return;
-      pendingApprovalPreview = false;
-      const suffix = persist ? "persisted" : session ? "allowed for session" : "allowed once";
-      emit({
-        kind: "message",
-        text: `approval preview answered: ${allow ? suffix : "denied"}`,
-      });
+          pendingApprovalPreview = false;
+          const scopeLabel = scope === "prefix" ? "prefix" : "scope";
+          const suffix = persist ? `${scopeLabel} grant saved` : session ? `${scopeLabel} grant active this session` : "allowed once";
+          emit({
+            kind: "message",
+            text: `approval preview answered: ${allow ? suffix : "denied"}`,
+          });
           emit({ kind: "turn_done" });
         },
         async ApproveTab(_tabID, id, allow, session, persist) {
-          await this.Approve(id, allow, session, persist);
+          await this.ApproveTabWithScope(_tabID, id, allow, session, persist, "");
+        },
+        async ApproveTabWithScope(_tabID, id, allow, session, persist, scope) {
+          await this.ApproveWithScope(id, allow, session, persist, scope);
         },
         async AnswerQuestion(_id, answers) {
       if (!pendingAskPreview) return;
@@ -930,11 +1046,14 @@ function makeMockApp(): AppBindings {
       const s = sessions.find((x) => x.path === path) ?? trashedSessions.find((x) => x.path === path);
       return [
         { role: "user", content: s?.preview || `(mock) preview ${path}` },
+        { role: "phase", content: "Preparing read-only preview" },
         {
           role: "assistant",
           content: "This is a read-only mock preview. The active conversation is unchanged.",
           reasoning: "Preview reads the saved session without resuming it.",
         },
+        { role: "notice", level: "info", content: "Preview mode keeps the active conversation untouched." },
+        { role: "compaction", content: "", trigger: "manual", messages: 3, summary: "Mock preview preserved the latest task, tool result, and answer summary." },
       ];
     },
     async DeleteSession(path: string) {
@@ -1126,6 +1245,7 @@ function makeMockApp(): AppBindings {
           priority: capSkillRoots.length + 1,
           status: "ok",
           configured: true,
+          removable: true,
           skills: 1,
           skillItems: [{ name: "local-dev", description: "Local custom development workflow", scope: "custom", runAs: "inline" }],
         });
@@ -1135,7 +1255,7 @@ function makeMockApp(): AppBindings {
       }
     },
     async RemoveSkillPath(path: string) {
-      capSkillRoots = capSkillRoots.filter((r) => !(r.scope === "custom" && r.dir === path));
+      capSkillRoots = capSkillRoots.filter((r) => r.dir !== path);
       if (!capSkillRoots.some((r) => r.scope === "custom")) {
         const idx = capSkills.findIndex((s) => s.name === "local-dev");
         if (idx >= 0) capSkills.splice(idx, 1);
@@ -1245,6 +1365,7 @@ function makeMockApp(): AppBindings {
     async WorkspaceChanges() {
       return {
         gitAvailable: true,
+        gitBranch: "main",
         files: [
           {
             path: "desktop/frontend/src/components/WorkspacePanel.tsx",
@@ -1258,6 +1379,23 @@ function makeMockApp(): AppBindings {
           { path: "internal/control/controller.go", sources: ["session"], turns: [1], latestTime: Date.now() - 120_000 },
         ],
       };
+    },
+    async GitBranches() {
+      return ["main", "dev", "feature/branch-switcher"];
+    },
+    async GitCheckout(_branch: string) {
+      console.info("mock GitCheckout", _branch);
+    },
+    async WorkspaceGitHistory(path: string) {
+      return [
+        { hash: "abcdef123456", author: "Mock Author", date: new Date().toISOString(), message: "Mock commit message for " + path },
+      ];
+    },
+    async WorkspaceGitCommitDetail(_hash: string, path: string) {
+      if (path) {
+        return { diff: "--- a/mock\n+++ b/mock\n@@ -1,1 +1,1 @@\n-mock\n+mock diff" };
+      }
+      return { files: ["mock_file_1.ts", "mock_file_2.ts"] };
     },
     async OpenWorkspacePath(rel: string) {
       console.info("mock OpenWorkspacePath", rel);
@@ -1367,16 +1505,46 @@ function makeMockApp(): AppBindings {
       settings.autoPlan = mode;
     },
     async SaveProvider(p: ProviderView) {
+      p.added = true;
       const i = settings.providers.findIndex((x) => x.name === p.name);
       if (i >= 0) settings.providers[i] = p;
       else settings.providers.push(p);
     },
+    async AddOfficialProviderAccess(kind: string, key: string) {
+      const templates: Record<string, ProviderView> = {
+        deepseek: { name: "deepseek", builtIn: true, added: true, kind: "openai", baseUrl: "https://api.deepseek.com", modelsUrl: "", models: ["deepseek-v4-flash", "deepseek-v4-pro"], default: "deepseek-v4-flash", apiKeyEnv: "DEEPSEEK_API_KEY", keySet: !!key.trim(), balanceUrl: "https://api.deepseek.com/user/balance", contextWindow: 1_000_000, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+        "mimo-api": { name: "mimo-api", builtIn: true, added: true, kind: "openai", baseUrl: "https://api.xiaomimimo.com/v1", modelsUrl: "", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: !!key.trim(), balanceUrl: "", contextWindow: 1_048_576, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+        "mimo-token-plan": { name: "mimo-token-plan", builtIn: true, added: true, kind: "openai", baseUrl: "https://token-plan-cn.xiaomimimo.com/v1", modelsUrl: "", models: ["mimo-v2.5-pro"], default: "mimo-v2.5-pro", apiKeyEnv: "MIMO_API_KEY", keySet: !!key.trim(), balanceUrl: "", contextWindow: 1_048_576, reasoningProtocol: "", supportedEfforts: [], defaultEffort: "" },
+      };
+      const next = templates[kind] ?? templates.deepseek;
+      const i = settings.providers.findIndex((x) => x.name === next.name);
+      if (i >= 0) settings.providers[i] = { ...settings.providers[i], ...next, keySet: next.keySet || settings.providers[i].keySet };
+      else settings.providers.push(next);
+    },
+    async FetchProviderModels(p: ProviderView) {
+      if (!p.baseUrl.trim()) throw new Error(t("settings.fetchModelsMissingBaseUrl"));
+      if (!p.apiKeyEnv.trim()) throw new Error(t("settings.fetchModelsMissingKeyEnv"));
+      await delay(350);
+      if (p.baseUrl.includes("deepseek")) return ["deepseek-v4-flash", "deepseek-v4-pro"];
+      if (p.baseUrl.includes("mimo") || p.baseUrl.includes("xiaomimimo")) return ["mimo-v2.5", "mimo-v2.5-pro"];
+      return ["gpt-5", "gpt-5-mini", "qwen3-coder"];
+    },
     async DeleteProvider(name: string) {
       settings.providers = settings.providers.filter((p) => p.name !== name);
     },
-    async SetProviderKey(apiKeyEnv: string) {
+    async RemoveProviderAccess(name: string) {
+      const p = settings.providers.find((x) => x.name === name);
+      if (p?.builtIn) p.added = false;
+      else settings.providers = settings.providers.filter((x) => x.name !== name);
+    },
+    async SetProviderKey(apiKeyEnv: string, _value: string) {
       settings.providers.forEach((p) => {
         if (p.apiKeyEnv === apiKeyEnv) p.keySet = true;
+      });
+    },
+    async ClearProviderKey(apiKeyEnv: string) {
+      settings.providers.forEach((p) => {
+        if (p.apiKeyEnv === apiKeyEnv) p.keySet = false;
       });
     },
     async SetPermissionMode(mode: string) {
@@ -1413,8 +1581,8 @@ function makeMockApp(): AppBindings {
             settings.desktopThemeStyle = style;
           }
         },
-    async SetAgentParams(temperature: number, maxSteps: number, systemPrompt: string) {
-      settings.agent = { temperature, maxSteps, systemPrompt };
+    async SetAgentParams(temperature: number, maxSteps: number, plannerMaxSteps: number, systemPrompt: string) {
+      settings.agent = { temperature, maxSteps, plannerMaxSteps, systemPrompt };
     },
     async SetTrayLocale(_locale: "en" | "zh") {},
     async SetBypass(on: boolean) {

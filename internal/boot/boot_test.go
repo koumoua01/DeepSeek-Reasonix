@@ -18,6 +18,7 @@ import (
 
 	"reasonix/internal/config"
 	"reasonix/internal/event"
+	"reasonix/internal/netclient"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
 	"reasonix/internal/sandbox"
@@ -34,7 +35,7 @@ import (
 // into the session's system message (the cached prefix), and the `remember`
 // tool is registered. It builds a real Controller from a throwaway project dir.
 func TestBuildFoldsProjectMemoryIntoSystemPrompt(t *testing.T) {
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 
 	writeFile(t, dir, "reasonix.toml", `
@@ -118,12 +119,52 @@ func TestNewProviderAppliesConfiguredDefaultEffort(t *testing.T) {
 	}
 }
 
+func TestNewProviderAppliesModelReasoningProtocol(t *testing.T) {
+	var gotReq map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&gotReq); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
+	}))
+	defer srv.Close()
+
+	p, err := NewProvider(&config.ProviderEntry{
+		Name:    "deepseek-proxy",
+		Kind:    "openai",
+		BaseURL: srv.URL,
+		Model:   "deepseek-v4-flash",
+	})
+	if err != nil {
+		t.Fatalf("NewProvider: %v", err)
+	}
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+	if got := gotReq["reasoning_effort"]; got != "high" {
+		t.Fatalf("reasoning_effort = %#v, want high from DeepSeek model capability", got)
+	}
+	thinking, ok := gotReq["thinking"].(map[string]any)
+	if !ok || thinking["type"] != "enabled" {
+		t.Fatalf("thinking = %#v, want enabled", gotReq["thinking"])
+	}
+}
+
 // TestBuildDiscoversSkills proves the skill wiring end-to-end: a project skill
 // is discovered at boot, surfaced via Controller.Skills(), and its name folds
 // into the cache-stable system prompt's "# Skills" index alongside a built-in.
 func TestBuildDiscoversSkills(t *testing.T) {
-	dir := t.TempDir()
-	home := t.TempDir()
+	dir := robustTempDir(t)
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Chdir(dir)
@@ -176,7 +217,7 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 func TestAddBuiltinsWithWorkspaceRootKeepsSessionTools(t *testing.T) {
 	reg := tool.NewRegistry()
 	var stderr bytes.Buffer
-	addBuiltins(reg, nil, []string{t.TempDir()}, sandbox.Spec{}, builtin.SearchSpec{}, &stderr, t.TempDir())
+	addBuiltins(reg, nil, []string{robustTempDir(t)}, sandbox.Spec{}, 120*time.Second, builtin.SearchSpec{}, &stderr, robustTempDir(t), netclient.ProxySpec{})
 	for _, name := range []string{
 		"todo_write",
 		"complete_step",
@@ -192,8 +233,8 @@ func TestAddBuiltinsWithWorkspaceRootKeepsSessionTools(t *testing.T) {
 }
 
 func TestBuildOmitsDisabledSkillsFromPromptAndRuntimeList(t *testing.T) {
-	dir := t.TempDir()
-	home := t.TempDir()
+	dir := robustTempDir(t)
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Chdir(dir)
@@ -244,11 +285,60 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 }
 
+func TestBuildOmitsExcludedSkillRootsFromPromptAndRuntimeList(t *testing.T) {
+	dir := robustTempDir(t)
+	home := robustTempDir(t)
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Chdir(dir)
+	excluded := filepath.Join(home, ".agents", "skills")
+	writeFile(t, home, ".reasonix/skills/keep.md", "---\ndescription: keep\n---\nplaybook")
+	writeFile(t, home, ".agents/skills/noisy.md", "---\ndescription: noisy\n---\nplaybook")
+	writeFile(t, dir, "reasonix.toml", fmt.Sprintf(`
+default_model = "test-model"
+
+[codegraph]
+enabled = false
+
+[agent]
+system_prompt = "BASE"
+
+[skills]
+excluded_paths = [%q]
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`, excluded))
+
+	ctrl, err := Build(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	defer ctrl.Close()
+
+	for _, s := range ctrl.Skills() {
+		if s.Name == "noisy" {
+			t.Fatalf("excluded skill should not be executable: %v", ctrl.Skills())
+		}
+	}
+	sys := systemMessage(ctrl.History())
+	if strings.Contains(sys, "noisy") {
+		t.Fatalf("excluded skill name should be omitted from system prompt:\n%s", sys)
+	}
+	if !strings.Contains(sys, "keep") {
+		t.Fatalf("non-excluded skill should remain in system prompt:\n%s", sys)
+	}
+}
+
 // TestBuildWithoutMemoryLeavesPromptUnchanged is the inverse invariant: with no
 // memory files, the system prompt is exactly the configured base — the cache
 // prefix is untouched by the memory feature.
 func TestBuildWithoutMemoryLeavesPromptUnchanged(t *testing.T) {
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 	writeFile(t, dir, "reasonix.toml", `
 default_model = "test-model"
@@ -292,7 +382,7 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 }
 
 func TestBuildLanguagePolicyIsAppended(t *testing.T) {
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 	writeFile(t, dir, "reasonix.toml", `
 default_model = "test-model"
@@ -350,25 +440,25 @@ func writeFile(t *testing.T, dir, name, body string) {
 }
 
 func TestRememberPermissionRuleUsesWorkspaceRoot(t *testing.T) {
-	home := t.TempDir()
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("AppData", filepath.Join(home, "AppData"))
 
-	cwd := t.TempDir()
-	workspace := t.TempDir()
+	cwd := robustTempDir(t)
+	workspace := robustTempDir(t)
 	t.Chdir(cwd)
 	writeFile(t, cwd, "reasonix.toml", `
 [permissions]
-allow = ["bash(cwd*)"]
+allow = ["Bash(cwd*)"]
 `)
 	writeFile(t, workspace, "reasonix.toml", `
 [permissions]
-allow = ["bash(workspace*)"]
+allow = ["Bash(workspace*)"]
 `)
 
-	const rule = "bash=go test ./..."
+	const rule = "Bash(go test ./...)"
 	rememberPermissionRule(workspace, rule)
 
 	cwdCfg := config.LoadForEdit(filepath.Join(cwd, "reasonix.toml"))
@@ -381,23 +471,56 @@ allow = ["bash(workspace*)"]
 	}
 }
 
-func TestRememberPermissionRuleEmptyRootUsesSourcePath(t *testing.T) {
-	home := t.TempDir()
+func TestRememberPermissionRuleCreatesWorkspaceConfigOverUserConfig(t *testing.T) {
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("AppData", filepath.Join(home, "AppData"))
 
-	cwd := t.TempDir()
+	workspace := robustTempDir(t)
+	userConfig := config.UserConfigPath()
+	writeFile(t, filepath.Dir(userConfig), filepath.Base(userConfig), `
+[permissions]
+allow = ["Bash(user)"]
+`)
+
+	const rule = "Edit(src/app.go)"
+	res := rememberPermissionRule(workspace, rule)
+	if !res.Saved || res.Path != filepath.Join(workspace, "reasonix.toml") {
+		t.Fatalf("remember result = %+v, want saved to workspace config", res)
+	}
+
+	userCfg := config.LoadForEdit(userConfig)
+	if hasPermissionRule(userCfg.Permissions.Allow, rule) {
+		t.Fatalf("workspace rule was written to user config: %v", userCfg.Permissions.Allow)
+	}
+	workspaceCfg := config.LoadForEdit(filepath.Join(workspace, "reasonix.toml"))
+	if !hasPermissionRule(workspaceCfg.Permissions.Allow, rule) {
+		t.Fatalf("workspace rule missing from project config: %v", workspaceCfg.Permissions.Allow)
+	}
+}
+
+func TestRememberPermissionRuleEmptyRootUsesSourcePath(t *testing.T) {
+	home := robustTempDir(t)
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+
+	cwd := robustTempDir(t)
 	t.Chdir(cwd)
 	userConfig := config.UserConfigPath()
 	writeFile(t, filepath.Dir(userConfig), filepath.Base(userConfig), `
 [permissions]
-allow = ["bash(user*)"]
+allow = ["Bash(user*)"]
 `)
 
-	const rule = "bash=go env"
-	rememberPermissionRule("", rule)
+	const rule = "Bash(go env)"
+	res := rememberPermissionRule("", rule)
+	if !res.Saved || res.Path != userConfig {
+		t.Fatalf("remember result = %+v, want saved to user source config", res)
+	}
 
 	userCfg := config.LoadForEdit(userConfig)
 	if !hasPermissionRule(userCfg.Permissions.Allow, rule) {
@@ -405,6 +528,43 @@ allow = ["bash(user*)"]
 	}
 	if _, err := os.Stat(filepath.Join(cwd, "reasonix.toml")); !os.IsNotExist(err) {
 		t.Fatalf("empty root should not create cwd config when SourcePath exists, err=%v", err)
+	}
+}
+
+func TestRememberPermissionRuleSkipsRuleCoveredByExistingAllow(t *testing.T) {
+	workspace := robustTempDir(t)
+	writeFile(t, workspace, "reasonix.toml", `
+[permissions]
+allow = ["Bash(go test:*)"]
+`)
+
+	res := rememberPermissionRule(workspace, "Bash(go test ./...)")
+	if res.Saved || res.CoveredBy != "Bash(go test:*)" {
+		t.Fatalf("remember result = %+v, want already covered", res)
+	}
+	cfg := config.LoadForEdit(filepath.Join(workspace, "reasonix.toml"))
+	if len(cfg.Permissions.Allow) != 1 || cfg.Permissions.Allow[0] != "Bash(go test:*)" {
+		t.Fatalf("allow rules = %v, want only existing prefix", cfg.Permissions.Allow)
+	}
+}
+
+func TestRememberPermissionRulePrunesNarrowRulesWhenSavingBroaderRule(t *testing.T) {
+	workspace := robustTempDir(t)
+	writeFile(t, workspace, "reasonix.toml", `
+[permissions]
+allow = ["Bash(go test ./...)", "Bash(go build ./...)"]
+`)
+
+	res := rememberPermissionRule(workspace, "Bash(go test:*)")
+	if !res.Saved || res.CoveredBy != "" {
+		t.Fatalf("remember result = %+v, want saved broader rule", res)
+	}
+	cfg := config.LoadForEdit(filepath.Join(workspace, "reasonix.toml"))
+	if hasPermissionRule(cfg.Permissions.Allow, "Bash(go test ./...)") {
+		t.Fatalf("narrow go test rule should be pruned: %v", cfg.Permissions.Allow)
+	}
+	if !hasPermissionRule(cfg.Permissions.Allow, "Bash(go build ./...)") || !hasPermissionRule(cfg.Permissions.Allow, "Bash(go test:*)") {
+		t.Fatalf("allow rules = %v, want unrelated exact plus prefix", cfg.Permissions.Allow)
 	}
 }
 
@@ -421,14 +581,14 @@ func hasPermissionRule(rules []string, want string) bool {
 // ~/.reasonix/config.json with no v1+ config present must be imported during
 // Build — config written, key pinned into the env, and the user told via a notice.
 func TestBuildMigratesLegacyConfigEndToEnd(t *testing.T) {
-	home := t.TempDir()
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)                               // os.UserHomeDir on Windows
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config")) // os.UserConfigDir on Linux
 	t.Setenv("AppData", filepath.Join(home, "AppData"))         // os.UserConfigDir on Windows
 	t.Setenv("DEEPSEEK_API_KEY", "")                            // track for cleanup; migration os.Setenv's it live
 
-	proj := t.TempDir()
+	proj := robustTempDir(t)
 	t.Chdir(proj)
 	// codegraph off keeps Build offline; it merges over the migrated user config
 	// without dropping the migrated plugins.
@@ -498,13 +658,13 @@ func TestBuildMigratesLegacyConfigEndToEnd(t *testing.T) {
 }
 
 func TestBuildMigratesLegacySessionsFromConfigSessionDir(t *testing.T) {
-	home := t.TempDir()
+	home := robustTempDir(t)
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, "xdg-config"))
 	t.Setenv("AppData", filepath.Join(home, "AppData"))
 
-	proj := t.TempDir()
+	proj := robustTempDir(t)
 	writeFile(t, proj, "reasonix.toml", "[codegraph]\nenabled = false\n")
 
 	legacyDir := config.SessionDir()
@@ -559,7 +719,7 @@ func TestBuildMigratesLegacySessionsFromConfigSessionDir(t *testing.T) {
 // withTempCache helper in internal/plugin/stats_test.go.
 func isolateConfigHome(t *testing.T) string {
 	t.Helper()
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Setenv("HOME", dir)
 	t.Setenv("XDG_CONFIG_HOME", dir)
 	return dir
@@ -594,7 +754,7 @@ func TestPartitionByTier(t *testing.T) {
 
 func TestBuildMigratesLegacyEagerTierToBackground(t *testing.T) {
 	isolateConfigHome(t)
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 
 	writeFile(t, dir, "reasonix.toml", `
@@ -642,7 +802,7 @@ tier = "eager"
 
 func TestBuildMigratesLegacyLazyTierToBackground(t *testing.T) {
 	isolateConfigHome(t)
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 
 	writeFile(t, dir, "reasonix.toml", `
@@ -690,7 +850,7 @@ tier = "lazy"
 
 func TestBuildColdCodegraphStartsInBackground(t *testing.T) {
 	isolateConfigHome(t)
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 	launcher := writeCodegraphHelper(t, dir)
 	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
@@ -754,9 +914,88 @@ api_key_env = "REASONIX_TEST_KEY_UNSET"
 	}
 }
 
+func TestBuildWarmCodegraphIgnoresLegacyEagerTier(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fake launcher is a POSIX-sh script")
+	}
+	isolateConfigHome(t)
+	dir := robustTempDir(t)
+	t.Chdir(dir)
+	if err := os.Mkdir(filepath.Join(dir, ".codegraph"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	launcher := filepath.Join(dir, "slow-codegraph")
+	writeFile(t, dir, "slow-codegraph", "#!/bin/sh\nif [ \"$1\" = serve ]; then sleep 5; fi\n")
+	if err := os.Chmod(launcher, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	writeFile(t, dir, "reasonix.toml", fmt.Sprintf(`
+default_model = "test-model"
+
+[codegraph]
+enabled = true
+path = %q
+tier = "eager"
+
+[agent]
+system_prompt = "BASE"
+
+[[providers]]
+name = "test-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`, launcher))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	ctrl, err := Build(ctx, Options{})
+	if err != nil {
+		t.Fatalf("Build should not block on warm codegraph with legacy eager tier: %v", err)
+	}
+	defer ctrl.Close()
+}
+
+func TestBuildDefaultsToNearestGitRoot(t *testing.T) {
+	isolateConfigHome(t)
+	root := robustTempDir(t)
+	if err := os.Mkdir(filepath.Join(root, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	subdir := filepath.Join(root, "cmd", "tool")
+	if err := os.MkdirAll(subdir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, root, "reasonix.toml", `
+default_model = "root-model"
+
+[codegraph]
+enabled = false
+
+[agent]
+system_prompt = "BASE"
+
+[[providers]]
+name = "root-model"
+kind = "openai"
+base_url = "https://example.invalid"
+model = "x"
+api_key_env = "REASONIX_TEST_KEY_UNSET"
+`)
+	t.Chdir(subdir)
+
+	ctrl, err := Build(context.Background(), Options{Model: "root-model"})
+	if err != nil {
+		t.Fatalf("Build should load config from nearest git root: %v", err)
+	}
+	defer ctrl.Close()
+}
+
 func TestBuildMigratesLegacyEagerBeforeStatsDemotion(t *testing.T) {
 	isolateConfigHome(t)
-	dir := t.TempDir()
+	dir := robustTempDir(t)
 	t.Chdir(dir)
 
 	// Three samples above 2*budget — the rule in stats.go's Recommend triggers

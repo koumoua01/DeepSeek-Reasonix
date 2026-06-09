@@ -204,6 +204,17 @@ func TestUpsertProvider(t *testing.T) {
 		t.Errorf("replace didn't apply: %+v", got)
 	}
 
+	// Multi-model providers may omit the back-compat single model field.
+	if err := c.UpsertProvider(ProviderEntry{
+		Name:    "multi",
+		Kind:    "openai",
+		BaseURL: "http://localhost:8888/v1",
+		Models:  []string{"m1", "m2"},
+		Default: "m1",
+	}); err != nil {
+		t.Fatalf("multi-model add: %v", err)
+	}
+
 	// Missing required fields error.
 	for _, bad := range []ProviderEntry{
 		{Kind: "openai", BaseURL: "u", Model: "m"}, // no name
@@ -264,18 +275,21 @@ func TestNormalizeEffortDeepSeek(t *testing.T) {
 	}
 }
 
-func TestNormalizeLegacyEffortMigratesOff(t *testing.T) {
+func TestNormalizeLegacyEffortMigratesProviderDefaults(t *testing.T) {
 	c := &Config{Providers: []ProviderEntry{
 		{Name: "deepseek", Effort: "off"},
 		{Name: "deepseek-upper", Effort: "OFF"},
+		{Name: "deepseek-auto", Effort: "auto"},
+		{Name: "deepseek-auto-upper", Effort: "AUTO"},
 		{Name: "keep", Effort: "high"},
 	}}
 	normalizeLegacyEffort(c)
-	if c.Providers[0].Effort != "" || c.Providers[1].Effort != "" {
-		t.Fatalf("legacy off should migrate to empty, got %q/%q", c.Providers[0].Effort, c.Providers[1].Effort)
+	normalizeEffortConfig(c)
+	if c.Providers[0].Effort != "" || c.Providers[1].Effort != "" || c.Providers[2].Effort != "" || c.Providers[3].Effort != "" {
+		t.Fatalf("provider default efforts should migrate to empty, got %q/%q/%q/%q", c.Providers[0].Effort, c.Providers[1].Effort, c.Providers[2].Effort, c.Providers[3].Effort)
 	}
-	if c.Providers[2].Effort != "high" {
-		t.Fatalf("non-legacy effort changed: %q", c.Providers[2].Effort)
+	if c.Providers[4].Effort != "high" {
+		t.Fatalf("non-legacy effort changed: %q", c.Providers[4].Effort)
 	}
 }
 
@@ -322,7 +336,10 @@ func TestRemoveProvider(t *testing.T) {
 	c := Default()
 	c.Agent.PlannerModel = "deepseek-pro"
 
-	// Cannot remove the default model.
+	// Cannot remove the default model when no configured fallback is available.
+	for i := range c.Providers {
+		c.Providers[i].APIKeyEnv = ""
+	}
 	if err := c.RemoveProvider(c.DefaultModel); err == nil {
 		t.Error("expected error removing the default model")
 	}
@@ -352,11 +369,11 @@ func TestPermissionMutators(t *testing.T) {
 		t.Error("expected error for bad mode")
 	}
 
-	if err := c.AddPermissionRule("deny", "bash(rm -rf*)"); err != nil {
+	if err := c.AddPermissionRule("deny", "Bash(rm -rf*)"); err != nil {
 		t.Fatalf("add deny: %v", err)
 	}
 	// Duplicate is a no-op, not an error or a second entry.
-	if err := c.AddPermissionRule("deny", "bash(rm -rf*)"); err != nil {
+	if err := c.AddPermissionRule("deny", "Bash(rm -rf*)"); err != nil {
 		t.Fatalf("dup add: %v", err)
 	}
 	if len(c.Permissions.Deny) != 1 {
@@ -370,7 +387,7 @@ func TestPermissionMutators(t *testing.T) {
 		t.Error("expected error for unknown list")
 	}
 
-	removed, err := c.RemovePermissionRule("deny", "bash(rm -rf*)")
+	removed, err := c.RemovePermissionRule("deny", "Bash(rm -rf*)")
 	if err != nil || !removed {
 		t.Errorf("remove: removed=%v err=%v", removed, err)
 	}
@@ -382,8 +399,14 @@ func TestPermissionMutators(t *testing.T) {
 func TestSkillPathMutators(t *testing.T) {
 	c := Default()
 	root := t.TempDir()
+	if err := c.ExcludeSkillPath(root); err != nil {
+		t.Fatalf("exclude skill path: %v", err)
+	}
 	if err := c.AddSkillPath(root); err != nil {
 		t.Fatalf("add skill path: %v", err)
+	}
+	if len(c.Skills.ExcludedPaths) != 0 {
+		t.Fatalf("add skill path should restore excluded path, got %v", c.Skills.ExcludedPaths)
 	}
 	if err := c.AddSkillPath(filepath.Join(root, ".")); err != nil {
 		t.Fatalf("duplicate skill path: %v", err)
@@ -403,6 +426,27 @@ func TestSkillPathMutators(t *testing.T) {
 	}
 	if removed, err := c.RemoveSkillPath(root); err != nil || removed {
 		t.Fatalf("remove absent: removed=%v err=%v", removed, err)
+	}
+	if err := c.ExcludeSkillPath(filepath.Join(root, ".")); err != nil {
+		t.Fatalf("exclude skill path: %v", err)
+	}
+	if err := c.ExcludeSkillPath(root); err != nil {
+		t.Fatalf("duplicate exclude skill path: %v", err)
+	}
+	if len(c.Skills.ExcludedPaths) != 1 {
+		t.Fatalf("excluded paths = %v, want one deduped entry", c.Skills.ExcludedPaths)
+	}
+	if err := c.ExcludeSkillPath(" "); err == nil {
+		t.Fatal("empty excluded skill path should error")
+	}
+	if err := c.RestoreSkillPath(root); err != nil {
+		t.Fatalf("restore skill path: %v", err)
+	}
+	if len(c.Skills.ExcludedPaths) != 0 {
+		t.Fatalf("excluded paths after restore = %v, want empty", c.Skills.ExcludedPaths)
+	}
+	if err := c.RestoreSkillPath(" "); err == nil {
+		t.Fatal("empty restored skill path should error")
 	}
 }
 
@@ -495,7 +539,7 @@ func TestCodegraphDefaultEnabledForUpgrades(t *testing.T) {
 		t.Fatal("default codegraph auto_install = false, want true")
 	}
 	if c.Codegraph.Tier != "" {
-		t.Fatalf("default codegraph tier = %q, want unset (boot then preserves warm→eager/cold→background)", c.Codegraph.Tier)
+		t.Fatalf("default codegraph tier = %q, want unset (background by default)", c.Codegraph.Tier)
 	}
 }
 
@@ -603,7 +647,7 @@ func TestSaveToRoundTrips(t *testing.T) {
 	if err := c.SetPermissionMode("deny"); err != nil {
 		t.Fatal(err)
 	}
-	if err := c.AddPermissionRule("allow", "bash(go test*)"); err != nil {
+	if err := c.AddPermissionRule("allow", "Bash(go test:*)"); err != nil {
 		t.Fatal(err)
 	}
 	if err := c.SetNetwork(NetworkConfig{
@@ -642,7 +686,7 @@ func TestSaveToRoundTrips(t *testing.T) {
 	if got.Permissions.Mode != "deny" {
 		t.Errorf("mode = %q", got.Permissions.Mode)
 	}
-	if len(got.Permissions.Allow) != 1 || got.Permissions.Allow[0] != "bash(go test*)" {
+	if len(got.Permissions.Allow) != 1 || got.Permissions.Allow[0] != "Bash(go test:*)" {
 		t.Errorf("allow list = %v", got.Permissions.Allow)
 	}
 	if got.Network.ProxyMode != "custom" || got.Network.Proxy.Server != "127.0.0.1" || got.Network.Proxy.Port != 7890 {
@@ -721,6 +765,77 @@ func TestEffortCapabilityCustomSupportedEfforts(t *testing.T) {
 	}
 }
 
+func TestEffortCapabilityUsesKnownModelRegistry(t *testing.T) {
+	e := &ProviderEntry{
+		Name:    "deepseek-proxy",
+		Kind:    "openai",
+		BaseURL: "https://proxy.example.com/v1",
+		Model:   "deepseek-v4-flash",
+	}
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported {
+		t.Fatalf("deepseek model behind proxy should expose effort, got %+v", cap)
+	}
+	wantLevels := []string{"auto", "high", "max"}
+	if len(cap.Levels) != len(wantLevels) {
+		t.Fatalf("levels = %v, want %v", cap.Levels, wantLevels)
+	}
+	for i, want := range wantLevels {
+		if cap.Levels[i] != want {
+			t.Fatalf("levels[%d] = %q, want %q", i, cap.Levels[i], want)
+		}
+	}
+	if cap.Default != "high" {
+		t.Fatalf("default = %q, want high", cap.Default)
+	}
+	if protocol := ReasoningProtocolForEntry(e); protocol != ReasoningProtocolDeepSeek {
+		t.Fatalf("protocol = %q, want deepseek", protocol)
+	}
+	if got, err := NormalizeEffort(e, "max"); err != nil || got != "max" {
+		t.Fatalf("NormalizeEffort(max) = %q/%v, want max/nil", got, err)
+	}
+}
+
+func TestReasoningProtocolOverrideControlsEffortCapability(t *testing.T) {
+	e := &ProviderEntry{
+		Name:              "deepseek-proxy",
+		Kind:              "openai",
+		BaseURL:           "https://proxy.example.com/v1",
+		Model:             "deepseek-v4-flash",
+		ReasoningProtocol: "none",
+	}
+	if cap := EffortCapabilityForEntry(e); cap.Supported {
+		t.Fatalf("reasoning_protocol=none should disable effort, got %+v", cap)
+	}
+	if protocol := ReasoningProtocolForEntry(e); protocol != ReasoningProtocolNone {
+		t.Fatalf("protocol = %q, want none", protocol)
+	}
+	if _, err := NormalizeEffort(e, "max"); err == nil {
+		t.Fatal("NormalizeEffort should reject effort when reasoning_protocol=none")
+	}
+
+	e.ReasoningProtocol = "openai"
+	cap := EffortCapabilityForEntry(e)
+	if !cap.Supported {
+		t.Fatalf("reasoning_protocol=openai should expose OpenAI effort levels, got %+v", cap)
+	}
+	wantLevels := []string{"auto", "low", "medium", "high"}
+	if len(cap.Levels) != len(wantLevels) {
+		t.Fatalf("levels = %v, want %v", cap.Levels, wantLevels)
+	}
+	for i, want := range wantLevels {
+		if cap.Levels[i] != want {
+			t.Fatalf("levels[%d] = %q, want %q", i, cap.Levels[i], want)
+		}
+	}
+	if _, err := NormalizeEffort(e, "max"); err == nil {
+		t.Fatal("OpenAI reasoning_protocol should reject max")
+	}
+	if got, err := NormalizeEffort(e, "medium"); err != nil || got != "medium" {
+		t.Fatalf("NormalizeEffort(medium) = %q/%v, want medium/nil", got, err)
+	}
+}
+
 func TestNormalizeEffortCustomSupportedEfforts(t *testing.T) {
 	e := &ProviderEntry{
 		Name:             "custom",
@@ -763,6 +878,10 @@ func TestNormalizeEffortCustomDefaultEffort(t *testing.T) {
 	if got, err := NormalizeEffort(e, "auto"); err != nil || got != "" {
 		t.Fatalf("NormalizeEffort(auto) = %q/%v, want empty/nil", got, err)
 	}
+	e.Effort = "auto"
+	if got := EffectiveEffort(e); got != "low" {
+		t.Fatalf("stored auto should fall through to default_effort, got %q", got)
+	}
 	e.Effort = "high"
 	if got := EffectiveEffort(e); got != "high" {
 		t.Fatalf("explicit effort should win over default_effort, got %q", got)
@@ -802,19 +921,23 @@ func TestNormalizeEffortCustomLevelsCaseInsensitive(t *testing.T) {
 func TestUpsertProviderNormalizesCustomEffortFields(t *testing.T) {
 	c := &Config{}
 	if err := c.UpsertProvider(ProviderEntry{
-		Name:             "custom",
-		Kind:             "openai",
-		BaseURL:          "https://example.com",
-		Model:            "m",
-		Effort:           " HIGH ",
-		SupportedEfforts: []string{"Low", "MEDIUM", "medium", "auto"},
-		DefaultEffort:    " LOW ",
+		Name:              "custom",
+		Kind:              "openai",
+		BaseURL:           "https://example.com",
+		Model:             "m",
+		Effort:            " HIGH ",
+		ReasoningProtocol: " OPENAI ",
+		SupportedEfforts:  []string{"Low", "MEDIUM", "medium", "auto"},
+		DefaultEffort:     " LOW ",
 	}); err != nil {
 		t.Fatalf("UpsertProvider: %v", err)
 	}
 	got, _ := c.Provider("custom")
 	if got.Effort != "high" || got.DefaultEffort != "low" {
 		t.Fatalf("effort/default = %q/%q, want high/low", got.Effort, got.DefaultEffort)
+	}
+	if got.ReasoningProtocol != "openai" {
+		t.Fatalf("reasoning_protocol = %q, want openai", got.ReasoningProtocol)
 	}
 	wantSupported := []string{"low", "medium"}
 	if len(got.SupportedEfforts) != len(wantSupported) {

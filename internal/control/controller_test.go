@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"reasonix/internal/agent"
 	"reasonix/internal/checkpoint"
 	"reasonix/internal/event"
+	"reasonix/internal/permission"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
 	"reasonix/internal/tool"
@@ -26,6 +28,15 @@ type appendingRunner struct {
 
 func (r appendingRunner) Run(_ context.Context, input string) error {
 	r.session.Add(provider.Message{Role: provider.RoleUser, Content: input})
+	return nil
+}
+
+type handoffRunner struct {
+	session *agent.Session
+}
+
+func (r handoffRunner) Run(_ context.Context, input string) error {
+	r.session.Add(provider.Message{Role: provider.RoleUser, Content: "handoff: " + input})
 	return nil
 }
 
@@ -74,6 +85,28 @@ func TestRunTurnSnapshotsActivityWhenTranscriptChanges(t *testing.T) {
 	}
 	if meta.UpdatedAt.IsZero() {
 		t.Fatal("activity meta should be marked")
+	}
+}
+
+func TestRunTurnRecordsDisplayForPersistedUserMessage(t *testing.T) {
+	sess := agent.NewSession("sys")
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{Runner: handoffRunner{session: sess}, Executor: exec})
+	var gotContent, gotDisplay string
+	c.SetDisplayRecorder(func(content, display string) {
+		gotContent = content
+		gotDisplay = display
+	})
+
+	if err := c.runTurnWithRawDisplay(context.Background(), "expanded prompt", "raw prompt", "visible prompt"); err != nil {
+		t.Fatal(err)
+	}
+
+	if gotContent != "handoff: expanded prompt" {
+		t.Fatalf("display recorded against %q, want persisted user message", gotContent)
+	}
+	if gotDisplay != "visible prompt" {
+		t.Fatalf("display = %q, want visible prompt", gotDisplay)
 	}
 }
 
@@ -134,6 +167,35 @@ func TestSnapshotActivityRefreshesSessionActivity(t *testing.T) {
 	}
 	if !second.UpdatedAt.After(first.UpdatedAt) {
 		t.Fatalf("SnapshotActivity did not refresh activity: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
+func TestSubmitClearAliasStartsFreshContextAndSavesTranscript(t *testing.T) {
+	dir := t.TempDir()
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "old context"})
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	path := filepath.Join(dir, "session.jsonl")
+	c := New(Options{Executor: exec, SystemPrompt: "sys", SessionDir: dir, SessionPath: path, Label: "test"})
+
+	c.submit("/clear", "")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) && c.SessionPath() == path {
+		time.Sleep(time.Millisecond)
+	}
+	if c.SessionPath() == path {
+		t.Fatal("/clear did not rotate to a fresh session path")
+	}
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(loaded.Messages) != 2 || loaded.Messages[1].Content != "old context" {
+		t.Fatalf("previous transcript was not saved: %+v", loaded.Messages)
+	}
+	current := exec.Session().Snapshot()
+	if len(current) != 1 || current[0].Role != provider.RoleSystem || current[0].Content != "sys" {
+		t.Fatalf("fresh context = %+v, want only system prompt", current)
 	}
 }
 
@@ -218,23 +280,120 @@ func TestApprovalDeny(t *testing.T) {
 	}
 }
 
-// TestApprovalSessionGrant proves an "allow this session" answer short-circuits
-// later prompts for the same tool+subject: only the first reaches the frontend.
-func TestApprovalSessionGrant(t *testing.T) {
+// TestApprovalSessionGrantScopesBashToCommand proves an "allow this session"
+// answer short-circuits later prompts for the same bash command, but a different
+// command still reaches the frontend.
+func TestApprovalSessionGrantScopesBashToCommand(t *testing.T) {
 	c, ids, prompts := approvalIDs()
-	// Only the first call reaches the frontend (the session grant short-circuits
-	// the rest), so a single approval is all this needs — ranging would block on
-	// a second ID that never arrives.
+	go func() {
+		c.Approve(<-ids, true, true, false) // grant go build for this session
+		c.Approve(<-ids, true, false, false)
+	}()
+
+	for i, subject := range []string{"go build", "go build", "go test ./..."} {
+		allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", subject, nil)
+		if err != nil || !allow {
+			t.Fatalf("call %d = (%v,%v), want allow", i, allow, err)
+		}
+	}
+	if *prompts != 2 {
+		t.Errorf("prompted %d times, want 2 (same command granted, different command prompts)", *prompts)
+	}
+}
+
+func TestApprovalSessionGrantCanScopeBashToCommandPrefix(t *testing.T) {
+	c, ids, prompts := approvalIDs()
+	go func() {
+		c.ApproveWithScope(<-ids, true, true, false, permission.ApprovalScopePrefix) // grant go test:* for this session
+		c.Approve(<-ids, true, false, false)
+	}()
+
+	for i, subject := range []string{"go test ./...", "go test ./internal/control", "go build ./..."} {
+		allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", subject, nil)
+		if err != nil || !allow {
+			t.Fatalf("call %d = (%v,%v), want allow", i, allow, err)
+		}
+	}
+	if *prompts != 2 {
+		t.Errorf("prompted %d times, want 2 (prefix grant should cover similar command only)", *prompts)
+	}
+}
+
+func TestApprovalPersistentBashPrefixRememberRule(t *testing.T) {
+	ids := make(chan string, 1)
+	var remembered string
+	var notices []string
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				ids <- e.Approval.ID
+			}
+			if e.Kind == event.Notice {
+				notices = append(notices, e.Text)
+			}
+		}),
+		OnRemember: func(rule string) RememberResult {
+			remembered = rule
+			return RememberResult{Rule: rule, Path: "reasonix.toml", Saved: true}
+		},
+	})
+	go func() {
+		c.ApproveWithScope(<-ids, true, true, true, permission.ApprovalScopePrefix)
+	}()
+
+	allow, remember, err := gateApprover{c}.Approve(context.Background(), "bash", "go test ./...", nil)
+	if err != nil || !allow || remember {
+		t.Fatalf("Approve = (%v,%v,%v), want allow with controller-managed persistence", allow, remember, err)
+	}
+	if remembered != "Bash(go test:*)" {
+		t.Fatalf("remembered rule = %q, want Bash(go test:*)", remembered)
+	}
+	if len(notices) != 1 || !strings.Contains(notices[0], "Bash(go test:*)") || !strings.Contains(notices[0], "reasonix.toml") {
+		t.Fatalf("notices = %v, want saved rule notice", notices)
+	}
+}
+
+func TestApprovalSessionGrantGroupsFileMutationTools(t *testing.T) {
+	c, ids, prompts := approvalIDs()
 	go func() { c.Approve(<-ids, true, true, false) }()
 
-	for i := 0; i < 3; i++ {
-		allow, _, err := gateApprover{c}.Approve(context.Background(), "bash", "go build", nil)
+	for i, call := range []struct {
+		tool    string
+		subject string
+	}{
+		{"edit_file", "src/a.go"},
+		{"write_file", "src/b.go"},
+		{"multi_edit", "src/c.go"},
+	} {
+		allow, _, err := gateApprover{c}.Approve(context.Background(), call.tool, call.subject, nil)
 		if err != nil || !allow {
 			t.Fatalf("call %d = (%v,%v), want allow", i, allow, err)
 		}
 	}
 	if *prompts != 1 {
-		t.Errorf("prompted %d times, want 1 (session grant should short-circuit)", *prompts)
+		t.Errorf("prompted %d times, want 1 (file mutation session grant should short-circuit)", *prompts)
+	}
+}
+
+func TestApprovalSessionGrantKeepsPolicyDenyPrecedence(t *testing.T) {
+	c, ids, prompts := approvalIDs()
+	g := permission.NewGate(permission.New("ask", nil, nil, []string{"bash(rm*)"}), gateApprover{c})
+	go func() { c.Approve(<-ids, true, true, false) }()
+
+	allow, _, err := g.Check(context.Background(), "bash", json.RawMessage(`{"command":"go build"}`), false)
+	if err != nil || !allow {
+		t.Fatalf("first approved call = (%v,%v), want allow", allow, err)
+	}
+	allow, _, err = g.Check(context.Background(), "bash", json.RawMessage(`{"command":"go build"}`), false)
+	if err != nil || !allow {
+		t.Fatalf("same-command call after session grant = (%v,%v), want allow", allow, err)
+	}
+	allow, reason, err := g.Check(context.Background(), "bash", json.RawMessage(`{"command":"rm -rf /tmp/x"}`), false)
+	if err != nil || allow || reason == "" {
+		t.Fatalf("deny-listed call = (%v,%q,%v), want blocked with reason", allow, reason, err)
+	}
+	if *prompts != 1 {
+		t.Errorf("prompted %d times, want 1", *prompts)
 	}
 }
 

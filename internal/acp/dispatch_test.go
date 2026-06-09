@@ -7,17 +7,20 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"reasonix/internal/event"
+	"reasonix/internal/permission"
 )
 
 // fakeNotifier captures Notify calls and answers Request via an injectable hook,
 // standing in for *Conn in adapter unit tests.
 type fakeNotifier struct {
-	mu      sync.Mutex
-	notifs  []capturedNotif
-	onReq   func(method string, params any) (json.RawMessage, error)
-	reqSeen []capturedNotif
+	mu       sync.Mutex
+	notifs   []capturedNotif
+	onReq    func(method string, params any) (json.RawMessage, error)
+	onReqCtx func(ctx context.Context, method string, params any) (json.RawMessage, error)
+	reqSeen  []capturedNotif
 }
 
 type capturedNotif struct {
@@ -32,10 +35,13 @@ func (f *fakeNotifier) Notify(method string, params any) error {
 	return nil
 }
 
-func (f *fakeNotifier) Request(_ context.Context, method string, params any) (json.RawMessage, error) {
+func (f *fakeNotifier) Request(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	f.mu.Lock()
 	f.reqSeen = append(f.reqSeen, capturedNotif{method, params})
 	f.mu.Unlock()
+	if f.onReqCtx != nil {
+		return f.onReqCtx(ctx, method, params)
+	}
 	if f.onReq != nil {
 		return f.onReq(method, params)
 	}
@@ -224,6 +230,59 @@ func TestUpdateSinkApprovalAllowAlways(t *testing.T) {
 	}
 }
 
+func TestUpdateSinkApprovalBashPrefix(t *testing.T) {
+	fn := &fakeNotifier{onReq: func(_ string, params any) (json.RawMessage, error) {
+		raw, _ := json.Marshal(params)
+		var p PermissionRequestParams
+		if err := json.Unmarshal(raw, &p); err != nil {
+			t.Fatalf("permission params: %v", err)
+		}
+		var hasExactSession, hasPrefix, hasPersistPrefix bool
+		for _, opt := range p.Options {
+			hasExactSession = hasExactSession || opt.OptionID == string(OptAllowAlways)
+			hasPrefix = hasPrefix || opt.OptionID == string(OptAllowPrefix)
+			hasPersistPrefix = hasPersistPrefix || opt.OptionID == string(OptPersistPrefix)
+		}
+		if hasExactSession {
+			t.Fatalf("options = %+v, exact bash session choice should be omitted when a prefix is available", p.Options)
+		}
+		if !hasPrefix || !hasPersistPrefix {
+			t.Fatalf("options = %+v, want bash prefix choices", p.Options)
+		}
+		if len(p.Options) != 4 {
+			t.Fatalf("options = %+v, want allow once, prefix session, prefix persistent, reject", p.Options)
+		}
+		res, _ := json.Marshal(PermissionRequestResult{
+			Outcome: PermissionOutcome{Outcome: "selected", OptionID: string(OptPersistPrefix)},
+		})
+		return res, nil
+	}}
+	sink := newUpdateSink(fn, "sess-1")
+	type scopedApproveCall struct {
+		id      string
+		allow   bool
+		session bool
+		persist bool
+		scope   string
+	}
+	got := make(chan scopedApproveCall, 1)
+	sink.bindApproveWithScope(func(id string, allow, session, persist bool, scope string) {
+		got <- scopedApproveCall{id, allow, session, persist, scope}
+	})
+
+	sink.Emit(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "10", Tool: "bash", Subject: "go test ./..."}})
+
+	select {
+	case c := <-got:
+		want := scopedApproveCall{id: "10", allow: true, session: true, persist: true, scope: permission.ApprovalScopePrefix}
+		if c != want {
+			t.Errorf("approve = %+v, want %+v", c, want)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("approve was never called")
+	}
+}
+
 func TestUpdateSinkApprovalDenied(t *testing.T) {
 	// Both a "cancelled" outcome and a transport error must deny the call.
 	for _, tc := range []struct {
@@ -255,6 +314,48 @@ func TestUpdateSinkApprovalDenied(t *testing.T) {
 				t.Fatal("approve was never called")
 			}
 		})
+	}
+}
+
+func TestUpdateSinkApprovalUsesTurnContext(t *testing.T) {
+	reqStarted := make(chan struct{})
+	fn := &fakeNotifier{onReqCtx: func(ctx context.Context, _ string, _ any) (json.RawMessage, error) {
+		close(reqStarted)
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}}
+	sink := newUpdateSink(fn, "sess-1")
+	turnCtx, cancel := context.WithCancel(context.Background())
+	sink.setTurnContext(turnCtx)
+	got := make(chan approveCall, 1)
+	sink.bindApprove(func(id string, allow, session, persist bool) { got <- approveCall{id, allow, session, persist} })
+
+	sink.Emit(event.Event{Kind: event.ApprovalRequest, Approval: event.Approval{ID: "7", Tool: "bash"}})
+	select {
+	case <-reqStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("permission request did not start")
+	}
+	cancel()
+
+	select {
+	case c := <-got:
+		if c.id != "7" || c.allow || c.session || c.persist {
+			t.Fatalf("approve after context cancel = %+v, want denied id=7", c)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("turn context cancellation did not deny permission request")
+	}
+}
+
+func TestClipKeepsValidUTF8(t *testing.T) {
+	text := strings.Repeat("a", maxResultChars-1) + "界" + strings.Repeat("b", 20)
+	got := clip(text)
+	if !utf8.ValidString(got) {
+		t.Fatalf("clip returned invalid UTF-8")
+	}
+	if strings.Contains(got, "\ufffd") {
+		t.Fatalf("clip inserted replacement characters: %q", got[len(got)-40:])
 	}
 }
 

@@ -2,16 +2,15 @@ import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } f
 import type { CSSProperties, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
 import { ShellExpandProvider, useShellExpand } from "./lib/shellExpand";
 import {
+  Download,
   SquarePen,
-  Brain,
-  Blocks,
   CircleGauge,
   FileText,
+  FileJson,
   GitBranch,
   History,
   Settings as SettingsIcon,
   Pencil,
-  MoreHorizontal,
   PanelLeftClose,
   PanelLeftOpen,
   PanelRightClose,
@@ -19,9 +18,10 @@ import {
   Trash2,
 } from "lucide-react";
 import logoWordmark from "./assets/logo-wordmark.svg";
+import { useToast } from "./lib/toast";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT } from "./lib/i18n";
-import { useController } from "./lib/useController";
+import { useController, type Item, type LiveStream } from "./lib/useController";
 import { app, onProjectTreeChanged } from "./lib/bridge";
 import { Transcript } from "./components/Transcript";
 import { Composer } from "./components/Composer";
@@ -29,20 +29,21 @@ import { TodoPanel } from "./components/TodoPanel";
 import { ApprovalModal } from "./components/ApprovalModal";
 import { AskCard } from "./components/AskCard";
 import { StatusBar } from "./components/StatusBar";
-import { MemoryPanel } from "./components/MemoryPanel";
 import { HistoryPanel } from "./components/HistoryPanel";
 import { SettingsPanel } from "./components/SettingsPanel";
-import { CapabilitiesPanel } from "./components/CapabilitiesPanel";
 import { UpdateBanner } from "./components/UpdateBanner";
 import { ContextPanel } from "./components/ContextPanel";
 import { WorkspacePanel } from "./components/WorkspacePanel";
 import { Tooltip } from "./components/Tooltip";
+import { StartupSplash, shouldShowStartupSplash } from "./components/StartupSplash";
 import { OnboardingOverlay } from "./components/OnboardingOverlay";
 import { TabBar } from "./components/TabBar";
 import { ProjectTree } from "./components/ProjectTree";
+import { CopyButton } from "./components/CopyButton";
+import { CommandPalette, type PaletteItem } from "./components/CommandPalette";
 import { parseTodos } from "./lib/tools";
 import { shouldShowTodoPanel } from "./lib/todoVisibility";
-import type { ComposerInsertRequest, MemoryView, Meta, Mode, SessionMeta, TabMeta } from "./lib/types";
+import type { ComposerInsertRequest, Meta, Mode, SessionMeta, SettingsTab, TabMeta } from "./lib/types";
 import { loadLayoutSize, saveLayoutSize } from "./lib/layoutPreferences";
 import {
   applyTheme,
@@ -56,6 +57,7 @@ import {
   themeForStyle,
   type Theme,
 } from "./lib/theme";
+import { applyTextSize, DEFAULT_TEXT_SIZE, getTextSize, nextTextSize } from "./lib/textSize";
 import { useWindowStatePersistence } from "./lib/windowState";
 
 const SIDEBAR_COLLAPSED_KEY = "reasonix.sidebar.collapsed";
@@ -82,6 +84,7 @@ const RIGHT_DOCK_MAX_WIDTH = 860;
 type RightDockMode = "context" | "files" | "changed";
 const SHOW_CONTEXT_DOCK = false;
 type HistoryScopeFilter = { scope: "global" | "project"; workspaceRoot: string };
+type DesktopPlatform = "darwin" | "windows" | "linux";
 type HistoryViewState =
   | { kind: "history"; source: "scope"; filter: HistoryScopeFilter; sessions: SessionMeta[] }
   | { kind: "history"; source: "all"; sessions: SessionMeta[] }
@@ -150,6 +153,28 @@ function saveSidebarWidth(width: number): void {
   saveLayoutSize("sidebarWidth", width, clampSidebarWidth);
 }
 
+function normalizeDesktopPlatform(value: string): DesktopPlatform {
+  if (value === "darwin" || value === "windows") return value;
+  return "linux";
+}
+
+function browserPlatformOverride(): DesktopPlatform | null {
+  if (typeof window === "undefined" || window.runtime) return null;
+  const value = new URLSearchParams(window.location.search).get("platform");
+  if (value === "darwin" || value === "windows" || value === "linux") return value;
+  return null;
+}
+
+function detectBrowserPlatform(): DesktopPlatform {
+  const override = browserPlatformOverride();
+  if (override) return override;
+  if (typeof navigator === "undefined") return "linux";
+  const marker = `${navigator.platform} ${navigator.userAgent}`;
+  if (/Win/i.test(marker)) return "windows";
+  if (/Mac/i.test(marker)) return "darwin";
+  return "linux";
+}
+
 function loadRightDockTreeWidth(): number {
   return loadLayoutSize("rightDockTreeWidth", defaultRightDockTreeWidth(), clampRightDockTreeWidth);
 }
@@ -208,6 +233,95 @@ function workspaceDisplayName(path?: string): string {
   return parts.length > 0 ? parts[parts.length - 1] : path;
 }
 
+function materializeLiveItems(items: Item[], live?: LiveStream): Item[] {
+  if (!live) return items;
+  return items.map((item) => {
+    if (item.kind !== "assistant" || item.id !== live.id) return item;
+    return { ...item, text: live.text, reasoning: live.reasoning, streaming: true };
+  });
+}
+
+function fence(label: string, value: string): string {
+  if (!value.trim()) return "";
+  const fenceToken = value.includes("```") ? "````" : "```";
+  return `${label}\n${fenceToken}\n${value.trim()}\n${fenceToken}`;
+}
+
+function sessionItemsToMarkdown(title: string, items: Item[], live?: LiveStream): string {
+  const lines: string[] = [`# ${title.trim() || "Reasonix session"}`, ""];
+  for (const item of materializeLiveItems(items, live)) {
+    switch (item.kind) {
+      case "user":
+        lines.push("## User", "", item.text.trim(), "");
+        break;
+      case "assistant":
+        lines.push("## Assistant");
+        if (item.reasoning.trim()) {
+          lines.push("", "### Reasoning", "", item.reasoning.trim());
+        }
+        if (item.text.trim()) {
+          lines.push("", item.text.trim());
+        }
+        lines.push("");
+        break;
+      case "tool":
+        lines.push(`### Tool: ${item.name}`);
+        if (item.args.trim()) lines.push("", fence("Args", item.args));
+        if (item.output?.trim()) lines.push("", fence("Output", item.output));
+        if (item.error?.trim()) lines.push("", fence("Error", item.error));
+        lines.push("");
+        break;
+      case "phase":
+        lines.push(`### Phase`, "", item.text.trim(), "");
+        break;
+      case "notice":
+        lines.push(`### ${item.level === "warn" ? "Warning" : "Notice"}`, "", item.text.trim(), "");
+        break;
+      case "compaction":
+        lines.push("### Context Compaction", "");
+        if (item.pending) {
+          lines.push("Compaction pending.");
+        } else {
+          lines.push(`Messages: ${item.messages}`);
+          if (item.trigger) lines.push(`Trigger: ${item.trigger}`);
+          if (item.summary.trim()) lines.push("", item.summary.trim());
+        }
+        lines.push("");
+        break;
+    }
+  }
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trimEnd() + "\n";
+}
+
+function sessionItemsToJson(title: string, items: Item[], live?: LiveStream): string {
+  return JSON.stringify(
+    {
+      title,
+      exportedAt: new Date().toISOString(),
+      items: materializeLiveItems(items, live),
+    },
+    null,
+    2,
+  );
+}
+
+function safeFilename(name: string): string {
+  const cleaned = name.trim().replace(/[\\/:*?"<>|]+/g, "-").replace(/\s+/g, " ").slice(0, 80);
+  return cleaned || "reasonix-session";
+}
+
+function downloadTextFile(filename: string, text: string, mime: string): void {
+  const blob = new Blob([text], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 
 /** Global hotkey handler for shell-expand toggle (Ctrl/Cmd+B). */
 function ShellHotkeys() {
@@ -223,6 +337,26 @@ function ShellHotkeys() {
     document.addEventListener("keydown", onKey);
     return () => document.removeEventListener("keydown", onKey);
   }, [shellExpand]);
+  return null;
+}
+
+/** Global hotkey handler for text-size shortcuts (Ctrl/Cmd + Plus/Minus/0). */
+function TextSizeHotkeys() {
+  useEffect(() => {
+    const onKey = (e: globalThis.KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key !== "+" && e.key !== "=" && e.key !== "-" && e.key !== "0") return;
+
+      e.preventDefault();
+      if (e.key === "0") {
+        applyTextSize(DEFAULT_TEXT_SIZE);
+        return;
+      }
+      applyTextSize(nextTextSize(getTextSize(), e.key === "-" ? -1 : 1));
+    };
+    document.addEventListener("keydown", onKey);
+    return () => document.removeEventListener("keydown", onKey);
+  }, []);
   return null;
 }
 
@@ -252,10 +386,6 @@ export default function App() {
     rewind,
     setModel,
     setEffort,
-    fetchMemory,
-    remember,
-    forget,
-    saveDoc,
     switchTab,
     openProjectTab,
     openGlobalTab,
@@ -269,11 +399,13 @@ export default function App() {
   const [tabMetas, setTabMetas] = useState<TabMeta[]>([]);
   const [tabOrderIds, setTabOrderIds] = useState<string[]>([]);
   const [tabRevealSignal, setTabRevealSignal] = useState(0);
+  const [startupSplashVisible, setStartupSplashVisible] = useState<boolean>(() => shouldShowStartupSplash());
   // null until the mount probe resolves; true shows the overlay. Probed once —
   // clearing the key mid-session is the Settings panel's job, not the gate's.
   const [needsOnboarding, setNeedsOnboarding] = useState<boolean | null>(null);
-  const [memView, setMemView] = useState<MemoryView | null>(null);
+  const [settingsTarget, setSettingsTarget] = useState<SettingsTab | null>(null);
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
+  const { showToast } = useToast();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
@@ -287,15 +419,37 @@ export default function App() {
   const [dockRefreshKey, setDockRefreshKey] = useState(0);
   const [projectRevision, setProjectRevision] = useState(0);
   const [composerInsertRequest, setComposerInsertRequest] = useState<ComposerInsertRequest | null>(null);
-  const [settingsOpen, setSettingsOpen] = useState(false);
-  const [capsOpen, setCapsOpen] = useState(false);
+  const [desktopPlatform, setDesktopPlatform] = useState<DesktopPlatform>(detectBrowserPlatform);
   const [renamingTopicId, setRenamingTopicId] = useState<string | null>(null);
   const [topicTitleDraft, setTopicTitleDraft] = useState("");
+  const [topicExportOpen, setTopicExportOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
   const topicRenameSkipCommitRef = useRef(false);
   const topicRenameCommitHandledRef = useRef(false);
 
   // Persist window geometry across launches.
   useWindowStatePersistence();
+
+  useEffect(() => {
+    let cancelled = false;
+    const override = browserPlatformOverride();
+    if (override) {
+      setDesktopPlatform(override);
+      return () => {
+        cancelled = true;
+      };
+    }
+    void app.Platform()
+      .then((value) => {
+        if (!cancelled) setDesktopPlatform(normalizeDesktopPlatform(value));
+      })
+      .catch((e) => {
+        console.warn("platform probe failed", e);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -326,7 +480,7 @@ export default function App() {
   useEffect(() => {
     if (typeof window === "undefined" || !window.runtime) return;
     return window.runtime.EventsOn("app:open-settings", () => {
-      setSettingsOpen(true);
+      setSettingsTarget("general");
     });
   }, []);
   const [pendingPlanRevision, setPendingPlanRevision] = useState<string | null>(null);
@@ -358,6 +512,7 @@ export default function App() {
     () => tabMetas.find((tab) => tab.id === activeTabId) ?? tabMetas.find((tab) => tab.active),
     [activeTabId, tabMetas],
   );
+  const startupSplashHold = state.meta?.ready !== true && !state.meta?.startupErr;
   const mode = activeTabId ? modesByTab[activeTabId] ?? "normal" : "normal";
   const setMode = useCallback(
     (next: Mode | ((prev: Mode) => Mode)) => {
@@ -481,45 +636,42 @@ export default function App() {
   const todos = useMemo(() => (todoItem ? parseTodos(todoItem.args) : []), [todoItem]);
   const [dismissedTodo, setDismissedTodo] = useState<string | null>(null);
   const showTodos = shouldShowTodoPanel(todoItem?.id, dismissedTodo, todos);
-  const [todoNow, setTodoNow] = useState(() => Date.now());
-  const todoSeenRef = useRef<{ id: string; at: number } | null>(null);
-
-  useEffect(() => {
-    if (!todoItem) {
-      todoSeenRef.current = null;
-      return;
-    }
-    if (todoSeenRef.current?.id !== todoItem.id) {
-      todoSeenRef.current = { id: todoItem.id, at: Date.now() };
-      setTodoNow(Date.now());
-    }
-  }, [todoItem]);
-
-  useEffect(() => {
-    if (!showTodos) return;
-    const id = window.setInterval(() => setTodoNow(Date.now()), 15000);
-    return () => window.clearInterval(id);
-  }, [showTodos]);
-
-  const todoStale = useMemo(() => {
-    if (!showTodos || !todoEntry) return false;
-    const after = state.items.slice(todoEntry.index + 1);
-    const completedToolsAfter = after.filter(
-      (it) => it.kind === "tool" && it.name !== "todo_write" && !it.parentId && (it.status === "done" || it.status === "error"),
-    ).length;
-    const finalAssistantAfter = after.some((it) => it.kind === "assistant" && !it.streaming && it.text.trim() !== "");
-    const readinessNoticeAfter = after.some(
-      (it) => it.kind === "notice" && /final-answer readiness|todo_write|complete_step/i.test(it.text),
-    );
-    const staleByTime = state.running && todoSeenRef.current?.id === todoEntry.item.id && todoNow - todoSeenRef.current.at > 90_000;
-    return completedToolsAfter >= 2 || finalAssistantAfter || readinessNoticeAfter || staleByTime;
-  }, [showTodos, state.items, state.running, todoEntry, todoNow]);
 
   // useDeferredValue lets React prioritise Composer input (high-priority) over
   // Transcript re-renders (low-priority) during streaming. When a keystroke
   // and a transcript update collide, the keystroke is processed immediately
   // and the transcript re-render is deferred to idle time.
   const deferredItems = useDeferredValue(state.items);
+  const sessionTitle = topicTitle(activeTab);
+  const sessionHasContent = state.items.length > 0 || Boolean(state.live?.text || state.live?.reasoning);
+  const getSessionMarkdown = useCallback(
+    () => sessionItemsToMarkdown(sessionTitle, state.items, state.live),
+    [sessionTitle, state.items, state.live],
+  );
+  const getSessionJson = useCallback(
+    () => sessionItemsToJson(sessionTitle, state.items, state.live),
+    [sessionTitle, state.items, state.live],
+  );
+
+  useEffect(() => {
+    if (!topicExportOpen) return;
+    const onDown = (event: MouseEvent) => {
+      const target = event.target as Element | null;
+      if (!target?.closest(".topicbar__export")) setTopicExportOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [topicExportOpen]);
+
+  const exportSession = useCallback(
+    (format: "markdown" | "json") => {
+      const base = safeFilename(sessionTitle);
+      if (format === "json") downloadTextFile(`${base}.json`, getSessionJson(), "application/json");
+      else downloadTextFile(`${base}.md`, getSessionMarkdown(), "text/markdown");
+      setTopicExportOpen(false);
+    },
+    [getSessionJson, getSessionMarkdown, sessionTitle],
+  );
 
   useEffect(() => {
     if (!pendingPlanRevision || state.running) return;
@@ -528,17 +680,9 @@ export default function App() {
     send(text);
   }, [pendingPlanRevision, send, state.running]);
 
-  // Memory drawer: opening fetches a fresh snapshot; writes re-fetch so the
-  // panel reflects what landed on disk.
-  const openMemory = useCallback(async () => {
-    setMemView(await fetchMemory());
-  }, [fetchMemory]);
-
-  const closeMemory = useCallback(() => setMemView(null), []);
-
   // handleSend intercepts the slash commands that need a desktop-native action
   // before they reach the backend: "/model <ref>" rebuilds on that model, and
-  // "/memory" opens the memory drawer. Everything else — skills (/init, …),
+  // "/memory" opens the Memory tab in the settings centre. Everything else — skills (/init, …),
   // custom commands, bare /model and the other read-only management verbs
   // (/skill, /hooks, /mcp) — goes straight to Submit, which the controller
   // resolves (a turn, or a listing Notice).
@@ -561,7 +705,7 @@ export default function App() {
         return;
       }
       if (trimmed === "/memory") {
-        void openMemory();
+        setSettingsTarget("memory");
         return;
       }
       const theme = /^\/theme(?:\s+(\S+))?$/.exec(trimmed);
@@ -593,7 +737,7 @@ export default function App() {
       await syncModeToController(mode);
       send(trimmed, submitText.trim());
     },
-    [switchModel, openMemory, syncModeToController, mode, send, runShell, notice, t],
+    [switchModel, syncModeToController, mode, send, runShell, notice, t],
   );
 
   const refreshTabMetas = useCallback(async (): Promise<TabMeta[]> => {
@@ -928,6 +1072,17 @@ export default function App() {
     setTabRevealSignal((signal) => signal + 1);
   }, [activeTab?.scope, activeTab?.workspaceRoot, openGlobalTab, openProjectTab, refreshTabMetas, state.meta?.cwd]);
 
+  // ── Command palette (⌘K) ────────────────────────────────────────────
+  useEffect(() => {
+    const onKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (!(event.metaKey || event.ctrlKey) || event.altKey || event.shiftKey || event.key.toLowerCase() !== "k") return;
+      event.preventDefault();
+      setPaletteOpen((open) => !open);
+    };
+    window.addEventListener("keydown", onKeyDown, { capture: true });
+    return () => window.removeEventListener("keydown", onKeyDown, { capture: true });
+  }, []);
+
   const handleMessageAction = useCallback(async (turn: number, scope: string) => {
     await rewind(turn, scope);
     if (scope === "fork") {
@@ -965,24 +1120,85 @@ export default function App() {
     setHistView({ kind: "trash", sessions: await listTrashedSessions() });
   }, [listTrashedSessions]);
   const closeHistory = useCallback(() => setHistView(null), []);
+
+  // ── Command palette (⌘K) item builder ───────────────────────────────
+  const buildPaletteItems = useCallback((): PaletteItem[] => {
+    const items: PaletteItem[] = [];
+
+    for (const tab of tabMetas) {
+      items.push({
+        id: `tab:${tab.id}`,
+        title: tab.topicTitle || "Untitled",
+        hint: tab.scope === "global" ? "Global" : tab.workspaceName || tab.workspaceRoot,
+        group: t("sidebar.conversations"),
+        keywords: [tab.label],
+        run: () => void handleTabChange(tab.id),
+      });
+    }
+
+    items.push(
+      {
+        id: "action:new-session",
+        title: t("topbar.newSession"),
+        group: "Actions",
+        keywords: ["new", "chat", "session"],
+        run: () => void handleNewTab(),
+      },
+      {
+        id: "action:history",
+        title: t("sidebar.allHistory"),
+        group: "Actions",
+        keywords: ["history", "sessions", "past"],
+        run: () => void openAllHistory(),
+      },
+      {
+        id: "action:settings",
+        title: t("topbar.settings"),
+        group: "Actions",
+        keywords: ["preferences", "config", "options"],
+        run: () => setSettingsTarget("general"),
+      },
+      {
+        id: "action:trash",
+        title: t("sidebar.trash"),
+        group: "Actions",
+        keywords: ["deleted", "bin"],
+        run: () => void openTrash(),
+      },
+    );
+
+    return items;
+  }, [tabMetas, handleTabChange, handleNewTab, openAllHistory, openTrash, t]);
   const onResumeSession = useCallback(
     async (session: SessionMeta) => {
       if (state.running) return;
-      setHistView(null);
       const scope = session.scope || (session.workspaceRoot ? "project" : "global");
-      let targetTab: TabMeta | undefined;
-      if (scope === "project" && session.workspaceRoot && session.topicId) {
-        targetTab = await openProjectTab(session.workspaceRoot, session.topicId);
-      } else if (scope === "global" && session.topicId) {
-        targetTab = await openGlobalTab(session.topicId);
-      }
-      await resumeSession(session.path, targetTab?.id);
-      if (targetTab) {
+      try {
+        let targetTab: TabMeta;
+        if (scope === "project" && session.workspaceRoot && session.topicId) {
+          targetTab = await openProjectTab(session.workspaceRoot, session.topicId);
+        } else if (scope === "global" && session.topicId) {
+          targetTab = await openGlobalTab(session.topicId);
+        } else {
+          throw new Error(scope === "global" && !session.topicId
+            ? t("history.failedOpenSession")
+            : (session.topicId ? "Missing workspaceRoot" : t("history.failedOpenSession")));
+        }
+        setHistView(null);
+        await resumeSession(session.path, targetTab.id);
         await refreshTabMetas();
         setTabRevealSignal((signal) => signal + 1);
+      } catch (err: any) {
+        setHistView(null);
+        if (scope === "project" && session.workspaceRoot) {
+          const name = workspaceDisplayName(session.workspaceRoot);
+          showToast(t("history.failedOpenProject", { name, path: session.workspaceRoot }));
+        } else {
+          showToast(err?.message || String(err));
+        }
       }
     },
-    [openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession],
+    [openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession, t, showToast],
   );
   // Delete / rename act on disk, then re-fetch so the panel reflects the change.
   const onDeleteSession = useCallback(
@@ -1104,32 +1320,12 @@ export default function App() {
     if (!topicId) return;
     const nextTitle = topicTitleDraft.trim();
     if (!nextTitle) return;
-    await renameTopic(topicId, nextTitle);
+    try {
+      await renameTopic(topicId, nextTitle);
+    } catch {
+      /* keep the app usable if a stale topic cannot be renamed */
+    }
   }, [renameTopic, renamingTopicId, topicTitleDraft]);
-
-  const onRemember = useCallback(
-    async (scope: string, note: string) => {
-      await remember(scope, note);
-      setMemView(await fetchMemory());
-    },
-    [remember, fetchMemory],
-  );
-
-  const onForget = useCallback(
-    async (name: string) => {
-      await forget(name);
-      setMemView(await fetchMemory());
-    },
-    [forget, fetchMemory],
-  );
-
-  const onSaveDoc = useCallback(
-    async (path: string, body: string) => {
-      await saveDoc(path, body);
-      setMemView(await fetchMemory());
-    },
-    [saveDoc, fetchMemory],
-  );
 
   const sidebarExpandBlocked = false;
   const sidebarToggleTitle = sidebarCollapsed
@@ -1146,7 +1342,8 @@ export default function App() {
   return (
     <ShellExpandProvider>
     <ShellHotkeys />
-    <div className="app">
+    <TextSizeHotkeys />
+    <div className={`app app--${desktopPlatform}`}>
       <div
         ref={layoutRef}
         className={[
@@ -1175,10 +1372,10 @@ export default function App() {
             aria-label={sidebarToggleTitle}
             aria-disabled={sidebarExpandBlocked}
           >
-            {sidebarCollapsed ? <PanelLeftOpen size={15} /> : <PanelLeftClose size={15} />}
+            {sidebarCollapsed ? <PanelLeftOpen size={16} /> : <PanelLeftClose size={16} />}
           </button>
           <div className="app-chrome__identity" aria-label="Reasonix">
-            <img src={logoWordmark} alt="" className="app-chrome__logo" />
+            <img src={logoWordmark} alt="" className="app-chrome__logo" draggable={false} />
             <span className="app-chrome__separator">/</span>
             <span className="app-chrome__scope">{appChromeScopeLabel(activeTab, state.meta)}</span>
           </div>
@@ -1234,22 +1431,10 @@ export default function App() {
                 <span>{t("sidebar.trash")}</span>
               </button>
             </Tooltip>
-            <Tooltip label={t("topbar.memory")} fill side="right" disabled={sidebarNavTooltipDisabled}>
-              <button className="sidebar__navitem" onClick={() => void openMemory()}>
-                <Brain size={15} />
-                <span>{t("topbar.memory")}</span>
-              </button>
-            </Tooltip>
-            <Tooltip label={t("caps.title")} fill side="right" disabled={sidebarNavTooltipDisabled}>
-              <button className="sidebar__navitem" onClick={() => setCapsOpen(true)}>
-                <Blocks size={15} />
-                <span>{t("caps.title")}</span>
-              </button>
-            </Tooltip>
             <Tooltip label={t("topbar.settings")} fill side="right" disabled={sidebarNavTooltipDisabled}>
               <button
                 className="sidebar__navitem"
-                onClick={() => setSettingsOpen(true)}
+                onClick={() => setSettingsTarget("general")}
               >
                 <SettingsIcon size={15} />
                 <span>{t("topbar.settings")}</span>
@@ -1350,11 +1535,39 @@ export default function App() {
             </div>
             <div className="topicbar__spacer" />
             <div className="topicbar__actions">
-              <Tooltip label={t("topicBar.more")}>
-                <button className="topicbar__icon-btn">
-                  <MoreHorizontal size={16} />
-                </button>
-              </Tooltip>
+              <CopyButton
+                getText={getSessionMarkdown}
+                label={t("topicBar.copyAll")}
+                showLabel={false}
+                className="topicbar__action-btn topicbar__action-btn--icon"
+              />
+              <div className={`topicbar__export${topicExportOpen ? " topicbar__export--open" : ""}`}>
+                <Tooltip label={t("topicBar.export")}>
+                  <button
+                    className="topicbar__action-btn topicbar__action-btn--icon"
+                    type="button"
+                    disabled={!sessionHasContent}
+                    aria-label={t("topicBar.export")}
+                    aria-haspopup="menu"
+                    aria-expanded={topicExportOpen}
+                    onClick={() => setTopicExportOpen((open) => !open)}
+                  >
+                    <Download size={14} />
+                  </button>
+                </Tooltip>
+                {topicExportOpen && (
+                  <div className="topicbar__export-menu" role="menu">
+                    <button type="button" role="menuitem" onClick={() => exportSession("markdown")}>
+                      <FileText size={13} />
+                      <span>{t("topicBar.exportMarkdown")}</span>
+                    </button>
+                    <button type="button" role="menuitem" onClick={() => exportSession("json")}>
+                      <FileJson size={13} />
+                      <span>{t("topicBar.exportJson")}</span>
+                    </button>
+                  </div>
+                )}
+              </div>
             </div>
           </header>
 
@@ -1385,15 +1598,15 @@ export default function App() {
           </main>
 
           <footer className="footer" ref={footerRef}>
-            {showTodos && <TodoPanel todos={todos} stale={todoStale} onDismiss={() => setDismissedTodo(todoItem!.id)} />}
+            {showTodos && <TodoPanel todos={todos} onDismiss={() => setDismissedTodo(todoItem!.id)} />}
             {state.approval && (
               <ApprovalModal
                 approval={state.approval}
-                onAnswer={(allow, session, persist) => {
+                onAnswer={(allow, session, persist, scope) => {
                   // Approving an exit_plan_mode plan leaves plan mode; sync the
                   // tab-local indicator and persisted safe mode immediately.
                   if (state.approval!.tool === "exit_plan_mode" && allow) applyMode("normal");
-                  approve(state.approval!.id, allow, session, persist);
+                  approve(state.approval!.id, allow, session, persist, scope);
                 }}
                 onRevisePlan={(text) => {
                   setPendingPlanRevision(text);
@@ -1542,16 +1755,6 @@ export default function App() {
         )}
       </div>
 
-      {memView !== null && (
-        <MemoryPanel
-          view={memView}
-          onClose={closeMemory}
-          onRemember={onRemember}
-          onForget={onForget}
-          onSaveDoc={onSaveDoc}
-        />
-      )}
-
       {histView !== null && (
         <HistoryPanel
           kind={histView.kind}
@@ -1568,11 +1771,27 @@ export default function App() {
         />
       )}
 
-      {settingsOpen && <SettingsPanel onClose={() => setSettingsOpen(false)} onChanged={() => void refreshMeta()} />}
+      {settingsTarget !== null && (
+        <SettingsPanel
+          initialTab={settingsTarget}
+          onClose={() => setSettingsTarget(null)}
+          onChanged={() => void refreshMeta()}
+        />
+      )}
 
-      {capsOpen && <CapabilitiesPanel onClose={() => setCapsOpen(false)} />}
+      {startupSplashVisible && (
+        <StartupSplash hold={startupSplashHold} onDone={() => setStartupSplashVisible(false)} />
+      )}
 
       {needsOnboarding && <OnboardingOverlay onComplete={() => setNeedsOnboarding(false)} />}
+
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        items={buildPaletteItems()}
+        placeholder="Quick actions…"
+        emptyText="No matches"
+      />
     </div>
     </ShellExpandProvider>
   );

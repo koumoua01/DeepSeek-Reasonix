@@ -3,6 +3,9 @@ package skill
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -171,6 +174,22 @@ func TestInstallSkill(t *testing.T) {
 	if !strings.Contains(out, `"ok":true`) {
 		t.Errorf("expected ok result, got %s", out)
 	}
+	var res struct {
+		Path string `json:"path"`
+	}
+	if err := json.Unmarshal([]byte(out), &res); err != nil {
+		t.Fatalf("result JSON: %v", err)
+	}
+	wantPath := filepath.Join(home, ".reasonix", "skills", "deploy", SkillFile)
+	if res.Path != wantPath {
+		t.Fatalf("install_skill should report canonical path %s, got %s", wantPath, res.Path)
+	}
+	if _, err := os.Stat(wantPath); err != nil {
+		t.Fatalf("install_skill should write canonical SKILL.md: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".reasonix", "skills", "deploy.md")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("install_skill should not write legacy flat deploy.md, stat err=%v", err)
+	}
 	// Round-trips through the store with the frontmatter we wrote.
 	sk, ok := st.Read("deploy")
 	if !ok {
@@ -188,5 +207,32 @@ func TestInstallSkill(t *testing.T) {
 	if _, err := tl.Execute(context.Background(), json.RawMessage(
 		`{"name":"x","description":"","body":"b"}`)); err == nil {
 		t.Error("install_skill should require a description")
+	}
+}
+
+func TestReadSkillLoadsInlineAndIsReadOnly(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, home, ".reasonix/skills/note.md", "---\ndescription: take a note\n---\nDo the thing.")
+	tl := NewReadSkillTool(New(Options{HomeDir: home, DisableBuiltins: true}))
+
+	if !tl.ReadOnly() {
+		t.Fatal("read_skill must be ReadOnly so it works in plan mode")
+	}
+	out, err := tl.Execute(context.Background(), json.RawMessage(`{"name":"note","arguments":"with args"}`))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	if !strings.Contains(out, "Do the thing.") || !strings.Contains(out, "Arguments: with args") {
+		t.Errorf("inline body/args missing:\n%s", out)
+	}
+}
+
+func TestReadSkillRejectsSubagent(t *testing.T) {
+	home := t.TempDir()
+	writeSkill(t, home, ".reasonix/skills/dig.md", "---\ndescription: dig\nrunAs: subagent\n---\nbody")
+	tl := NewReadSkillTool(New(Options{HomeDir: home, DisableBuiltins: true}))
+
+	if _, err := tl.Execute(context.Background(), json.RawMessage(`{"name":"dig"}`)); err == nil || !strings.Contains(err.Error(), "run_skill") {
+		t.Fatalf("read_skill on a subagent skill should point to run_skill, got %v", err)
 	}
 }

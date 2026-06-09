@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -46,6 +47,10 @@ import (
 	"reasonix/internal/tool"
 )
 
+// ErrTurnRunning reports that a caller tried to start a second foreground turn
+// while one is already active in the same Controller.
+var ErrTurnRunning = errors.New("turn already running")
+
 // Controller drives one chat session. Construct with New; drive with the command
 // methods; observe through the Sink passed in Options.
 type Controller struct {
@@ -54,20 +59,22 @@ type Controller struct {
 	sink     event.Sink
 	policy   permission.Policy
 
-	label        string
-	systemPrompt string
-	sessionDir   string
-	host         *plugin.Host
-	commands     []command.Command
-	skills       []skill.Skill
-	allSkills    []skill.Skill
-	hooks        *hook.Runner // session hook runner; nil-safe (no hooks configured)
-	mem          *memory.Set
-	cleanup      func()
-	autoPlan     string
-	classifier   autoPlanClassifier
-	startedOnce  bool              // guards the one-shot SessionStart hook on first turn
-	onRemember   func(rule string) // set via Options; invoked when user picks "always allow"
+	label         string
+	systemPrompt  string
+	sessionDir    string
+	host          *plugin.Host
+	commands      []command.Command
+	skills        []skill.Skill
+	allSkills     []skill.Skill
+	skillStore    *skill.Store
+	allSkillStore *skill.Store
+	hooks         *hook.Runner // session hook runner; nil-safe (no hooks configured)
+	mem           *memory.Set
+	cleanup       func()
+	autoPlan      string
+	classifier    autoPlanClassifier
+	startedOnce   bool                             // guards the one-shot SessionStart hook on first turn
+	onRemember    func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
@@ -141,33 +148,47 @@ type Controller struct {
 	// a fresh memory takes effect this session without busting the prompt cache;
 	// it joins the prefix naturally on the next session.
 	pendingMemory []string
+
+	displayRecorder func(content, display string)
 }
 
 type approvalReply struct {
 	allow   bool
 	session bool
 	persist bool // true = write "always allow" rule to config
+	scope   string
+}
+
+// RememberResult describes what happened when an approval rule was persisted.
+type RememberResult struct {
+	Rule      string
+	Path      string
+	Saved     bool
+	CoveredBy string
+	Err       error
 }
 
 // Options carries the already-built pieces setup assembles. Lifecycle metadata
 // lets the controller mint and rotate session files; Host/Commands are surfaced
 // to frontends that resolve MCP prompts and slash commands.
 type Options struct {
-	Runner       agent.Runner
-	Executor     *agent.Agent
-	Sink         event.Sink
-	Policy       permission.Policy
-	Label        string
-	SystemPrompt string
-	SessionDir   string
-	SessionPath  string
-	Host         *plugin.Host
-	Commands     []command.Command
-	Skills       []skill.Skill
-	AllSkills    []skill.Skill
-	Hooks        *hook.Runner
-	Memory       *memory.Set
-	Cleanup      func()
+	Runner        agent.Runner
+	Executor      *agent.Agent
+	Sink          event.Sink
+	Policy        permission.Policy
+	Label         string
+	SystemPrompt  string
+	SessionDir    string
+	SessionPath   string
+	Host          *plugin.Host
+	Commands      []command.Command
+	Skills        []skill.Skill
+	AllSkills     []skill.Skill
+	SkillStore    *skill.Store
+	AllSkillStore *skill.Store
+	Hooks         *hook.Runner
+	Memory        *memory.Set
+	Cleanup       func()
 	// BalanceURL/BalanceKey wire the active provider's optional wallet-balance
 	// endpoint and bearer key; empty when the provider declares no balance_url.
 	BalanceURL    string
@@ -185,9 +206,9 @@ type Options struct {
 	AutoPlan      string
 	Classifier    autoPlanClassifier
 	// OnRemember, when set, is invoked with a new allow rule the user chose to
-	// persist to disk (e.g. "bash(go build*)"). The callback is wired into the
+	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
-	OnRemember func(rule string)
+	OnRemember func(rule string) RememberResult
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -217,6 +238,8 @@ func New(opts Options) *Controller {
 		commands:      opts.Commands,
 		skills:        opts.Skills,
 		allSkills:     opts.AllSkills,
+		skillStore:    opts.SkillStore,
+		allSkillStore: opts.AllSkillStore,
 		hooks:         opts.Hooks,
 		mem:           opts.Memory,
 		cleanup:       opts.Cleanup,
@@ -245,6 +268,42 @@ func New(opts Options) *Controller {
 		c.executor.SetMemoryQueue(c)
 	}
 	return c
+}
+
+// SetDisplayRecorder installs an optional hook used by frontends that persist a
+// shorter user-facing transcript than the fully composed model prompt.
+func (c *Controller) SetDisplayRecorder(fn func(content, display string)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.displayRecorder = fn
+}
+
+func (c *Controller) recordDisplay(content, display string) {
+	if strings.TrimSpace(display) == "" || content == display {
+		return
+	}
+	c.mu.Lock()
+	record := c.displayRecorder
+	c.mu.Unlock()
+	if record != nil {
+		record(content, display)
+	}
+}
+
+func (c *Controller) recordDisplayForNewUser(startMessages int, display string) {
+	if strings.TrimSpace(display) == "" {
+		return
+	}
+	msgs := c.History()
+	if startMessages > len(msgs) {
+		startMessages = len(msgs)
+	}
+	for _, m := range msgs[startMessages:] {
+		if m.Role == provider.RoleUser {
+			c.recordDisplay(m.Content, display)
+			return
+		}
+	}
 }
 
 // ckptDir derives a session's checkpoint directory from its file path
@@ -351,12 +410,43 @@ func (c *Controller) runTurn(ctx context.Context, input string) error {
 	return c.runTurnWithRaw(ctx, input, input)
 }
 
+// RunTurn executes one foreground turn synchronously through the same lifecycle
+// used by interactive frontends: auto-plan, transient memory/background-job
+// composition, checkpoints, hooks, and plan approval. It is for transports that
+// need a blocking request/response boundary, such as ACP session/prompt.
+func (c *Controller) RunTurn(ctx context.Context, input string) error {
+	ctx, cancel := context.WithCancel(ctx)
+	c.mu.Lock()
+	if c.running {
+		c.mu.Unlock()
+		cancel()
+		return ErrTurnRunning
+	}
+	c.cancel = cancel
+	c.running = true
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		c.running = false
+		c.cancel = nil
+		c.mu.Unlock()
+		cancel()
+	}()
+	return c.runTurn(ctx, input)
+}
+
 func (c *Controller) runTurnWithRaw(ctx context.Context, input, raw string) error {
+	return c.runTurnWithRawDisplay(ctx, input, raw, "")
+}
+
+func (c *Controller) runTurnWithRawDisplay(ctx context.Context, input, raw, display string) error {
 	c.maybeSessionStart(ctx)
 	c.maybeAutoPlan(ctx, raw)
 	input = c.Compose(input)
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
+	defer c.recordDisplayForNewUser(startMessages, display)
 	// Open a checkpoint for this turn before the user message is appended, so the
 	// recorded message boundary precedes it and pre-edit snapshots land here.
 	c.beginCheckpoint(input)
@@ -430,11 +520,21 @@ func lastAssistantText(msgs []provider.Message) string {
 // composition — emitting all output as events. The HTTP/SSE server uses this so
 // a browser client only POSTs the typed line.
 //
-// Slash commands route to the matching primitive: /compact and /new run their
-// session op and emit a Notice; /mcp__server__prompt and custom /commands
+// Slash commands route to the matching primitive: /compact and /new (or /clear)
+// run their session op and emit a Notice; /mcp__server__prompt and custom /commands
 // resolve to a turn; an unknown slash emits a Notice. Anything else is a normal
 // turn with its @-references resolved first.
 func (c *Controller) Submit(input string) {
+	c.submit(input, "")
+}
+
+// SubmitDisplay runs input as a turn while remembering the user-facing display
+// text for transcript replay when controller-side composition expands input.
+func (c *Controller) SubmitDisplay(display, input string) {
+	c.submit(input, display)
+}
+
+func (c *Controller) submit(input, display string) {
 	trimmed := strings.TrimSpace(input)
 	if note, ok := MemoryQuickAddNote(trimmed); ok {
 		c.rememberProjectNote(note)
@@ -461,7 +561,7 @@ func (c *Controller) Submit(input string) {
 				}
 			}
 		}()
-	case trimmed == "/new":
+	case trimmed == "/new" || trimmed == "/clear":
 		go func() {
 			if err := c.NewSession(); err != nil {
 				c.notice("new session failed: " + err.Error())
@@ -479,11 +579,15 @@ func (c *Controller) Submit(input string) {
 				c.notice("unknown command: " + trimmed)
 				return nil
 			}
-			return c.runTurnWithRaw(ctx, sent, sent)
+			return c.runTurnWithRawDisplay(ctx, sent, sent, display)
 		})
+	case strings.HasPrefix(trimmed, "//"):
+		// Double-slash — not a command. Common in code snippets (JS
+		// comments, file:// URLs). Run as a normal turn.
+		c.runRefTurn(input, display)
 	case strings.HasPrefix(trimmed, "/"):
 		if ref, ok := FileRefLine(trimmed); ok {
-			c.runRefTurn(ref)
+			c.runRefTurn(ref, display)
 			return
 		}
 		// Read-only management verbs (/model /memory /skills /hooks /mcp) emit a
@@ -533,19 +637,19 @@ func (c *Controller) Submit(input string) {
 		// turn. (Built-in slash verbs like /compact are handled above.)
 		if sent, ok := c.CustomCommand(trimmed); ok {
 			c.runGuarded(func(ctx context.Context) error {
-				return c.runTurnWithRaw(ctx, sent, sent)
+				return c.runTurnWithRawDisplay(ctx, sent, sent, display)
 			})
 			return
 		}
 		if sent, ok := c.RunSkill(trimmed); ok {
 			c.runGuarded(func(ctx context.Context) error {
-				return c.runTurnWithRaw(ctx, sent, sent)
+				return c.runTurnWithRawDisplay(ctx, sent, sent, display)
 			})
 			return
 		}
 		c.notice("unknown command: " + trimmed)
 	default:
-		c.runRefTurn(input)
+		c.runRefTurn(input, display)
 	}
 }
 
@@ -653,7 +757,7 @@ func (c *Controller) RunShell(command string) {
 
 // runRefTurn resolves a line's @references into a context block and starts a
 // turn with it prepended (or the raw line when nothing resolved).
-func (c *Controller) runRefTurn(input string) {
+func (c *Controller) runRefTurn(input, display string) {
 	c.runGuarded(func(ctx context.Context) error {
 		block, errs := c.ResolveRefs(ctx, input)
 		for _, e := range errs {
@@ -663,7 +767,7 @@ func (c *Controller) runRefTurn(input string) {
 		if block != "" {
 			sent = "Referenced context:\n\n" + block + "\n\n" + input
 		}
-		return c.runTurnWithRaw(ctx, sent, input)
+		return c.runTurnWithRawDisplay(ctx, sent, input, display)
 	})
 }
 
@@ -715,15 +819,21 @@ func (c *Controller) Turn() int {
 }
 
 // Approve answers a pending ApprovalRequest by ID: allow runs the call, session
-// also remembers a grant for the rest of the session so the same tool+subject
-// isn't re-prompted. Unknown/expired IDs are ignored.
+// also remembers a grant for the rest of the session so the same approval scope
+// is not re-prompted. Unknown/expired IDs are ignored.
 func (c *Controller) Approve(id string, allow, session, persist bool) {
+	c.ApproveWithScope(id, allow, session, persist, permission.ApprovalScopeExact)
+}
+
+// ApproveWithScope answers a pending ApprovalRequest with an explicit approval
+// scope. Unknown/expired IDs are ignored.
+func (c *Controller) ApproveWithScope(id string, allow, session, persist bool, scope string) {
 	c.mu.Lock()
 	reply := c.approvals[id]
 	delete(c.approvals, id)
 	c.mu.Unlock()
 	if reply != nil {
-		reply <- approvalReply{allow: allow, session: session, persist: persist} // buffered, never blocks
+		reply <- approvalReply{allow: allow, session: session, persist: persist, scope: scope} // buffered, never blocks
 	}
 }
 
@@ -735,7 +845,11 @@ func (c *Controller) Approve(id string, allow, session, persist bool) {
 func (c *Controller) EnableInteractiveApproval() {
 	if c.executor != nil {
 		gate := permission.NewGate(c.policy, gateApprover{c})
-		gate.OnRemember = c.onRemember // wire "always allow" persistence callback
+		gate.OnRemember = func(rule string) {
+			if c.onRemember != nil {
+				_ = c.onRemember(rule)
+			}
+		} // wire legacy "always allow" persistence callback
 		c.executor.SetGate(gate)
 		c.executor.SetAsker(c)
 	}
@@ -744,17 +858,12 @@ func (c *Controller) EnableInteractiveApproval() {
 // Ask implements agent.Asker: it emits an AskRequest and blocks until
 // AnswerQuestion(ID, …) answers or ctx is cancelled. promptMu serialises it
 // against tool-approval prompts so at most one user prompt is outstanding.
+// Unlike tool-approval gates, Ask is NOT bypassed in YOLO mode — the `ask`
+// tool exists to get a genuine user decision, and YOLO only auto-approves
+// tool calls; it must not answer the user's questions for them.
 func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]event.AskAnswer, error) {
-	if c.bypassEnabled() {
-		return recommendedAskAnswers(questions), nil
-	}
-
 	c.promptMu.Lock()
 	defer c.promptMu.Unlock()
-
-	if c.bypassEnabled() {
-		return recommendedAskAnswers(questions), nil
-	}
 
 	c.mu.Lock()
 	c.nextID++
@@ -774,23 +883,6 @@ func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	}
-}
-
-func (c *Controller) bypassEnabled() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bypass
-}
-
-func recommendedAskAnswers(questions []event.AskQuestion) []event.AskAnswer {
-	out := make([]event.AskAnswer, len(questions))
-	for i, q := range questions {
-		out[i] = event.AskAnswer{QuestionID: q.ID}
-		if len(q.Options) > 0 {
-			out[i].Selected = []string{q.Options[0].Label}
-		}
-	}
-	return out
 }
 
 // AnswerQuestion resolves a pending AskRequest by ID with the user's selections.
@@ -936,19 +1028,23 @@ func (c *Controller) Rewind(turn int, scope RewindScope) error {
 			return c.rewindFail(fmt.Errorf("conversation rewind unavailable for turn %d (resumed session)", turn))
 		}
 		s := c.executor.Session()
-		if boundary <= len(s.Messages) {
-			s.Messages = s.Messages[:boundary]
-			c.mu.Lock()
-			c.cpTurn = turn // renumber future turns from here; later turns are gone
-			for k := range c.cpBound {
-				if k >= turn {
-					delete(c.cpBound, k)
-				}
+		// boundary is the message-log index at turn start; compaction shrinks the
+		// log without rewriting boundaries, so a stale boundary past the end means
+		// the turn was compacted away — fail loudly instead of skipping silently.
+		if boundary > len(s.Messages) {
+			return c.rewindFail(fmt.Errorf("conversation rewind unavailable for turn %d: the conversation was compacted past this point", turn))
+		}
+		s.Messages = s.Messages[:boundary]
+		c.mu.Lock()
+		c.cpTurn = turn // renumber future turns from here; later turns are gone
+		for k := range c.cpBound {
+			if k >= turn {
+				delete(c.cpBound, k)
 			}
-			c.mu.Unlock()
-			if err := c.Snapshot(); err != nil {
-				slog.Warn("controller: snapshot after rewind", "err", err)
-			}
+		}
+		c.mu.Unlock()
+		if err := c.Snapshot(); err != nil {
+			slog.Warn("controller: snapshot after rewind", "err", err)
 		}
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 			Text: fmt.Sprintf("rewound conversation to turn %d", turn)})
@@ -1379,11 +1475,21 @@ func (c *Controller) Host() *plugin.Host { return c.host }
 func (c *Controller) Commands() []command.Command { return c.commands }
 
 // Skills returns the discoverable skills (for the slash menu and `/skills`).
-func (c *Controller) Skills() []skill.Skill { return c.skills }
+// When a live Store is available, scan it on demand so skills installed during
+// this session appear without rewriting the cache-stable system prompt.
+func (c *Controller) Skills() []skill.Skill {
+	if c.skillStore != nil {
+		return c.skillStore.List()
+	}
+	return c.skills
+}
 
 // AllSkills returns every discoverable skill, including disabled ones, for
 // management surfaces that need to re-enable a hidden skill.
 func (c *Controller) AllSkills() []skill.Skill {
+	if c.allSkillStore != nil {
+		return c.allSkillStore.List()
+	}
 	if len(c.allSkills) > 0 {
 		return c.allSkills
 	}
@@ -1498,6 +1604,55 @@ func (c *Controller) connectMCPSpec(s plugin.Spec) (int, error) {
 		}
 	}
 	return len(tools), nil
+}
+
+// ImportMCPEntries persists selected MCP entries and attempts to connect them
+// live. A connection failure does not roll back the config import: the user can
+// fix local dependencies and reconnect in a later session.
+func (c *Controller) ImportMCPEntries(entries []config.PluginEntry) (total, added, updated, connected, failed, skipped int, err error) {
+	cfg, lerr := config.Load()
+	if lerr != nil {
+		return 0, 0, 0, 0, 0, 0, lerr
+	}
+	existing := make(map[string]bool, len(cfg.Plugins))
+	for _, p := range cfg.Plugins {
+		existing[p.Name] = true
+	}
+	for _, e := range entries {
+		if existing[e.Name] {
+			updated++
+		} else {
+			added++
+		}
+		if err := cfg.UpsertPlugin(e); err != nil {
+			return 0, 0, 0, 0, 0, 0, err
+		}
+		existing[e.Name] = true
+	}
+	if err := cfg.Save(); err != nil {
+		return 0, 0, 0, 0, 0, 0, err
+	}
+	for _, e := range entries {
+		if c.host != nil && containsString(c.host.ServerNames(), e.Name) {
+			skipped++
+			continue
+		}
+		if _, err := c.AddMCPServer(e); err != nil {
+			failed++
+			continue
+		}
+		connected++
+	}
+	return len(entries), added, updated, connected, failed, skipped, nil
+}
+
+func containsString(ss []string, want string) bool {
+	for _, s := range ss {
+		if s == want {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *Controller) ConfiguredMCPNames() []string {
@@ -1996,9 +2151,6 @@ func listItem(line string) (content string, level int, ok bool) {
 	return s, 0, true
 }
 
-// requestApproval emits an ApprovalRequest and blocks until Approve(ID, …)
-// answers or ctx is cancelled. A prior session grant for the same tool+subject
-// short-circuits. promptMu serialises outstanding prompts.
 // parseRewind parses the arguments after "/rewind". The user may provide:
 //
 //	/rewind              → latest checkpoint, both
@@ -2034,14 +2186,15 @@ func parseRewind(args string, cps []checkpoint.Meta) (int, RewindScope, error) {
 	return turn, scope, nil
 }
 
+// requestApproval emits an ApprovalRequest and blocks until Approve(ID, …)
+// answers or ctx is cancelled. A prior session grant for the same approval scope
+// short-circuits. promptMu serialises outstanding prompts.
 func (c *Controller) requestApproval(ctx context.Context, tool, subject string) (bool, bool, error) {
-	key := tool + "\x00" + subject
-
 	c.mu.Lock()
 	// YOLO/bypass and the just-approved-plan window auto-allow every approval
 	// without prompting; the plan gate routes through here too, so this is what
 	// stops a bypass session from blocking on plan approval. Deny rules bit upstream.
-	if c.bypass || c.autoApprove || c.granted[key] {
+	if c.bypass || c.autoApprove || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
 		return true, false, nil
 	}
@@ -2053,7 +2206,7 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 	// Re-check the grant: a session grant may have landed while we queued behind
 	// another prompt for the same subject.
 	c.mu.Lock()
-	if c.bypass || c.autoApprove || c.granted[key] {
+	if c.bypass || c.autoApprove || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
 		return true, false, nil
 	}
@@ -2077,18 +2230,45 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 		// Plan approvals are one-shot — never persist a session grant for them, or
 		// every future plan would auto-approve.
 		if r.allow && r.session && tool != planApprovalTool {
+			rule := permission.SessionGrantRuleForScope(tool, subject, r.scope)
 			c.mu.Lock()
-			c.granted[key] = true
+			c.granted[rule] = true
 			c.mu.Unlock()
 		}
-		// When persist is true, remember=true signals Gate.OnRemember to write
-		// the rule to the on-disk config. Plan approvals are excluded.
-		remember := r.persist && tool != planApprovalTool
-		return r.allow, remember, nil
+		if r.allow && r.persist && tool != planApprovalTool && c.onRemember != nil {
+			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject, r.scope)))
+		}
+		return r.allow, false, nil
 	case <-ctx.Done():
 		c.mu.Lock()
 		delete(c.approvals, id)
 		c.mu.Unlock()
 		return false, false, ctx.Err()
+	}
+}
+
+func (c *Controller) sessionGrantAllowsLocked(tool, subject string) bool {
+	for rule := range c.granted {
+		if permission.RuleMatchesString(rule, tool, subject) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) emitRememberResult(r RememberResult) {
+	if r.Err != nil {
+		c.sink.Emit(event.Event{
+			Kind:  event.Notice,
+			Level: event.LevelWarn,
+			Text:  fmt.Sprintf(i18n.M.PermissionSaveFailedFmt, r.Rule, r.Err),
+		})
+		return
+	}
+	switch {
+	case r.Saved:
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionSavedFmt, r.Path, r.Rule)})
+	case strings.TrimSpace(r.CoveredBy) != "":
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionAlreadyAllowedFmt, r.Path, r.CoveredBy)})
 	}
 }
