@@ -18,6 +18,7 @@ import {
   Trash2,
 } from "lucide-react";
 import logoWordmark from "./assets/logo-wordmark.svg";
+import { useToast } from "./lib/toast";
 import { asArray } from "./lib/array";
 import { clearLegacyLangPref, normalizeLangPref, readLegacyLangPref, t, useI18n, useT } from "./lib/i18n";
 import { useController, type Item, type LiveStream } from "./lib/useController";
@@ -404,6 +405,7 @@ export default function App() {
   const [needsOnboarding, setNeedsOnboarding] = useState<boolean | null>(null);
   const [settingsTarget, setSettingsTarget] = useState<SettingsTab | null>(null);
   const [histView, setHistView] = useState<HistoryViewState | null>(null);
+  const { showToast } = useToast();
   const [sidebarCollapsed, setSidebarCollapsed] = useState(loadSidebarCollapsed);
   const [sidebarWidth, setSidebarWidth] = useState(loadSidebarWidth);
   const [sidebarResizing, setSidebarResizing] = useState(false);
@@ -634,39 +636,6 @@ export default function App() {
   const todos = useMemo(() => (todoItem ? parseTodos(todoItem.args) : []), [todoItem]);
   const [dismissedTodo, setDismissedTodo] = useState<string | null>(null);
   const showTodos = shouldShowTodoPanel(todoItem?.id, dismissedTodo, todos);
-  const [todoNow, setTodoNow] = useState(() => Date.now());
-  const todoSeenRef = useRef<{ id: string; at: number } | null>(null);
-
-  useEffect(() => {
-    if (!todoItem) {
-      todoSeenRef.current = null;
-      return;
-    }
-    if (todoSeenRef.current?.id !== todoItem.id) {
-      todoSeenRef.current = { id: todoItem.id, at: Date.now() };
-      setTodoNow(Date.now());
-    }
-  }, [todoItem]);
-
-  useEffect(() => {
-    if (!showTodos) return;
-    const id = window.setInterval(() => setTodoNow(Date.now()), 15000);
-    return () => window.clearInterval(id);
-  }, [showTodos]);
-
-  const todoStale = useMemo(() => {
-    if (!showTodos || !todoEntry) return false;
-    const after = state.items.slice(todoEntry.index + 1);
-    const completedToolsAfter = after.filter(
-      (it) => it.kind === "tool" && it.name !== "todo_write" && !it.parentId && (it.status === "done" || it.status === "error"),
-    ).length;
-    const finalAssistantAfter = after.some((it) => it.kind === "assistant" && !it.streaming && it.text.trim() !== "");
-    const readinessNoticeAfter = after.some(
-      (it) => it.kind === "notice" && /final-answer readiness|todo_write|complete_step/i.test(it.text),
-    );
-    const staleByTime = state.running && todoSeenRef.current?.id === todoEntry.item.id && todoNow - todoSeenRef.current.at > 90_000;
-    return completedToolsAfter >= 2 || finalAssistantAfter || readinessNoticeAfter || staleByTime;
-  }, [showTodos, state.items, state.running, todoEntry, todoNow]);
 
   // useDeferredValue lets React prioritise Composer input (high-priority) over
   // Transcript re-renders (low-priority) during streaming. When a keystroke
@@ -1203,21 +1172,33 @@ export default function App() {
   const onResumeSession = useCallback(
     async (session: SessionMeta) => {
       if (state.running) return;
-      setHistView(null);
       const scope = session.scope || (session.workspaceRoot ? "project" : "global");
-      let targetTab: TabMeta | undefined;
-      if (scope === "project" && session.workspaceRoot && session.topicId) {
-        targetTab = await openProjectTab(session.workspaceRoot, session.topicId);
-      } else if (scope === "global" && session.topicId) {
-        targetTab = await openGlobalTab(session.topicId);
-      }
-      await resumeSession(session.path, targetTab?.id);
-      if (targetTab) {
+      try {
+        let targetTab: TabMeta;
+        if (scope === "project" && session.workspaceRoot && session.topicId) {
+          targetTab = await openProjectTab(session.workspaceRoot, session.topicId);
+        } else if (scope === "global" && session.topicId) {
+          targetTab = await openGlobalTab(session.topicId);
+        } else {
+          throw new Error(scope === "global" && !session.topicId
+            ? t("history.failedOpenSession")
+            : (session.topicId ? "Missing workspaceRoot" : t("history.failedOpenSession")));
+        }
+        setHistView(null);
+        await resumeSession(session.path, targetTab.id);
         await refreshTabMetas();
         setTabRevealSignal((signal) => signal + 1);
+      } catch (err: any) {
+        setHistView(null);
+        if (scope === "project" && session.workspaceRoot) {
+          const name = workspaceDisplayName(session.workspaceRoot);
+          showToast(t("history.failedOpenProject", { name, path: session.workspaceRoot }));
+        } else {
+          showToast(err?.message || String(err));
+        }
       }
     },
-    [openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession],
+    [openGlobalTab, openProjectTab, refreshTabMetas, state.running, resumeSession, t, showToast],
   );
   // Delete / rename act on disk, then re-fetch so the panel reflects the change.
   const onDeleteSession = useCallback(
@@ -1617,15 +1598,15 @@ export default function App() {
           </main>
 
           <footer className="footer" ref={footerRef}>
-            {showTodos && <TodoPanel todos={todos} stale={todoStale} onDismiss={() => setDismissedTodo(todoItem!.id)} />}
+            {showTodos && <TodoPanel todos={todos} onDismiss={() => setDismissedTodo(todoItem!.id)} />}
             {state.approval && (
               <ApprovalModal
                 approval={state.approval}
-                onAnswer={(allow, session, persist) => {
+                onAnswer={(allow, session, persist, scope) => {
                   // Approving an exit_plan_mode plan leaves plan mode; sync the
                   // tab-local indicator and persisted safe mode immediately.
                   if (state.approval!.tool === "exit_plan_mode" && allow) applyMode("normal");
-                  approve(state.approval!.id, allow, session, persist);
+                  approve(state.approval!.id, allow, session, persist, scope);
                 }}
                 onRevisePlan={(text) => {
                   setPendingPlanRevision(text);

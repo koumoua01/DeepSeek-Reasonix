@@ -53,6 +53,7 @@ type Asker interface {
 
 // callContextKey carries the executing tool call's identity into Execute.
 type callContextKey struct{}
+type parentSessionContextKey struct{}
 
 // callContext is the per-call context a tool can read. parentID is the call being
 // executed and sink is the agent's event sink (the `task` tool uses both to nest
@@ -79,6 +80,18 @@ func CallContext(ctx context.Context) (parentID string, sink event.Sink, asker A
 		return "", nil, nil, false
 	}
 	return cc.parentID, cc.sink, cc.asker, true
+}
+
+// WithParentSession stamps the active parent session ID onto a turn context so
+// persisted sub-agents can record and enforce their owning conversation.
+func WithParentSession(ctx context.Context, parentSession string) context.Context {
+	return context.WithValue(ctx, parentSessionContextKey{}, strings.TrimSpace(parentSession))
+}
+
+// ParentSession returns the active parent session ID carried by a turn context.
+func ParentSession(ctx context.Context) string {
+	parentSession, _ := ctx.Value(parentSessionContextKey{}).(string)
+	return strings.TrimSpace(parentSession)
 }
 
 // Gate decides, per tool call, whether it may run. The agent consults it at
@@ -543,7 +556,6 @@ type finalReadinessCheck struct {
 	applies              bool
 	reason               string
 	missingProjectChecks int
-	missingCompleteStep  bool
 	incompleteTodos      int
 }
 
@@ -552,7 +564,6 @@ func (c finalReadinessCheck) audit(result evidence.ReadinessAuditResult, recover
 		Result:                 result,
 		Recovered:              recovered,
 		MissingProjectChecks:   c.missingProjectChecks,
-		MissingCompleteStep:    c.missingCompleteStep,
 		IncompleteTodos:        c.incompleteTodos,
 		CommandMismatchMissing: c.missingProjectChecks,
 	}
@@ -594,10 +605,7 @@ func (a *Agent) finalReadinessCheck() finalReadinessCheck {
 			missing = append(missing, fmt.Sprintf("run %q from %s after the latest write", command, finalReadinessCheckSource(check)))
 		}
 	}
-	if hasTodoReceipt && !a.evidence.HasSuccessfulCompleteStepAfter(writer) {
-		out.missingCompleteStep = true
-		missing = append(missing, "call complete_step after the latest write")
-	}
+
 	if len(missing) == 0 {
 		return out
 	}
@@ -1059,6 +1067,7 @@ func (a *Agent) executeOne(ctx context.Context, call provider.ToolCall) toolOutc
 	cctx := withCallContext(ctx, call.ID, a.sink, a.asker)
 	if a.evidence != nil {
 		cctx = evidence.WithLedger(cctx, a.evidence)
+		cctx = evidence.WithSessionMessages(cctx, a.session.Snapshot())
 	}
 	if len(a.projectChecks) > 0 {
 		cctx = instruction.WithChecks(cctx, a.projectChecks)

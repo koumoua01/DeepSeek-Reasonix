@@ -12,6 +12,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/url"
 	"os"
 	"os/signal"
@@ -205,6 +206,9 @@ func runAgent(args []string) int {
 	showThinking := fs.Bool("show-thinking", false, "show thinking text instead of the collapsed thinking marker")
 	metricsPath := fs.String("metrics", "", "write a JSON token/cache/cost summary of the run to this path")
 	dir := fs.String("dir", "", "change to this directory first (project root); config, sandbox and file tools resolve from here")
+	cont := fs.Bool("continue", false, "resume the most recent saved session")
+	fs.BoolVar(cont, "c", false, "shorthand for --continue")
+	resume := fs.String("resume", "", "resume a specific session file (non-interactive; takes precedence over --continue)")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -252,6 +256,38 @@ func runAgent(args []string) int {
 		return 1
 	}
 	defer ctrl.Close()
+
+	// --resume: load a specific session file (non-interactive, meant for
+	// MCP/API callers that manage their own per-project session). Takes
+	// precedence over --continue.
+	// --continue: resume the most recent saved session.
+	if *resume != "" {
+		loaded, err := agent.LoadSession(*resume)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		ctrl.Resume(loaded, *resume)
+	} else if *cont {
+		sessions, err := agent.ListSessions(config.SessionDir())
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		if len(sessions) == 0 {
+			fmt.Fprintln(os.Stderr, i18n.M.NoSessionToResume)
+			return 1
+		}
+		loaded, err := agent.LoadSession(sessions[0].Path)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, i18n.M.ErrorPrefix, err)
+			return 1
+		}
+		ctrl.Resume(loaded, sessions[0].Path)
+	}
+	if ctrl.SessionPath() == "" && ctrl.SessionDir() != "" {
+		ctrl.SetSessionPath(agent.NewSessionPath(ctrl.SessionDir(), ctrl.Label()))
+	}
 
 	runErr := ctrl.Run(ctx, prompt)
 	if cfg != nil {
@@ -435,6 +471,7 @@ func chatREPL(args []string) int {
 	if cfg, err := config.Load(); err == nil {
 		m.outputStyle = cfg.Agent.OutputStyle    // shown as the active entry in /output-style
 		m.statuslineCmd = cfg.Statusline.Command // custom status-line command, "" = built-in row
+		m.cfg = cfg
 	}
 
 	// /model support: a pure builder the TUI calls to rebuild on a different
@@ -471,9 +508,13 @@ func chatREPL(args []string) int {
 	}
 	m.refreshEffortStatus()
 
-	// No alt-screen: finalized transcript lines are committed to the terminal's
-	// normal buffer (via tea.Println) so native scrollback, the wheel, and copy
-	// all work — the bubbletea-managed region is just the bottom input/status.
+	if m.nativeScrollback {
+		reserveNativeScrollbackFrame(os.Stdout, m.bottomRows())
+	}
+
+	// Non-Termux terminals use an alt-screen transcript viewport. Termux stays
+	// in the normal buffer so native touch scrollback and soft-keyboard focus
+	// keep working; finalized transcript lines are emitted via tea.Println.
 	p := tea.NewProgram(m)
 	final, runErr := p.Run()
 	// Close the active controller plus any retired ones from /model switches.
@@ -498,6 +539,12 @@ func chatREPL(args []string) int {
 		return 1
 	}
 	return 0
+}
+
+func reserveNativeScrollbackFrame(w io.Writer, rows int) {
+	for i := 0; i < rows; i++ {
+		fmt.Fprintln(w)
+	}
 }
 
 // setupTargets is where the wizard writes: the TOML config and the secrets file.
@@ -898,6 +945,42 @@ func fetchOrFallback(probe *config.ProviderEntry, famName string) []string {
 	return models
 }
 
+// fetchModelListCompat walks the full set of model-list URL candidates a given
+// base URL can resolve to (root, /v1, known OpenAI/Anthropic compat suffixes)
+// and returns the first successful fetch. This is the wizard-time probe for a
+// *user-supplied* custom provider — its baseURL is whatever the user pasted,
+// and "whatever they pasted" might be https://x.com (root, probe /v1/models)
+// or https://x.com/v1 (versioned, probe /v1/models directly). Previously the
+// wizard hardcoded `baseURL + "/models"`, which works for OpenAI-shape URLs
+// but silently fails for Anthropic-shape roots and the reverse — so the
+// wizard's idea of "what models exist" diverged from the chat client's actual
+// endpoint. Returning the empty slice (not an error) on full miss lets the
+// wizard fall through to a manual text input without an error message.
+func fetchModelListCompat(ctx context.Context, baseURL, apiKey string) ([]string, error) {
+	candidates, err := config.BuildModelFetchURLs(baseURL, "")
+	if err != nil {
+		return nil, err
+	}
+	var lastErr error
+	for _, u := range candidates {
+		models, err := openai.FetchModels(ctx, u, apiKey)
+		if err == nil {
+			return models, nil
+		}
+		lastErr = err
+		// An endpoint-miss is not a hard error — try the next candidate.
+		// Anything else (auth, 5xx, bad TLS) bubbles up immediately because
+		// retrying it on a sibling URL won't help.
+		if !openai.IsModelFetchEndpointMiss(err) {
+			return nil, err
+		}
+	}
+	if lastErr != nil {
+		slog.Debug("model-list probe: all candidates missed", "base_url", baseURL, "err", lastErr)
+	}
+	return nil, nil
+}
+
 // buildFamilyEntry returns a single ProviderEntry exposing the user's
 // selected models under one entry. It preserves the preset's API key env,
 // base URL, kind, context window, pricing, and effort — the things that
@@ -1113,7 +1196,7 @@ func promptCustomProviderFromURL() ([]config.ProviderEntry, error) {
 	fmt.Printf("  %s\n", dim(fmt.Sprintf(i18n.M.FetchingModelsFmt, "custom")))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	models, err := openai.FetchModels(ctx, baseURL+"/models", apiKey)
+	models, err := fetchModelListCompat(ctx, baseURL, apiKey)
 	if err != nil || len(models) == 0 {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  %s\n", dim(fmt.Sprintf(i18n.M.FetchModelsFailedFmt, "custom", err)))
@@ -1219,7 +1302,7 @@ func promptAnthropicProviderFromURL() ([]config.ProviderEntry, error) {
 	fmt.Printf("  %s\n", dim(fmt.Sprintf(i18n.M.AnthropicFetchingModelsFmt, "anthropic")))
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	models, err := openai.FetchModels(ctx, baseURL+"/models", apiKey)
+	models, err := fetchModelListCompat(ctx, baseURL, apiKey)
 	if err != nil || len(models) == 0 {
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "  %s\n", dim(fmt.Sprintf(i18n.M.AnthropicFetchModelsFailedFmt, "anthropic", err)))

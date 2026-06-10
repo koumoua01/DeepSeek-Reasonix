@@ -73,8 +73,8 @@ type Controller struct {
 	cleanup       func()
 	autoPlan      string
 	classifier    autoPlanClassifier
-	startedOnce   bool              // guards the one-shot SessionStart hook on first turn
-	onRemember    func(rule string) // set via Options; invoked when user picks "always allow"
+	startedOnce   bool                             // guards the one-shot SessionStart hook on first turn
+	onRemember    func(rule string) RememberResult // set via Options; invoked when user picks "always allow"
 
 	// balanceURL/balanceKey target the active provider's optional wallet-balance
 	// endpoint (empty when the provider declares none). Captured at build so a
@@ -156,6 +156,16 @@ type approvalReply struct {
 	allow   bool
 	session bool
 	persist bool // true = write "always allow" rule to config
+	scope   string
+}
+
+// RememberResult describes what happened when an approval rule was persisted.
+type RememberResult struct {
+	Rule      string
+	Path      string
+	Saved     bool
+	CoveredBy string
+	Err       error
 }
 
 // Options carries the already-built pieces setup assembles. Lifecycle metadata
@@ -196,9 +206,9 @@ type Options struct {
 	AutoPlan      string
 	Classifier    autoPlanClassifier
 	// OnRemember, when set, is invoked with a new allow rule the user chose to
-	// persist to disk (e.g. "bash(go build*)"). The callback is wired into the
+	// persist to disk (e.g. "Bash(go test:*)"). The callback is wired into the
 	// permission Gate on EnableInteractiveApproval.
-	OnRemember func(rule string)
+	OnRemember func(rule string) RememberResult
 }
 
 // New builds a Controller. A nil Sink is replaced with event.Discard.
@@ -433,6 +443,7 @@ func (c *Controller) runTurnWithRaw(ctx context.Context, input, raw string) erro
 func (c *Controller) runTurnWithRawDisplay(ctx context.Context, input, raw, display string) error {
 	c.maybeSessionStart(ctx)
 	c.maybeAutoPlan(ctx, raw)
+	ctx = agent.WithParentSession(ctx, c.parentSessionID())
 	input = c.Compose(input)
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
@@ -771,6 +782,7 @@ func (c *Controller) notice(text string) {
 // just needs the exit status — no TurnDone event, no cancel bookkeeping.
 func (c *Controller) Run(ctx context.Context, input string) error {
 	c.maybeSessionStart(ctx)
+	ctx = agent.WithParentSession(ctx, c.parentSessionID())
 	startMessages := c.messageCount()
 	defer c.snapshotActivityIfChanged(startMessages)
 	if c.hooks.Enabled() {
@@ -809,15 +821,21 @@ func (c *Controller) Turn() int {
 }
 
 // Approve answers a pending ApprovalRequest by ID: allow runs the call, session
-// also remembers a tool-wide grant for the rest of the session so that tool
-// isn't re-prompted. Unknown/expired IDs are ignored.
+// also remembers a grant for the rest of the session so the same approval scope
+// is not re-prompted. Unknown/expired IDs are ignored.
 func (c *Controller) Approve(id string, allow, session, persist bool) {
+	c.ApproveWithScope(id, allow, session, persist, permission.ApprovalScopeExact)
+}
+
+// ApproveWithScope answers a pending ApprovalRequest with an explicit approval
+// scope. Unknown/expired IDs are ignored.
+func (c *Controller) ApproveWithScope(id string, allow, session, persist bool, scope string) {
 	c.mu.Lock()
 	reply := c.approvals[id]
 	delete(c.approvals, id)
 	c.mu.Unlock()
 	if reply != nil {
-		reply <- approvalReply{allow: allow, session: session, persist: persist} // buffered, never blocks
+		reply <- approvalReply{allow: allow, session: session, persist: persist, scope: scope} // buffered, never blocks
 	}
 }
 
@@ -829,7 +847,11 @@ func (c *Controller) Approve(id string, allow, session, persist bool) {
 func (c *Controller) EnableInteractiveApproval() {
 	if c.executor != nil {
 		gate := permission.NewGate(c.policy, gateApprover{c})
-		gate.OnRemember = c.onRemember // wire "always allow" persistence callback
+		gate.OnRemember = func(rule string) {
+			if c.onRemember != nil {
+				_ = c.onRemember(rule)
+			}
+		} // wire legacy "always allow" persistence callback
 		c.executor.SetGate(gate)
 		c.executor.SetAsker(c)
 	}
@@ -838,17 +860,12 @@ func (c *Controller) EnableInteractiveApproval() {
 // Ask implements agent.Asker: it emits an AskRequest and blocks until
 // AnswerQuestion(ID, …) answers or ctx is cancelled. promptMu serialises it
 // against tool-approval prompts so at most one user prompt is outstanding.
+// Unlike tool-approval gates, Ask is NOT bypassed in YOLO mode — the `ask`
+// tool exists to get a genuine user decision, and YOLO only auto-approves
+// tool calls; it must not answer the user's questions for them.
 func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]event.AskAnswer, error) {
-	if c.bypassEnabled() {
-		return recommendedAskAnswers(questions), nil
-	}
-
 	c.promptMu.Lock()
 	defer c.promptMu.Unlock()
-
-	if c.bypassEnabled() {
-		return recommendedAskAnswers(questions), nil
-	}
 
 	c.mu.Lock()
 	c.nextID++
@@ -868,23 +885,6 @@ func (c *Controller) Ask(ctx context.Context, questions []event.AskQuestion) ([]
 		c.mu.Unlock()
 		return nil, ctx.Err()
 	}
-}
-
-func (c *Controller) bypassEnabled() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.bypass
-}
-
-func recommendedAskAnswers(questions []event.AskQuestion) []event.AskAnswer {
-	out := make([]event.AskAnswer, len(questions))
-	for i, q := range questions {
-		out[i] = event.AskAnswer{QuestionID: q.ID}
-		if len(q.Options) > 0 {
-			out[i].Selected = []string{q.Options[0].Label}
-		}
-	}
-	return out
 }
 
 // AnswerQuestion resolves a pending AskRequest by ID with the user's selections.
@@ -1030,19 +1030,23 @@ func (c *Controller) Rewind(turn int, scope RewindScope) error {
 			return c.rewindFail(fmt.Errorf("conversation rewind unavailable for turn %d (resumed session)", turn))
 		}
 		s := c.executor.Session()
-		if boundary <= len(s.Messages) {
-			s.Messages = s.Messages[:boundary]
-			c.mu.Lock()
-			c.cpTurn = turn // renumber future turns from here; later turns are gone
-			for k := range c.cpBound {
-				if k >= turn {
-					delete(c.cpBound, k)
-				}
+		// boundary is the message-log index at turn start; compaction shrinks the
+		// log without rewriting boundaries, so a stale boundary past the end means
+		// the turn was compacted away — fail loudly instead of skipping silently.
+		if boundary > len(s.Messages) {
+			return c.rewindFail(fmt.Errorf("conversation rewind unavailable for turn %d: the conversation was compacted past this point", turn))
+		}
+		s.Messages = s.Messages[:boundary]
+		c.mu.Lock()
+		c.cpTurn = turn // renumber future turns from here; later turns are gone
+		for k := range c.cpBound {
+			if k >= turn {
+				delete(c.cpBound, k)
 			}
-			c.mu.Unlock()
-			if err := c.Snapshot(); err != nil {
-				slog.Warn("controller: snapshot after rewind", "err", err)
-			}
+		}
+		c.mu.Unlock()
+		if err := c.Snapshot(); err != nil {
+			slog.Warn("controller: snapshot after rewind", "err", err)
 		}
 		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 			Text: fmt.Sprintf("rewound conversation to turn %d", turn)})
@@ -1401,6 +1405,10 @@ func (c *Controller) SessionPath() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.sessionPath
+}
+
+func (c *Controller) parentSessionID() string {
+	return agent.BranchID(c.SessionPath())
 }
 
 // History returns the executor's current message log (for repopulating a
@@ -2149,9 +2157,6 @@ func listItem(line string) (content string, level int, ok bool) {
 	return s, 0, true
 }
 
-// requestApproval emits an ApprovalRequest and blocks until Approve(ID, …)
-// answers or ctx is cancelled. A prior tool-wide session grant short-circuits.
-// promptMu serialises outstanding prompts.
 // parseRewind parses the arguments after "/rewind". The user may provide:
 //
 //	/rewind              → latest checkpoint, both
@@ -2187,18 +2192,15 @@ func parseRewind(args string, cps []checkpoint.Meta) (int, RewindScope, error) {
 	return turn, scope, nil
 }
 
+// requestApproval emits an ApprovalRequest and blocks until Approve(ID, …)
+// answers or ctx is cancelled. A prior session grant for the same approval scope
+// short-circuits. promptMu serialises outstanding prompts.
 func (c *Controller) requestApproval(ctx context.Context, tool, subject string) (bool, bool, error) {
-	// Session grants are tool-wide: "allow for this session" / "allow persistently"
-	// mean the user trusts this tool (write_file, bash, …), not just this one
-	// file/command, so a different subject for the same tool isn't re-prompted.
-	// Deny rules still bite upstream of here.
-	key := tool
-
 	c.mu.Lock()
 	// YOLO/bypass and the just-approved-plan window auto-allow every approval
 	// without prompting; the plan gate routes through here too, so this is what
 	// stops a bypass session from blocking on plan approval. Deny rules bit upstream.
-	if c.bypass || c.autoApprove || c.granted[key] {
+	if c.bypass || c.autoApprove || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
 		return true, false, nil
 	}
@@ -2210,7 +2212,7 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 	// Re-check the grant: a session grant may have landed while we queued behind
 	// another prompt for the same subject.
 	c.mu.Lock()
-	if c.bypass || c.autoApprove || c.granted[key] {
+	if c.bypass || c.autoApprove || c.sessionGrantAllowsLocked(tool, subject) {
 		c.mu.Unlock()
 		return true, false, nil
 	}
@@ -2234,18 +2236,45 @@ func (c *Controller) requestApproval(ctx context.Context, tool, subject string) 
 		// Plan approvals are one-shot — never persist a session grant for them, or
 		// every future plan would auto-approve.
 		if r.allow && r.session && tool != planApprovalTool {
+			rule := permission.SessionGrantRuleForScope(tool, subject, r.scope)
 			c.mu.Lock()
-			c.granted[key] = true
+			c.granted[rule] = true
 			c.mu.Unlock()
 		}
-		// When persist is true, remember=true signals Gate.OnRemember to write
-		// the rule to the on-disk config. Plan approvals are excluded.
-		remember := r.persist && tool != planApprovalTool
-		return r.allow, remember, nil
+		if r.allow && r.persist && tool != planApprovalTool && c.onRemember != nil {
+			c.emitRememberResult(c.onRemember(permission.RememberRuleForScope(tool, subject, r.scope)))
+		}
+		return r.allow, false, nil
 	case <-ctx.Done():
 		c.mu.Lock()
 		delete(c.approvals, id)
 		c.mu.Unlock()
 		return false, false, ctx.Err()
+	}
+}
+
+func (c *Controller) sessionGrantAllowsLocked(tool, subject string) bool {
+	for rule := range c.granted {
+		if permission.RuleMatchesString(rule, tool, subject) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Controller) emitRememberResult(r RememberResult) {
+	if r.Err != nil {
+		c.sink.Emit(event.Event{
+			Kind:  event.Notice,
+			Level: event.LevelWarn,
+			Text:  fmt.Sprintf(i18n.M.PermissionSaveFailedFmt, r.Rule, r.Err),
+		})
+		return
+	}
+	switch {
+	case r.Saved:
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionSavedFmt, r.Path, r.Rule)})
+	case strings.TrimSpace(r.CoveredBy) != "":
+		c.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(i18n.M.PermissionAlreadyAllowedFmt, r.Path, r.CoveredBy)})
 	}
 }
