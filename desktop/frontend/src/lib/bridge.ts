@@ -100,6 +100,7 @@ export interface AppBindings {
   ApproveTabWithScope(tabID: string, id: string, allow: boolean, session: boolean, persist: boolean, scope: string): Promise<void>;
   AnswerQuestion(id: string, answers: QuestionAnswer[]): Promise<void>;
   AnswerQuestionForTab(tabID: string, id: string, answers: QuestionAnswer[]): Promise<void>;
+  ReplayPendingPrompts(): Promise<void>;
   SetPlanMode(on: boolean): Promise<void>;
   SetMode(mode: string): Promise<void>;
   SetModeForTab(tabID: string, mode: string): Promise<void>;
@@ -231,6 +232,7 @@ export interface AppBindings {
   ListTabs(): Promise<TabMeta[]>;
   OpenProjectTab(workspaceRoot: string, topicID: string): Promise<TabMeta>;
   OpenGlobalTab(topicID: string): Promise<TabMeta>;
+  EnsureBlankTab(scope: string, workspaceRoot: string): Promise<TabMeta>;
   SetActiveTab(tabID: string): Promise<void>;
   ReorderTabs(tabIDs: string[]): Promise<void>;
   CloseTab(tabID: string): Promise<void>;
@@ -1243,6 +1245,7 @@ function makeMockApp(): AppBindings {
         async AnswerQuestionForTab(_tabID, id, answers) {
           await withMockTabScope(_tabID, () => this.AnswerQuestion(id, answers));
         },
+        async ReplayPendingPrompts() {},
         async ConfirmAction(req) {
           void req;
           return false;
@@ -2129,6 +2132,21 @@ function makeMockApp(): AppBindings {
       };
       mockTabs = [...mockTabs.map((item) => ({ ...item, active: false })), tab];
       return { ...tab };
+    },
+    async EnsureBlankTab(scope: string, workspaceRoot: string) {
+      const targetScope = scope === "project" && workspaceRoot ? "project" : "global";
+      const targetRoot = targetScope === "project" ? workspaceRoot : "";
+      const existing = mockTabs.find((tab) =>
+        tab.scope === targetScope &&
+        (targetScope === "global" || tab.workspaceRoot === targetRoot) &&
+        !tab.running
+      );
+      if (existing) {
+        setMockActiveTab(existing.id);
+        return { ...existing, active: true };
+      }
+      const topic = await this.CreateTopic(targetScope, targetRoot, "");
+      return targetScope === "global" ? this.OpenGlobalTab(topic.id) : this.OpenProjectTab(targetRoot, topic.id);
     },
     async SetActiveTab(_tabID: string) {
       setMockActiveTab(_tabID);

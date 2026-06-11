@@ -608,6 +608,25 @@ func (a *App) ApproveTabWithScope(tabID, id string, allow, session, persist bool
 	}
 }
 
+// ReplayPendingPrompts asks every tab's controller to re-emit any approval/ask
+// prompt that is currently blocking its run loop. The frontend calls this once
+// its event subscription is live (on load/reconnect) so a session that was
+// already awaiting confirmation rebuilds its modal instead of showing a
+// "waiting" status with no way to answer — and no way to stop.
+func (a *App) ReplayPendingPrompts() {
+	a.mu.RLock()
+	tabs := make([]*WorkspaceTab, 0, len(a.tabs))
+	for _, t := range a.tabs {
+		tabs = append(tabs, t)
+	}
+	a.mu.RUnlock()
+	for _, t := range tabs {
+		if t.Ctrl != nil {
+			t.Ctrl.ReplayPendingPrompts()
+		}
+	}
+}
+
 // SetPlanMode toggles the read-only plan axis while preserving the current
 // tool-auto-approval axis.
 func (a *App) SetPlanMode(on bool) {
@@ -785,11 +804,26 @@ func (a *App) NewSession() error {
 	if ctrl == nil {
 		return nil
 	}
+	// Tab is already blank — just persist and skip the new-session dance.
+	if !ctrl.Running() && !messagesHaveConversationContent(ctrl.History()) {
+		a.persistTabSessionPath(tab, ctrl.SessionPath())
+		return nil
+	}
+
 	if err := ctrl.NewSession(); err != nil {
 		return err
 	}
 	a.persistTabSessionPath(tab, ctrl.SessionPath())
 	return nil
+}
+
+func messagesHaveConversationContent(messages []provider.Message) bool {
+	for _, msg := range messages {
+		if msg.Role != provider.RoleSystem {
+			return true
+		}
+	}
+	return false
 }
 
 // ClearSession discards the current conversation and rotates to a fresh unsaved one.
@@ -3825,7 +3859,7 @@ func (a *App) AttachDropped(path string) (DroppedItem, error) {
 				return nil
 			}
 		}
-		if rel, ok := workspaceRelative(path); ok {
+		if rel, ok := workspaceRelativeIn(path, a.activeWorkspaceRoot()); ok {
 			item = DroppedItem{Kind: "workspace", Path: rel, IsDir: info.IsDir()}
 			return nil
 		}
@@ -3853,12 +3887,16 @@ func isImageExt(path string) bool {
 	return false
 }
 
-func workspaceRelative(path string) (string, bool) {
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", false
+func workspaceRelativeIn(path, workspaceRoot string) (string, bool) {
+	root := workspaceRoot
+	if !filepath.IsAbs(root) {
+		abs, err := filepath.Abs(root)
+		if err != nil {
+			return "", false
+		}
+		root = abs
 	}
-	rel, err := filepath.Rel(cwd, path)
+	rel, err := filepath.Rel(root, path)
 	if err != nil {
 		return "", false
 	}
