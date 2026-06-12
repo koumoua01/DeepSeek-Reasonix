@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { useT } from "../lib/i18n";
 import type { WireApproval } from "../lib/types";
 import { PromptAction, PromptDetailToggle, PromptShelf } from "./PromptShelf";
+import { playAttentionChime } from "../lib/sound";
 
 export function ApprovalModal({
   approval,
@@ -10,7 +11,7 @@ export function ApprovalModal({
   onExitPlan,
 }: {
   approval: WireApproval;
-  onAnswer: (allow: boolean, session: boolean, persist: boolean, scope?: string) => void;
+  onAnswer: (allow: boolean, session: boolean, persist: boolean) => void;
   onRevisePlan?: (text: string) => void;
   onExitPlan?: () => void;
 }) {
@@ -21,10 +22,7 @@ export function ApprovalModal({
   const cardRef = useRef<HTMLDivElement | null>(null);
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const isPlanApproval = approval.tool === "exit_plan_mode";
-  const isBashApproval = approval.tool === "bash";
   const subject = approval.subject.trim();
-  const bashPrefix = isBashApproval ? bashCommandPrefix(subject) : "";
-  const hasBashPrefix = bashPrefix !== "";
   const subjectSummary = subject.split("\n").find((line) => line.trim())?.trim() ?? "";
 
 
@@ -36,9 +34,7 @@ export function ApprovalModal({
 
   const chooseToolAction = (key: string) => {
     if (key === "1") onAnswer(true, false, false);
-    else if (key === "2" && hasBashPrefix) onAnswer(true, true, false, "prefix");
     else if (key === "2") onAnswer(true, true, false);
-    else if (key === "3" && hasBashPrefix) onAnswer(true, true, true, "prefix");
     else if (key === "3") onAnswer(true, true, true);
     else if (key === "4" || key === "Escape") onAnswer(false, false, false);
   };
@@ -48,6 +44,7 @@ export function ApprovalModal({
     setRevisionOpen(false);
     setRevisionText("");
     setDetailsOpen(false);
+    playAttentionChime();
   }, [approval.id]);
 
   useEffect(() => {
@@ -62,7 +59,7 @@ export function ApprovalModal({
     };
     document.addEventListener("keydown", onKeyDown);
     return () => document.removeEventListener("keydown", onKeyDown);
-  }, [hasBashPrefix, isPlanApproval, onAnswer, onExitPlan]);
+  }, [isPlanApproval, onAnswer, onExitPlan]);
 
   useEffect(() => {
     if (revisionOpen) inputRef.current?.focus();
@@ -148,35 +145,9 @@ export function ApprovalModal({
             />
           )}
           <PromptAction keyLabel="1" label={t("approval.allowOnce")} onClick={() => onAnswer(true, false, false)} selected />
-          {hasBashPrefix ? (
-            <>
-              <PromptAction
-                keyLabel="2"
-                label={t("approval.allowRuleSession")}
-                onClick={() => onAnswer(true, true, false, "prefix")}
-              />
-              <PromptAction
-                keyLabel="3"
-                label={t("approval.allowRulePersistent")}
-                onClick={() => onAnswer(true, true, true, "prefix")}
-              />
-              <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
-            </>
-          ) : (
-            <>
-              <PromptAction
-                keyLabel="2"
-                label={t("approval.allowRuleSession")}
-                onClick={() => onAnswer(true, true, false)}
-              />
-              <PromptAction
-                keyLabel="3"
-                label={t("approval.allowRulePersistent")}
-                onClick={() => onAnswer(true, true, true)}
-              />
-              <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
-            </>
-          )}
+          <PromptAction keyLabel="2" label={t("approval.allowRuleSession")} onClick={() => onAnswer(true, true, false)} />
+          <PromptAction keyLabel="3" label={t("approval.allowRulePersistent")} onClick={() => onAnswer(true, true, true)} />
+          <PromptAction keyLabel="4" label={t("approval.deny")} onClick={() => onAnswer(false, false, false)} />
         </>
       }
     >
@@ -185,33 +156,5 @@ export function ApprovalModal({
       )}
     </PromptShelf>
   );
-}
 
-
-
-function bashCommandPrefix(subject: string): string {
-  const command = subject.trim();
-  if (!command || command.includes("`") || command.includes("$(") || /[;|&<>\n]/.test(command)) return "";
-  const fields = command.split(/\s+/).filter(Boolean);
-  if (fields.length < 2) return "";
-  if (dangerousBashCommand(command)) return "";
-  const base = fields[0].toLowerCase();
-  if ((base === "npm" || base === "pnpm" || base === "yarn" || base === "bun") && fields[1]?.toLowerCase() === "run") {
-    return fields.length >= 3 ? `${fields[0]} ${fields[1]} ${fields[2]}:*` : "";
-  }
-  return `${fields[0]} ${fields[1]}:*`;
-}
-
-function dangerousBashCommand(command: string): boolean {
-  return /^rm\s+-[^\s]*[rf][^\s]*\b/.test(command)
-    || /^git\s+push\b.*\s--force\b/.test(command)
-    || /^git\s+push\b.*\s-f\b/.test(command)
-    || /^git\s+reset\s+--hard\b/.test(command)
-    || /^git\s+clean\s+-f\b/.test(command)
-    || /^chmod\s+(?:-R\s+)?777\b/.test(command)
-    || /^chown\b/.test(command)
-    || /^sudo\b/.test(command)
-    || /^mkfs\b/.test(command)
-    || /^dd\s+if=/.test(command)
-    || /^fdisk\b/.test(command);
 }

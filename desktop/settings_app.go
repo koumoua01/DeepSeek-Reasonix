@@ -55,6 +55,7 @@ type SandboxView struct {
 	Network       bool     `json:"network"`
 	WorkspaceRoot string   `json:"workspaceRoot"`
 	AllowWrite    []string `json:"allowWrite"`
+	Shell         string   `json:"shell"` // [tools.shell] prefer: auto|bash|powershell|pwsh
 }
 
 type NetworkProxyView struct {
@@ -118,15 +119,16 @@ type WeixinBotView struct {
 }
 
 type BotSettingsView struct {
-	Enabled     bool                `json:"enabled"`
-	Model       string              `json:"model"`
-	MaxSteps    int                 `json:"maxSteps"`
-	DebounceMs  int                 `json:"debounceMs"`
-	Allowlist   BotAllowlistView    `json:"allowlist"`
-	QQ          QQBotView           `json:"qq"`
-	Feishu      FeishuBotView       `json:"feishu"`
-	Weixin      WeixinBotView       `json:"weixin"`
-	Connections []BotConnectionView `json:"connections"`
+	Enabled          bool                `json:"enabled"`
+	Model            string              `json:"model"`
+	ToolApprovalMode string              `json:"toolApprovalMode"`
+	MaxSteps         int                 `json:"maxSteps"`
+	DebounceMs       int                 `json:"debounceMs"`
+	Allowlist        BotAllowlistView    `json:"allowlist"`
+	QQ               QQBotView           `json:"qq"`
+	Feishu           FeishuBotView       `json:"feishu"`
+	Weixin           WeixinBotView       `json:"weixin"`
+	Connections      []BotConnectionView `json:"connections"`
 }
 
 // SettingsView is the whole Settings panel payload.
@@ -147,6 +149,13 @@ type SettingsView struct {
 	DesktopTheme      string          `json:"desktopTheme"`
 	DesktopThemeStyle string          `json:"desktopThemeStyle"`
 	CloseBehavior     string          `json:"closeBehavior"`
+	DisplayMode       string          `json:"displayMode"`
+	StatusBarStyle    string          `json:"statusBarStyle"`
+	StatusBarItems    []string        `json:"statusBarItems"`
+	CheckUpdates      bool            `json:"checkUpdates"`
+	Telemetry         bool            `json:"telemetry"`
+	Metrics           bool            `json:"metrics"`
+	ExpandThinking    bool            `json:"expandThinking"`
 	ConfigPath        string          `json:"configPath"`
 	// ProviderKinds lists the provider implementations the kernel actually
 	// registered (provider.Kinds()), so the editor's "kind" picker offers only
@@ -316,19 +325,30 @@ func (a *App) Settings() SettingsView {
 				Ask:   []string{},
 				Deny:  []string{},
 			},
-			Sandbox:           SandboxView{Bash: "enforce", AllowWrite: []string{}},
+			Sandbox:           SandboxView{Bash: "enforce", AllowWrite: []string{}, Shell: "auto"},
 			Agent:             AgentView{PlannerMaxSteps: 12},
 			Bot:               botSettingsView(config.BotConfig{}),
 			AutoPlan:          "off",
 			DesktopTheme:      "light",
 			DesktopThemeStyle: "graphite",
 			CloseBehavior:     "background",
+			DisplayMode:       "standard",
+			StatusBarStyle:    "text",
+			StatusBarItems:    config.DefaultDesktopStatusBarItems(),
+			CheckUpdates:      true,
+			Telemetry:         true,
+			Metrics:           false,
+			ExpandThinking:    false,
 		}
 	}
 	ctrl := a.activeCtrl()
 	bash := cfg.Sandbox.Bash
 	if bash == "" {
 		bash = "enforce"
+	}
+	shell := cfg.Tools.Shell.Prefer
+	if shell == "" {
+		shell = "auto"
 	}
 	v := SettingsView{
 		DefaultModel:      cfg.DefaultModel,
@@ -347,6 +367,7 @@ func (a *App) Settings() SettingsView {
 		Sandbox: SandboxView{
 			Bash: bash, Network: cfg.Sandbox.Network,
 			WorkspaceRoot: cfg.Sandbox.WorkspaceRoot, AllowWrite: nonNil(cfg.Sandbox.AllowWrite),
+			Shell: shell,
 		},
 		Network: NetworkView{
 			ProxyMode: cfg.NetworkProxyMode(),
@@ -366,6 +387,13 @@ func (a *App) Settings() SettingsView {
 		DesktopTheme:      cfg.DesktopTheme(),
 		DesktopThemeStyle: cfg.DesktopThemeStyle(),
 		CloseBehavior:     cfg.DesktopCloseBehavior(),
+		DisplayMode:       cfg.DesktopDisplayMode(),
+		StatusBarStyle:    cfg.DesktopStatusBarStyle(),
+		StatusBarItems:    cfg.DesktopStatusBarItems(),
+		CheckUpdates:      cfg.DesktopCheckUpdates(),
+		Telemetry:         cfg.DesktopTelemetry(),
+		Metrics:           cfg.DesktopMetrics(),
+		ExpandThinking:    cfg.Desktop.ExpandThinking,
 		ConfigPath:        cfgPath,
 		ProviderKinds:     nonNil(provider.Kinds()),
 		AutoApproveTools:  ctrl != nil && ctrl.AutoApproveTools(),
@@ -386,10 +414,11 @@ func botSettingsView(b config.BotConfig) BotSettingsView {
 		mode = "webhook"
 	}
 	return BotSettingsView{
-		Enabled:    b.Enabled,
-		Model:      b.Model,
-		MaxSteps:   b.MaxSteps,
-		DebounceMs: b.DebounceMs,
+		Enabled:          b.Enabled,
+		Model:            b.Model,
+		ToolApprovalMode: normalizeBotConnectionToolApprovalMode(b.ToolApprovalMode),
+		MaxSteps:         b.MaxSteps,
+		DebounceMs:       b.DebounceMs,
 		Allowlist: BotAllowlistView{
 			Enabled:      b.Allowlist.Enabled,
 			AllowAll:     b.Allowlist.AllowAll,
@@ -481,6 +510,9 @@ func (a *App) loadDesktopUserConfigForEdit() (*config.Config, string, error) {
 	if _, err := os.Stat(userPath); err == nil {
 		cfg := config.LoadForEdit(userPath)
 		normalizeLegacyDesktopProviderAccessForSettings(cfg, userPath)
+		if err := a.migrateLegacyBotConfigToUser(cfg, userPath); err != nil {
+			return nil, "", err
+		}
 		return cfg, userPath, nil
 	}
 	cfg := config.LoadForEdit(userPath)
@@ -492,7 +524,71 @@ func (a *App) loadDesktopUserConfigForEdit() (*config.Config, string, error) {
 	legacyCfg := config.LoadForEdit(legacyPath)
 	normalizeLegacyDesktopProviderAccessForSettings(legacyCfg, legacyPath)
 	legacyCfg.ConfigVersion = config.Default().ConfigVersion
+	if err := migrateLegacyBotConfigToUser(cfg, legacyCfg, userPath); err != nil {
+		return nil, "", err
+	}
 	return legacyCfg, userPath, nil
+}
+
+func (a *App) migrateLegacyBotConfigToUser(userCfg *config.Config, userPath string) error {
+	if userCfg == nil {
+		return nil
+	}
+	legacyPath := config.SourcePathForRoot(a.activeWorkspaceRoot())
+	if legacyPath == "" || sameConfigPath(legacyPath, userPath) {
+		return nil
+	}
+	legacyCfg := config.LoadForEdit(legacyPath)
+	return migrateLegacyBotConfigToUser(userCfg, legacyCfg, userPath)
+}
+
+func migrateLegacyBotConfigToUser(userCfg, legacyCfg *config.Config, userPath string) error {
+	if userCfg == nil || legacyCfg == nil || desktopBotConfigConfigured(userCfg.Bot) {
+		return nil
+	}
+	if !desktopBotConfigConfigured(legacyCfg.Bot) {
+		return nil
+	}
+	userCfg.Bot = legacyCfg.Bot
+	if err := userCfg.SaveTo(userPath); err != nil {
+		return fmt.Errorf("migrate legacy bot config: %w", err)
+	}
+	return nil
+}
+
+func desktopBotConfigConfigured(bot config.BotConfig) bool {
+	defaults := config.Default().Bot
+	if bot.Enabled || strings.TrimSpace(bot.Model) != "" || len(bot.Connections) > 0 {
+		return true
+	}
+	if (bot.MaxSteps != 0 && bot.MaxSteps != defaults.MaxSteps) || (bot.DebounceMs != 0 && bot.DebounceMs != defaults.DebounceMs) {
+		return true
+	}
+	if bot.Allowlist.AllowAll ||
+		len(bot.Allowlist.QQUsers)+len(bot.Allowlist.FeishuUsers)+len(bot.Allowlist.WeixinUsers) > 0 ||
+		len(bot.Allowlist.QQGroups)+len(bot.Allowlist.FeishuGroups)+len(bot.Allowlist.WeixinGroups) > 0 {
+		return true
+	}
+	if bot.QQ.Enabled || strings.TrimSpace(bot.QQ.AppID) != "" || bot.QQ.AppSecretEnv != defaults.QQ.AppSecretEnv {
+		return true
+	}
+	if bot.Feishu.Enabled ||
+		strings.TrimSpace(bot.Feishu.AppID) != "" ||
+		bot.Feishu.Domain != defaults.Feishu.Domain ||
+		bot.Feishu.AppSecretEnv != defaults.Feishu.AppSecretEnv ||
+		strings.TrimSpace(bot.Feishu.VerificationToken) != "" ||
+		bot.Feishu.Mode != defaults.Feishu.Mode ||
+		bot.Feishu.WebhookPort != defaults.Feishu.WebhookPort ||
+		bot.Feishu.RequireMention != defaults.Feishu.RequireMention {
+		return true
+	}
+	if bot.Weixin.Enabled ||
+		bot.Weixin.AccountID != defaults.Weixin.AccountID ||
+		bot.Weixin.TokenEnv != defaults.Weixin.TokenEnv ||
+		bot.Weixin.APIBase != defaults.Weixin.APIBase {
+		return true
+	}
+	return false
 }
 
 func normalizeLegacyDesktopProviderAccessForSettings(cfg *config.Config, path string) {
@@ -587,6 +683,7 @@ func (a *App) rebuild() error {
 		WorkspaceRoot:  tab.WorkspaceRoot,
 		SessionDir:     tabSessionDir(tab),
 		EffortOverride: cloneStringPtr(tab.effort),
+		TokenMode:      currentTabTokenMode(tab),
 	})
 	if err != nil {
 		a.mu.Lock()
@@ -1168,12 +1265,13 @@ func (a *App) RemovePermissionRule(list, rule string) error {
 }
 
 // SetSandbox updates the bash sandbox mode, network egress, and write roots.
-func (a *App) SetSandbox(bash string, network bool, workspaceRoot string, allowWrite []string) error {
+func (a *App) SetSandbox(bash string, network bool, workspaceRoot string, allowWrite []string, shell string) error {
 	return a.applyConfigChange(func(c *config.Config) error {
 		c.Sandbox.Bash = bash
 		c.Sandbox.Network = network
 		c.Sandbox.WorkspaceRoot = strings.TrimSpace(workspaceRoot)
 		c.Sandbox.AllowWrite = trimList(allowWrite)
+		c.Tools.Shell.Prefer = strings.TrimSpace(shell)
 		return nil
 	})
 }
@@ -1197,9 +1295,10 @@ func (a *App) SetNetwork(n NetworkView) error {
 }
 
 func (a *App) SetBotSettings(b BotSettingsView) error {
-	return a.applyConfigOnly(func(c *config.Config) error {
+	err := a.applyConfigOnly(func(c *config.Config) error {
 		c.Bot.Enabled = b.Enabled
 		c.Bot.Model = strings.TrimSpace(b.Model)
+		c.Bot.ToolApprovalMode = normalizeBotConnectionToolApprovalMode(b.ToolApprovalMode)
 		c.Bot.MaxSteps = b.MaxSteps
 		c.Bot.DebounceMs = b.DebounceMs
 		c.Bot.Allowlist = config.BotAllowlist{
@@ -1236,6 +1335,10 @@ func (a *App) SetBotSettings(b BotSettingsView) error {
 		c.Bot.Connections = botConnectionConfigs(b.Connections)
 		return nil
 	})
+	if err == nil {
+		a.refreshBotRuntimeAsync()
+	}
+	return err
 }
 
 func (a *App) SetBotSecret(envName, value string) error {
@@ -1246,6 +1349,7 @@ func (a *App) SetBotSecret(envName, value string) error {
 	if err := upsertDotEnv(envName, value); err != nil {
 		return err
 	}
+	a.refreshBotRuntimeAsync()
 	return nil
 }
 
@@ -1254,13 +1358,34 @@ func (a *App) ClearBotSecret(envName string) error {
 	if envName == "" {
 		return fmt.Errorf("bot secret env name is empty")
 	}
-	return removeDotEnv(envName)
+	if err := removeDotEnv(envName); err != nil {
+		return err
+	}
+	a.refreshBotRuntimeAsync()
+	return nil
 }
 
 // SetCloseBehavior updates desktop-only window close behavior without rebuilding
 // the active controller. It must stay out of provider-visible prompt/request data.
 func (a *App) SetCloseBehavior(mode string) error {
 	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopCloseBehavior(mode) })
+}
+
+// SetDisplayMode updates the transcript display mode. UI-only, no rebuild needed.
+func (a *App) SetDisplayMode(mode string) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopDisplayMode(mode) })
+}
+
+// SetStatusBarStyle updates the desktop status bar metric label style. UI-only,
+// no rebuild needed.
+func (a *App) SetStatusBarStyle(style string) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopStatusBarStyle(style) })
+}
+
+// SetStatusBarItems updates the ordered visible desktop status bar items.
+// UI-only, no rebuild needed.
+func (a *App) SetStatusBarItems(items []string) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopStatusBarItems(items) })
 }
 
 // SetDesktopLanguage updates only the desktop UI language. It deliberately does
@@ -1287,6 +1412,38 @@ func (a *App) SetTrayLocale(locale string) error {
 // rebuild the active controller and must stay out of provider-visible requests.
 func (a *App) SetDesktopAppearance(theme, style string) error {
 	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopAppearance(theme, style) })
+}
+
+// SetDesktopCheckUpdates updates only the desktop startup update-check
+// preference. Manual checks in Settings are unaffected.
+func (a *App) SetDesktopCheckUpdates(enabled bool) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopCheckUpdates(enabled) })
+}
+
+// SetDesktopTelemetry sets whether the desktop sends the anonymous launch ping.
+func (a *App) SetDesktopTelemetry(enabled bool) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopTelemetry(enabled) })
+}
+
+// SetDesktopMetrics sets whether the desktop sends opt-in aggregate agent metrics,
+// starting or stopping the live aggregator so the toggle takes effect immediately.
+func (a *App) SetDesktopMetrics(enabled bool) error {
+	if err := a.applyConfigOnly(func(c *config.Config) error { return c.SetDesktopMetrics(enabled) }); err != nil {
+		return err
+	}
+	switch {
+	case enabled && a.metrics.Load() == nil && version != "dev":
+		a.metrics.Store(newMetricsAggregator(filepath.Dir(config.UserConfigPath())))
+	case !enabled:
+		a.metrics.Store(nil)
+	}
+	return nil
+}
+
+// SetExpandThinking sets whether reasoning text is expanded by default on
+// the desktop. It is desktop-only and does not rebuild the controller.
+func (a *App) SetExpandThinking(on bool) error {
+	return a.applyConfigOnly(func(c *config.Config) error { return c.SetExpandThinking(on) })
 }
 
 // MigrateDesktopPreferences imports old browser-local desktop preferences into

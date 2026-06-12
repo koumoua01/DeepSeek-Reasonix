@@ -77,6 +77,20 @@ func (c *Config) SetAutoPlan(mode string) error {
 	return nil
 }
 
+// SetUIShortcutLayout selects the CLI keyboard shortcut layout. "classic" keeps
+// historical behavior; "desktop" enables the two-axis desktop-style shortcuts.
+func (c *Config) SetUIShortcutLayout(layout string) error {
+	switch strings.ToLower(strings.TrimSpace(layout)) {
+	case "", "classic", "default", "legacy", "off":
+		c.UI.ShortcutLayout = "classic"
+	case "desktop", "dual", "dual-axis", "dual_axis":
+		c.UI.ShortcutLayout = "desktop"
+	default:
+		return fmt.Errorf("shortcut_layout %q: must be classic|desktop", layout)
+	}
+	return nil
+}
+
 // UpsertProvider adds e, or replaces an existing provider with the same name
 // (preserving its position). Required fields (name, kind, base_url, model/models)
 // are validated; whether the kind is actually registered and the key resolves is
@@ -178,9 +192,97 @@ func (c *Config) SetDesktopCloseBehavior(mode string) error {
 	return nil
 }
 
+// SetDesktopDisplayMode sets the transcript display mode. UI-only.
+func (c *Config) SetDesktopDisplayMode(mode string) error {
+	switch strings.ToLower(strings.TrimSpace(mode)) {
+	case "compact":
+		c.Desktop.DisplayMode = "compact"
+	case "minimal":
+		c.Desktop.DisplayMode = "minimal"
+	case "", "standard":
+		c.Desktop.DisplayMode = "standard"
+	default:
+		return fmt.Errorf("display mode %q: must be standard|compact|minimal", mode)
+	}
+	return nil
+}
+
+// SetDesktopStatusBarStyle sets the desktop status bar metric label style.
+// UI-only; it must not affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopStatusBarStyle(style string) error {
+	switch strings.ToLower(strings.TrimSpace(style)) {
+	case "icon", "icons":
+		c.Desktop.StatusBarStyle = "icon"
+	case "", "text", "label", "labels":
+		c.Desktop.StatusBarStyle = "text"
+	default:
+		return fmt.Errorf("status bar style %q: must be icon|text", style)
+	}
+	return nil
+}
+
+// SetDesktopStatusBarItems sets the ordered visible desktop status bar items.
+// UI-only; it must not affect CLI output or provider-visible request data.
+func (c *Config) SetDesktopStatusBarItems(items []string) error {
+	out := make([]string, 0, len(items))
+	seen := map[string]bool{}
+	for _, raw := range items {
+		id := strings.TrimSpace(raw)
+		if id == "" || seen[id] {
+			continue
+		}
+		if !knownDesktopStatusBarItems[id] {
+			return fmt.Errorf("status bar item %q: unknown item", id)
+		}
+		out = append(out, id)
+		seen[id] = true
+	}
+	if len(out) == 0 {
+		out = DefaultDesktopStatusBarItems()
+	}
+	c.Desktop.StatusBarItems = out
+	return nil
+}
+
+// SetDesktopCheckUpdates sets whether the desktop app checks for updates on
+// startup. Manual checks remain available in Settings regardless of this value.
+func (c *Config) SetDesktopCheckUpdates(enabled bool) error {
+	c.Desktop.CheckUpdates = &enabled
+	return nil
+}
+
+// SetDesktopTelemetry sets whether the desktop sends the anonymous launch ping.
+func (c *Config) SetDesktopTelemetry(enabled bool) error {
+	c.Desktop.Telemetry = &enabled
+	return nil
+}
+
+// SetDesktopMetrics sets whether the desktop sends opt-in aggregate agent metrics.
+func (c *Config) SetDesktopMetrics(enabled bool) error {
+	c.Desktop.Metrics = &enabled
+	return nil
+}
+
 // SetUICloseBehavior is kept for callers compiled against the old edit API.
 func (c *Config) SetUICloseBehavior(mode string) error {
 	return c.SetDesktopCloseBehavior(mode)
+}
+
+// SetExpandThinking sets whether the desktop reasoning/thinking section is
+// expanded by default. It is desktop-only and must not affect CLI output or
+// provider-visible request data.
+func (c *Config) SetExpandThinking(on bool) error {
+	c.Desktop.ExpandThinking = on
+	return nil
+}
+
+// SetShowReasoning sets the CLI's default verbose-reasoning preference. When
+// true, thinking text is shown in the chat TUI on startup; when false (the
+// default), it stays collapsed until the user toggles it with Ctrl+O or
+// /verbose.
+func (c *Config) SetShowReasoning(on bool) error {
+	c.UI.ShowReasoning = on
+	return nil
 }
 
 // SetProviderThinking updates a provider's provider-specific thinking mode knob.

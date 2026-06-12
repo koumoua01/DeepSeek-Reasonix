@@ -52,6 +52,7 @@ type ref struct {
 
 // refTokenRe matches an @reference token: '@' then a run of non-space chars.
 var refTokenRe = regexp.MustCompile(`@([^\s]+)`)
+var pathLocationSuffixRe = regexp.MustCompile(`:\d+(?::\d+)?:?$`)
 
 // parseRefTokens extracts the deduped, punctuation-trimmed tokens following '@'
 // in a line. Pure: classification (server? file?) happens in classifyRef.
@@ -138,6 +139,22 @@ func (c *Controller) HasRefs(line string) bool {
 	return len(c.detectRefs(line)) > 0
 }
 
+// inputImages resolves image @-attachments in the turn input to data URLs so the
+// turn can carry them to a vision-capable model. Best-effort: an unreadable
+// attachment is skipped — the @image ref still lands as text via ResolveRefs.
+func (c *Controller) inputImages(line string) []string {
+	var urls []string
+	for _, r := range c.detectRefs(line) {
+		if r.kind != refImage {
+			continue
+		}
+		if url, err := visionImageDataURL(r.path); err == nil {
+			urls = append(urls, url)
+		}
+	}
+	return urls
+}
+
 // resolveBareNames batch-resolves simple filenames (no path separator) that
 // don't exist in cwd. It walks the working tree once and matches every
 // unresolved name against the set, stopping when all are found. This runs in
@@ -207,6 +224,77 @@ func FileRefLine(line string) (string, bool) {
 		return "", false
 	}
 	return "@" + p, true
+}
+
+// SlashPathLineRef reports whether a slash-prefixed line starts with a local file
+// path, including common compiler-location suffixes like ":12" or ":12:34".
+// It returns an @reference for the file so diagnostics that begin with an
+// absolute path can keep their original text while also attaching file context.
+func SlashPathLineRef(line, baseDir string) (string, bool) {
+	token, ok := leadingSlashPathToken(line)
+	if !ok {
+		return "", false
+	}
+	for _, p := range pathTokenCandidates(token) {
+		if fileRefExists(p, baseDir) {
+			return "@" + p, true
+		}
+	}
+	return "", false
+}
+
+// SlashPathLikeLine reports whether a slash-prefixed line looks like a POSIX
+// absolute path rather than a slash command. It intentionally stays conservative:
+// unknown "/foo" remains an unknown command, while "/foo/bar..." is sent as
+// ordinary prompt text even if the path no longer exists.
+func SlashPathLikeLine(line string) bool {
+	token, ok := leadingSlashPathToken(line)
+	if !ok {
+		return false
+	}
+	for _, p := range pathTokenCandidates(token) {
+		if strings.Contains(p[1:], "/") {
+			return true
+		}
+	}
+	return false
+}
+
+func leadingSlashPathToken(line string) (string, bool) {
+	fields := strings.Fields(strings.TrimSpace(line))
+	if len(fields) == 0 {
+		return "", false
+	}
+	token := strings.Trim(fields[0], `"'`)
+	if !strings.HasPrefix(token, "/") || strings.HasPrefix(token, "//") {
+		return "", false
+	}
+	return token, true
+}
+
+func pathTokenCandidates(token string) []string {
+	token = strings.TrimRight(strings.Trim(token, `"'`), ".,;!?)]}")
+	if token == "" {
+		return nil
+	}
+	candidates := []string{token}
+	if stripped := pathLocationSuffixRe.ReplaceAllString(token, ""); stripped != token {
+		candidates = append(candidates, stripped)
+	}
+	return candidates
+}
+
+func fileRefExists(path, baseDir string) bool {
+	statPath := path
+	if baseDir != "" {
+		absPath, _, ok := resolveAbsRef(path, baseDir)
+		if !ok {
+			return false
+		}
+		statPath = absPath
+	}
+	info, err := os.Stat(statPath)
+	return err == nil && !info.IsDir()
 }
 
 // ResolveRefs resolves the @references in a line into a single tagged context
