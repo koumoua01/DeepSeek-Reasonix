@@ -6,6 +6,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"reasonix/internal/provider"
 )
 
 type RenderScope string
@@ -36,11 +38,14 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	default:
 		scope = RenderScopeFull
 	}
+	if scope == RenderScopeProject {
+		c = projectScopedConfigForRender(c)
+	}
 	defaults := Default()
 	var b strings.Builder
 
 	b.WriteString("# Reasonix configuration.\n")
-	b.WriteString("# Resolution order: flag > ./reasonix.toml > ~/.config/reasonix/config.toml > built-in defaults.\n")
+	fmt.Fprintf(&b, "# Resolution order: flag > ./reasonix.toml > %s > built-in defaults.\n", userConfigDisplayPath())
 	b.WriteString("# Secrets come from the environment via api_key_env; never put keys here.\n\n")
 
 	fmt.Fprintf(&b, "config_version = %d   # schema marker for diagnostics; old versions may ignore it\n", configVersion(c))
@@ -58,10 +63,20 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		if style := c.UIThemeStyle(); style != "" {
 			fmt.Fprintf(&b, "theme_style = %q   # CLI accent palette; REASONIX_THEME_STYLE can override per run\n", style)
 		} else {
-			b.WriteString("# theme_style = \"graphite\"   # graphite|ember|aurora|midnight|sandstone|porcelain|linen|glacier\n")
+			b.WriteString("# theme_style = \"graphite\"   # graphite|aurora|slate|carbon|nocturne|amber and legacy aliases\n")
+		}
+		if layout := c.UIShortcutLayout(); layout != "classic" {
+			fmt.Fprintf(&b, "shortcut_layout = %q   # classic|desktop; compatibility setting; Shift+Tab toggles Plan, Ctrl+Y toggles YOLO\n", layout)
+		} else {
+			b.WriteString("# shortcut_layout = \"desktop\"   # classic|desktop; compatibility setting; Shift+Tab toggles Plan, Ctrl+Y toggles YOLO\n")
 		}
 		if strings.TrimSpace(c.UI.CloseBehavior) != "" && scope == RenderScopeProject {
 			fmt.Fprintf(&b, "close_behavior = %q   # legacy desktop close behavior; prefer [desktop].close_behavior in user config\n", c.DesktopCloseBehavior())
+		}
+		if c.UI.ShowReasoning {
+			b.WriteString("show_reasoning = true   # CLI: show thinking text by default; false = collapsed (toggle with Ctrl+O)\n")
+		} else {
+			b.WriteString("# show_reasoning = true   # CLI: show thinking text by default; false = collapsed (toggle with Ctrl+O)\n")
 		}
 		b.WriteString("\n")
 	}
@@ -73,16 +88,23 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		} else {
 			b.WriteString("# language = \"zh\"   # desktop UI language; empty/auto = browser/OS auto-detect\n")
 		}
+		fmt.Fprintf(&b, "layout_style = %q   # desktop layout: classic|workbench\n", c.DesktopLayoutStyle())
 		fmt.Fprintf(&b, "theme = %q   # desktop only: auto|dark|light\n", c.DesktopTheme())
 		if style := c.DesktopThemeStyle(); style != "" {
 			fmt.Fprintf(&b, "theme_style = %q   # desktop accent palette\n", style)
 		} else {
-			b.WriteString("# theme_style = \"graphite\"   # graphite|ember|aurora|midnight|sandstone|porcelain|linen|glacier\n")
+			b.WriteString("# theme_style = \"graphite\"   # graphite|aurora|slate|carbon|nocturne|amber and legacy aliases\n")
 		}
 		fmt.Fprintf(&b, "close_behavior = %q   # desktop: quit|background when the window close button is clicked\n", c.DesktopCloseBehavior())
+		fmt.Fprintf(&b, "status_bar_style = %q   # desktop: icon|text metric labels in the bottom status bar\n", c.DesktopStatusBarStyle())
+		fmt.Fprintf(&b, "status_bar_items = %s   # desktop: ordered visible bottom status bar items\n", renderStringArray(c.DesktopStatusBarItems()))
+		fmt.Fprintf(&b, "check_updates = %v   # desktop: check for new versions on startup\n", c.DesktopCheckUpdates())
+		fmt.Fprintf(&b, "telemetry = %v   # desktop: anonymous launch ping (install id + version + OS); never content\n", c.DesktopTelemetry())
+		fmt.Fprintf(&b, "metrics = %v   # desktop: opt-in aggregate agent metrics (anonymous signal/bucket counts); never content\n", c.DesktopMetrics())
 		if len(c.Desktop.ProviderAccess) > 0 {
 			fmt.Fprintf(&b, "provider_access = %s   # desktop settings: providers shown on Settings > Model > Access\n", renderStringArray(c.Desktop.ProviderAccess))
 		}
+		fmt.Fprintf(&b, "expand_thinking = %v   # desktop: show reasoning text expanded by default; false = collapsed\n", c.Desktop.ExpandThinking)
 		b.WriteString("\n")
 
 		b.WriteString("[notifications]\n")
@@ -148,8 +170,16 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	} else {
 		b.WriteString("# system_prompt_file = \"prompts/system.md\"   # overrides system_prompt when set\n")
 	}
-	fmt.Fprintf(&b, "max_steps         = %d   # executor tool-call rounds; 0 = no limit\n", c.Agent.MaxSteps)
-	fmt.Fprintf(&b, "planner_max_steps = %d   # planner read-only tool-call rounds; 0 = no limit\n", c.Agent.PlannerMaxSteps)
+	if c.Agent.MaxSteps != defaults.Agent.MaxSteps {
+		fmt.Fprintf(&b, "max_steps         = %d   # executor tool-call rounds; 0 = no limit\n", c.Agent.MaxSteps)
+	} else {
+		b.WriteString("# max_steps         = 0   # executor tool-call rounds; 0 = no limit\n")
+	}
+	if c.Agent.PlannerMaxSteps != defaults.Agent.PlannerMaxSteps {
+		fmt.Fprintf(&b, "planner_max_steps = %d   # planner read-only tool-call rounds; 0 = no limit\n", c.Agent.PlannerMaxSteps)
+	} else {
+		b.WriteString("# planner_max_steps = 12   # planner read-only tool-call rounds; 0 = no limit\n")
+	}
 	fmt.Fprintf(&b, "temperature       = %s\n", formatFloat(c.Agent.Temperature))
 	autoPlan := c.Agent.AutoPlan
 	switch strings.ToLower(strings.TrimSpace(autoPlan)) {
@@ -159,6 +189,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		autoPlan = "off"
 	}
 	fmt.Fprintf(&b, "auto_plan   = %q   # off|on; off keeps plan mode manual\n", autoPlan)
+	if lang := c.ReasoningLanguage(); lang != "auto" {
+		fmt.Fprintf(&b, "reasoning_language = %q   # visible reasoning language: auto|zh|en\n", lang)
+	} else {
+		b.WriteString("# reasoning_language = \"zh\"   # visible reasoning language: auto|zh|en\n")
+	}
 	if c.Agent.AutoPlanClassifier != "" {
 		fmt.Fprintf(&b, "auto_plan_classifier = %q   # optional provider/model for borderline auto-plan decisions\n", c.Agent.AutoPlanClassifier)
 	} else {
@@ -167,6 +202,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	fmt.Fprintf(&b, "soft_compact_ratio  = %s   # notice only; keeps cache-first prefix intact\n", formatFloat(c.Agent.SoftCompactRatio))
 	fmt.Fprintf(&b, "compact_ratio       = %s   # try compacting when prompt reaches this fraction\n", formatFloat(c.Agent.CompactRatio))
 	fmt.Fprintf(&b, "compact_force_ratio = %s   # force compacting at this high-water mark\n", formatFloat(c.Agent.CompactForceRatio))
+	fmt.Fprintf(&b, "cold_resume_prune   = %v   # elide stale tool results when reopening a session past the provider cache window\n", c.ColdResumePruneEnabled())
 	if c.Agent.PlannerModel != "" {
 		fmt.Fprintf(&b, "planner_model = %q   # low-frequency planner (two-model collaboration)\n", c.Agent.PlannerModel)
 	} else {
@@ -224,8 +260,10 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 				fmt.Fprintf(&b, "context_window = %d   # tokens; compaction triggers near this limit\n", p.ContextWindow)
 			}
 			if p.Price != nil {
-				fmt.Fprintf(&b, "price       = { cache_hit = %v, input = %v, output = %v, currency = %q }   # per 1M tokens\n",
-					p.Price.CacheHit, p.Price.Input, p.Price.Output, p.Price.Symbol())
+				fmt.Fprintf(&b, "price       = %s   # provider-wide fallback, per 1M tokens\n", renderPricingInline(p.Price))
+			}
+			if len(p.Prices) > 0 {
+				fmt.Fprintf(&b, "prices      = %s   # per-model prices, per 1M tokens\n", renderPricingMap(p.Prices))
 			}
 			if p.Thinking != "" {
 				fmt.Fprintf(&b, "thinking    = %q\n", p.Thinking)
@@ -274,6 +312,18 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	}
 	b.WriteString("\n")
 
+	b.WriteString("[builtin_mcp]\n")
+	fmt.Fprintf(&b, "time_enabled = %v   # built-in Time MCP; off until manually enabled\n", c.BuiltInMCP.TimeEnabled)
+	fmt.Fprintf(&b, "context7_enabled = %v   # built-in Context7 MCP; off until manually enabled\n", c.BuiltInMCP.Context7Enabled)
+	b.WriteString("\n")
+
+	if scope != RenderScopeProject {
+		b.WriteString("[builtin_mcp_updates]\n")
+		fmt.Fprintf(&b, "mode = %q   # off|notify|download|auto_next_session; auto never hot-swaps active sessions\n", c.BuiltInMCPUpdates.ResolvedMode())
+		fmt.Fprintf(&b, "check_interval = %q   # minimum interval between desktop startup background checks\n", c.BuiltInMCPUpdates.ResolvedCheckInterval())
+		b.WriteString("\n")
+	}
+
 	renderLSPConfig(&b, c.LSP)
 
 	b.WriteString("[skills]\n")
@@ -313,7 +363,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	b.WriteString("\n")
 
 	b.WriteString("[sandbox]\n")
-	b.WriteString("# Confine tool blast radius. File-writers (write_file/edit_file/multi_edit)\n")
+	b.WriteString("# Confine tool blast radius. File-writers (write_file/edit_file/multi_edit/move_file)\n")
 	b.WriteString("# may only write under workspace_root (empty = current dir) + allow_write.\n")
 	b.WriteString("# bash = \"enforce\" (default) jails each command in an OS sandbox (macOS now;\n")
 	b.WriteString("# graceful fallback elsewhere); \"off\" disables it. network allows egress.\n")
@@ -350,6 +400,11 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		} else {
 			b.WriteString("# model = \"\"   # empty = default_model\n")
 		}
+		if c.Bot.ToolApprovalMode != "" {
+			fmt.Fprintf(&b, "tool_approval_mode = %q   # ask|auto|yolo; yolo skips tool approvals only\n", c.Bot.ToolApprovalMode)
+		} else {
+			b.WriteString("# tool_approval_mode = \"ask\"   # ask|auto|yolo; ask and plan decisions still wait\n")
+		}
 		fmt.Fprintf(&b, "max_steps = %d\n", c.Bot.MaxSteps)
 		fmt.Fprintf(&b, "debounce_ms = %d\n", c.Bot.DebounceMs)
 		b.WriteString("\n[bot.allowlist]\n")
@@ -365,6 +420,7 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 		fmt.Fprintf(&b, "enabled = %v\n", c.Bot.QQ.Enabled)
 		fmt.Fprintf(&b, "app_id = %q\n", c.Bot.QQ.AppID)
 		fmt.Fprintf(&b, "app_secret_env = %q\n", c.Bot.QQ.AppSecretEnv)
+		fmt.Fprintf(&b, "sandbox = %v\n", c.Bot.QQ.Sandbox)
 		b.WriteString("\n[bot.feishu]\n")
 		fmt.Fprintf(&b, "enabled = %v\n", c.Bot.Feishu.Enabled)
 		fmt.Fprintf(&b, "app_id = %q\n", c.Bot.Feishu.AppID)
@@ -387,6 +443,15 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 			fmt.Fprintf(&b, "label = %q\n", conn.Label)
 			fmt.Fprintf(&b, "enabled = %v\n", conn.Enabled)
 			fmt.Fprintf(&b, "status = %q\n", conn.Status)
+			if conn.Model != "" {
+				fmt.Fprintf(&b, "model = %q\n", conn.Model)
+			}
+			if conn.ToolApprovalMode != "" {
+				fmt.Fprintf(&b, "tool_approval_mode = %q\n", conn.ToolApprovalMode)
+			}
+			if conn.WorkspaceRoot != "" {
+				fmt.Fprintf(&b, "workspace_root = %q\n", conn.WorkspaceRoot)
+			}
 			if conn.LastError != "" {
 				fmt.Fprintf(&b, "last_error = %q\n", conn.LastError)
 			}
@@ -448,6 +513,40 @@ func RenderTOMLForScope(c *Config, scope RenderScope) string {
 	return b.String()
 }
 
+func renderPricingInline(p *provider.Pricing) string {
+	if p == nil {
+		return "{}"
+	}
+	return fmt.Sprintf("{ cache_hit = %v, input = %v, output = %v, currency = %q }",
+		p.CacheHit, p.Input, p.Output, p.Symbol())
+}
+
+func renderPricingMap(prices map[string]*provider.Pricing) string {
+	if len(prices) == 0 {
+		return "{}"
+	}
+	keys := make([]string, 0, len(prices))
+	for model := range prices {
+		if strings.TrimSpace(model) != "" && prices[model] != nil {
+			keys = append(keys, model)
+		}
+	}
+	if len(keys) == 0 {
+		return "{}"
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString("{ ")
+	for i, model := range keys {
+		if i > 0 {
+			b.WriteString(", ")
+		}
+		fmt.Fprintf(&b, "%s = %s", strconv.Quote(model), renderPricingInline(prices[model]))
+	}
+	b.WriteString(" }")
+	return b.String()
+}
+
 func configVersion(c *Config) int {
 	if c != nil && c.ConfigVersion > 0 {
 		return c.ConfigVersion
@@ -474,6 +573,21 @@ func shouldRenderProviders(c, defaults *Config, scope RenderScope) bool {
 		return true
 	}
 	return !reflect.DeepEqual(c.Providers, defaults.Providers)
+}
+
+func projectScopedConfigForRender(c *Config) *Config {
+	if c == nil || len(c.providerSources) == 0 {
+		return c
+	}
+	cp := *c
+	cp.Providers = make([]ProviderEntry, 0, len(c.Providers))
+	for _, p := range c.Providers {
+		if c.providerSources[providerMergeKey(p)] == providerSourceUser {
+			continue
+		}
+		cp.Providers = append(cp.Providers, p)
+	}
+	return &cp
 }
 
 func shouldRenderBot(c, defaults *Config, scope RenderScope) bool {
@@ -616,6 +730,24 @@ func renderBotSessionMappings(mappings []BotConnectionSessionMapping) string {
 		parts := map[string]string{
 			"remote_id":  mapping.RemoteID,
 			"session_id": mapping.SessionID,
+		}
+		if mapping.SessionSource != "" {
+			parts["session_source"] = mapping.SessionSource
+		}
+		if mapping.ChatType != "" {
+			parts["chat_type"] = mapping.ChatType
+		}
+		if mapping.UserID != "" {
+			parts["user_id"] = mapping.UserID
+		}
+		if mapping.ThreadID != "" {
+			parts["thread_id"] = mapping.ThreadID
+		}
+		if mapping.Scope != "" {
+			parts["scope"] = mapping.Scope
+		}
+		if mapping.WorkspaceRoot != "" {
+			parts["workspace_root"] = mapping.WorkspaceRoot
 		}
 		if mapping.UpdatedAt != "" {
 			parts["updated_at"] = mapping.UpdatedAt

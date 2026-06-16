@@ -14,8 +14,11 @@
 package codegraph
 
 import (
+	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -27,17 +30,39 @@ import (
 )
 
 const initTimeout = 30 * time.Second
+const daemonProbeTimeout = 300 * time.Millisecond
+
+// DaemonIdleTimeoutEnv is CodeGraph's own root-scoped daemon idle timeout knob.
+const DaemonIdleTimeoutEnv = "CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS"
+
+// ReasonixDaemonIdleTimeoutMS keeps Reasonix-launched daemons short-lived after
+// the last client disconnects while still preserving CodeGraph's shared-client
+// refcount semantics.
+const ReasonixDaemonIdleTimeoutMS = "1000"
+
+type daemonInfo struct {
+	PID        int    `json:"pid"`
+	Version    string `json:"version"`
+	SocketPath string `json:"socketPath"`
+	StartedAt  int64  `json:"startedAt"`
+}
 
 // SteerText is injected into the system prompt when CodeGraph tools are
-// available, so the model knows to prefer them for symbol-level questions.
+// available, so the model knows to prefer them for symbol-level questions. The
+// tool names are the model-visible registered names (mcp__codegraph__<tool>);
+// TestSteerTextNamesMatchRegisteredTools fails if they drift from the daemon's
+// actual tools so the model is never told to call a name it can't use.
 const SteerText = `## Code Intelligence (codegraph)
 You have codegraph tools for symbol-level code intelligence. For architecture questions, "how does X work", call graphs, symbol search, and impact analysis, prefer codegraph tools over grep/read_file:
-- codegraph_context — entry points + related symbols + key code in one call (USE THIS FIRST for "how does X work")
-- codegraph_search — find symbols by name (functions, types, interfaces)
-- codegraph_callers / codegraph_callees — trace call chains
-- codegraph_impact — what breaks if I change X
-- codegraph_trace — full call path between two symbols
-- codegraph_files — project file tree with symbol counts
+- mcp__codegraph__context — entry points + related symbols + key code in one call (USE THIS FIRST for "how does X work")
+- mcp__codegraph__search — find symbols by name (functions, types, interfaces)
+- mcp__codegraph__callers / mcp__codegraph__callees — trace call chains
+- mcp__codegraph__impact — what breaks if I change X
+- mcp__codegraph__trace — full call path between two symbols
+- mcp__codegraph__explore — walk the graph around a symbol (neighbours and relationships)
+- mcp__codegraph__node — full detail for one symbol (definition, location, signature)
+- mcp__codegraph__files — project file tree with symbol counts
+- mcp__codegraph__status — code-intelligence index build/health status
 Use grep/read_file for content search (comments, strings, config values) and when codegraph is not available.`
 
 // BundleDirName is the optional directory, beside the reasonix executable, where
@@ -200,4 +225,82 @@ func isExec(p string) bool {
 		return true
 	}
 	return fi.Mode()&0o111 != 0
+}
+
+// DaemonPID returns the PID recorded in CodeGraph's structured daemon lockfile.
+// It returns 0, false when the lockfile doesn't exist or does not contain the
+// full pid/version/socket record written by CodeGraph's daemon.
+func DaemonPID(root string) (int, bool) {
+	info, ok := readDaemonInfo(root)
+	if !ok {
+		return 0, false
+	}
+	return info.PID, true
+}
+
+func readDaemonInfo(root string) (daemonInfo, bool) {
+	pidPath := filepath.Join(root, ".codegraph", "daemon.pid")
+	raw, err := os.ReadFile(pidPath)
+	if err != nil {
+		return daemonInfo{}, false
+	}
+	var info daemonInfo
+	if err := json.Unmarshal(raw, &info); err != nil {
+		return daemonInfo{}, false
+	}
+	if info.PID <= 0 || info.Version == "" || info.SocketPath == "" || info.StartedAt <= 0 {
+		return daemonInfo{}, false
+	}
+	return info, true
+}
+
+// KillDaemon terminates the CodeGraph daemon for root after verifying that the
+// recorded PID still answers on the daemon socket as the same CodeGraph process.
+// This is intentionally for explicit cleanup paths such as tests/diagnostics:
+// CodeGraph daemons are root-scoped and may be shared by other MCP clients, so a
+// normal Reasonix controller close must only close its proxy connection and let
+// CodeGraph's own refcount/idle timer own daemon lifetime.
+func KillDaemon(root string) {
+	info, ok := readDaemonInfo(root)
+	if !ok {
+		return
+	}
+	if !daemonIdentityMatches(info) {
+		return
+	}
+	p, err := os.FindProcess(info.PID)
+	if err != nil {
+		return
+	}
+	_ = p.Kill()
+}
+
+func daemonIdentityMatches(info daemonInfo) bool {
+	if runtime.GOOS == "windows" {
+		return false
+	}
+	conn, err := net.DialTimeout("unix", info.SocketPath, daemonProbeTimeout)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(daemonProbeTimeout))
+
+	line, err := bufio.NewReader(conn).ReadString('\n')
+	if err != nil {
+		return false
+	}
+	var hello struct {
+		Codegraph  string `json:"codegraph"`
+		PID        int    `json:"pid"`
+		SocketPath string `json:"socketPath"`
+		Protocol   int    `json:"protocol"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimSpace(line)), &hello); err != nil {
+		return false
+	}
+	return hello.Codegraph != "" &&
+		hello.PID == info.PID &&
+		hello.SocketPath == info.SocketPath &&
+		hello.Protocol == 1
 }

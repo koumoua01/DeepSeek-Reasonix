@@ -22,9 +22,11 @@ mem.prof
 # Wails desktop artifacts
 /desktop/build/*
 !/desktop/build/appicon.png
+!/desktop/build/appicon.svg
 /desktop/desktop
 /desktop/frontend/dist/*
 !/desktop/frontend/dist/.gitkeep
+/desktop/frontend/sourcemaps/
 /desktop/frontend/wailsjs/
 /desktop/frontend/package.json.md5
 
@@ -55,7 +57,6 @@ Thumbs.db
 .idea/
 .vscode/
 build-windows.txt
+/site/public/av/
 
-# Scratch / agent working dirs (never committed)
-/tmp/
-/.codex/
+benchmarks/context-maintenance-e2e/run/

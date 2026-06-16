@@ -66,6 +66,14 @@ func TestReserveNativeScrollbackFrameWritesOnlyNewlines(t *testing.T) {
 	}
 }
 
+func TestPrepareNativeScrollbackClearsBeforeFrame(t *testing.T) {
+	var b bytes.Buffer
+	prepareNativeScrollback(&b, 2)
+	if got, want := b.String(), "\x1B[3J\x1B[2J\x1B[H\n\n"; got != want {
+		t.Fatalf("prepareNativeScrollback wrote %q, want %q", got, want)
+	}
+}
+
 func mustGetwd(t *testing.T) string {
 	t.Helper()
 	cwd, err := os.Getwd()
@@ -248,6 +256,77 @@ func TestConfigAutoPlanLocalCreatesMinimalProjectOverride(t *testing.T) {
 	}
 }
 
+func TestConfigReasoningLanguageCommandWritesUserConfig(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	out := captureStdout(t, func() {
+		if rc := Run([]string{"config", "reasoning-language", "zh"}, "test-version"); rc != 0 {
+			t.Fatalf("config reasoning-language rc = %d, want 0", rc)
+		}
+	})
+	if !strings.Contains(out, `reasoning_language = "zh"`) {
+		t.Fatalf("config reasoning-language output = %q", out)
+	}
+	cfg := config.LoadForEdit(config.UserConfigPath())
+	if cfg.Agent.ReasoningLanguage != "zh" || cfg.ReasoningLanguage() != "zh" {
+		t.Fatalf("saved reasoning_language = %q/%q, want zh", cfg.Agent.ReasoningLanguage, cfg.ReasoningLanguage())
+	}
+}
+
+func TestConfigReasoningLanguageLocalCreatesMinimalProjectOverride(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	userCfg := config.Default()
+	userCfg.DefaultModel = "mimo-pro"
+	if err := userCfg.SaveTo(config.UserConfigPath()); err != nil {
+		t.Fatalf("write user config: %v", err)
+	}
+
+	out := captureStdout(t, func() {
+		if rc := Run([]string{"config", "reasoning-language", "--local", "en"}, "test-version"); rc != 0 {
+			t.Fatalf("config reasoning-language --local rc = %d, want 0", rc)
+		}
+	})
+	if !strings.Contains(out, `reasoning_language = "en"`) {
+		t.Fatalf("config reasoning-language --local output = %q", out)
+	}
+
+	body, err := os.ReadFile("reasonix.toml")
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), "default_model") {
+		t.Fatalf("project reasoning-language override should not pin default_model:\n%s", body)
+	}
+	if !strings.Contains(string(body), "[agent]") || !strings.Contains(string(body), `reasoning_language = "en"`) {
+		t.Fatalf("project config missing reasoning_language override:\n%s", body)
+	}
+
+	cfg, err := config.Load()
+	if err != nil {
+		t.Fatalf("load merged config: %v", err)
+	}
+	if cfg.DefaultModel != "mimo-pro" {
+		t.Fatalf("default_model = %q, want global mimo-pro", cfg.DefaultModel)
+	}
+	if cfg.ReasoningLanguage() != "en" {
+		t.Fatalf("reasoning_language = %q, want local en", cfg.ReasoningLanguage())
+	}
+}
+
+func TestConfigReasoningLanguageRejectsAliases(t *testing.T) {
+	isolateCLIConfigHome(t)
+
+	errOut := captureStderr(t, func() {
+		if rc := Run([]string{"config", "reasoning-language", "中文"}, "test-version"); rc != 2 {
+			t.Fatalf("config reasoning-language alias rc = %d, want 2", rc)
+		}
+	})
+	if !strings.Contains(errOut, "must be auto|zh|en") {
+		t.Fatalf("config reasoning-language alias stderr = %q", errOut)
+	}
+}
+
 func TestWelcomePromptMissingKeysRequiresConfigSource(t *testing.T) {
 	if welcomeShouldPromptMissingKeys("", nil) {
 		t.Fatal("built-in defaults without a config source should not prompt for missing provider keys")
@@ -257,6 +336,71 @@ func TestWelcomePromptMissingKeysRequiresConfigSource(t *testing.T) {
 	}
 	if !welcomeShouldPromptMissingKeys("reasonix.toml", nil) {
 		t.Fatal("valid config source should enter the missing-key prompt path")
+	}
+}
+
+func TestProvidersWithMissingKeysOnlyChecksActiveDefaultModel(t *testing.T) {
+	cfg := config.Default()
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("MIMO_API_KEY", "")
+
+	missing := providersWithMissingKeys(cfg)
+	if len(missing) != 1 {
+		t.Fatalf("missing providers = %+v, want only active default model provider", missing)
+	}
+	if missing[0].APIKeyEnv != "DEEPSEEK_API_KEY" {
+		t.Fatalf("missing key env = %q, want DEEPSEEK_API_KEY", missing[0].APIKeyEnv)
+	}
+}
+
+func TestProvidersWithMissingKeysIgnoresUnusedBuiltInPresets(t *testing.T) {
+	cfg := config.Default()
+	t.Setenv("DEEPSEEK_API_KEY", "test-key")
+	t.Setenv("MIMO_API_KEY", "")
+
+	if missing := providersWithMissingKeys(cfg); len(missing) != 0 {
+		t.Fatalf("missing providers = %+v, want none when only unused MiMo presets are keyless", missing)
+	}
+}
+
+func TestProvidersWithMissingKeysIncludesReferencedSecondaryModels(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.PlannerModel = "mimo-pro"
+	cfg.Agent.SubagentModel = "mimo-flash"
+	cfg.Agent.SubagentModels = map[string]string{
+		"review": "mimo-pro/mimo-v2.5-pro",
+	}
+	cfg.Agent.AutoPlanClassifier = "mimo-flash/mimo-v2.5"
+	t.Setenv("DEEPSEEK_API_KEY", "test-key")
+	t.Setenv("MIMO_API_KEY", "")
+
+	missing := providersWithMissingKeys(cfg)
+	if len(missing) != 1 {
+		t.Fatalf("missing providers = %+v, want MiMo once", missing)
+	}
+	if missing[0].APIKeyEnv != "MIMO_API_KEY" {
+		t.Fatalf("missing key env = %q, want MIMO_API_KEY", missing[0].APIKeyEnv)
+	}
+}
+
+func TestProvidersWithMissingKeysSkipsDisabledAutoPlanClassifier(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.AutoPlan = "off"
+	cfg.Agent.AutoPlanClassifier = "mimo-flash/mimo-v2.5"
+	t.Setenv("DEEPSEEK_API_KEY", "test-key")
+	t.Setenv("MIMO_API_KEY", "")
+
+	if missing := providersWithMissingKeys(cfg); len(missing) != 0 {
+		t.Fatalf("missing providers = %+v, want none when auto-plan classifier is disabled", missing)
+	}
+
+	cfg.Agent.AutoPlan = "on"
+	missing := providersWithMissingKeys(cfg)
+	if len(missing) != 1 {
+		t.Fatalf("missing providers = %+v, want enabled auto-plan classifier provider", missing)
+	}
+	if missing[0].APIKeyEnv != "MIMO_API_KEY" {
+		t.Fatalf("missing key env = %q, want MIMO_API_KEY", missing[0].APIKeyEnv)
 	}
 }
 
@@ -844,4 +988,34 @@ func captureStderr(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(data)
+}
+
+func TestProvidersWithMissingKeysOnlyReferenced(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "")
+	t.Setenv("MIMO_API_KEY", "")
+	cfg := config.Default()
+
+	got := providersWithMissingKeys(cfg)
+	envs := map[string]bool{}
+	for _, p := range got {
+		envs[p.APIKeyEnv] = true
+	}
+	if !envs["DEEPSEEK_API_KEY"] {
+		t.Errorf("the default model's missing key must be prompted, got %v", got)
+	}
+	if envs["MIMO_API_KEY"] {
+		t.Errorf("unreferenced preset keys must not be prompted, got %v", got)
+	}
+}
+
+func TestProvidersWithMissingKeysIncludesPlannerModel(t *testing.T) {
+	t.Setenv("DEEPSEEK_API_KEY", "set")
+	t.Setenv("MIMO_API_KEY", "")
+	cfg := config.Default()
+	cfg.Agent.PlannerModel = "mimo-pro"
+
+	got := providersWithMissingKeys(cfg)
+	if len(got) != 1 || got[0].APIKeyEnv != "MIMO_API_KEY" {
+		t.Errorf("planner model's missing key must be prompted, got %+v", got)
+	}
 }

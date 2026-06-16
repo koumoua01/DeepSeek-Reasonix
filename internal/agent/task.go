@@ -138,8 +138,8 @@ func (t *TaskTool) Schema() json.RawMessage {
   "run_in_background":{"type":"boolean","description":"Run the sub-agent asynchronously: returns a job id immediately and keeps working across turns. Collect its final answer with wait, and you'll be notified when it finishes. Use for long, independent sub-tasks you don't need to block on right now."},
   "model":{"type":"string","description":"Optional model override for the sub-agent (a configured provider/model name)."},
   "effort":{"type":"string","description":"Optional reasoning effort for the sub-agent (e.g. high, max)."},
-  "continue_from":{"type":"string","description":"Optional subagent transcript reference to continue in place. The current kind, prompt persona, tools, model, effort, and workspace must match the saved transcript."},
-  "fork_from":{"type":"string","description":"Optional subagent transcript reference to copy into a new transcript before running this task. Mutually exclusive with continue_from."}
+  "continue_from":{"type":"string","description":"Resume a prior subagent run in place: the subagent retains its context from the previous run; use in iterative loops (e.g. review -> fix -> review again) by passing only the 'sa_...' value from the prior result's 'Subagent reference: ...' line. Requires a compatible subagent identity, including tools, model, effort, and workspace."},
+  "fork_from":{"type":"string","description":"Fork a prior subagent run: copies its transcript, leaves the source unchanged, and continues independently. Use only when you need an independent branch; for iterative continuation on the same thread, use continue_from. Pass the 'sa_...' value from the prior result's 'Subagent reference: ...' line. Requires a compatible subagent identity, including tools, model, effort, and workspace. Mutually exclusive with continue_from."}
 },
 "required":["prompt"]
 }`)
@@ -248,7 +248,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 				return "", err
 			}
 		}
-		job := jm.Start("task", label, func(jobCtx context.Context, _ io.Writer) (string, error) {
+		job := jm.StartForSession(jobs.SessionFromContext(ctx), "task", label, func(jobCtx context.Context, _ io.Writer) (string, error) {
 			defer run.Release()
 			answer, err := t.runSubSession(jobCtx, p.Prompt, subReg, nested, maxSteps, prov, pricing, ctxWin, run.Session)
 			if err != nil {
@@ -434,12 +434,14 @@ func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *too
 		MaxSteps:          maxSteps,
 		Temperature:       t.temperature,
 		Pricing:           pricing,
+		UsageSource:       event.UsageSourceSubagent,
 		Gate:              t.gate,
 		ContextWindow:     ctxWin,
 		SoftCompactRatio:  t.softCompactRatio,
 		CompactRatio:      t.compactRatio,
 		CompactForceRatio: t.compactForceRatio,
 		ArchiveDir:        t.archiveDir,
+		ReasoningLanguage: ReasoningLanguageFromContext(ctx),
 	}, sink)
 }
 
@@ -491,14 +493,22 @@ func NestedSink(ctx context.Context, fallback event.Sink) event.Sink {
 	return subSinkFor(parentID, parent)
 }
 
-// subSink forwards a sub-agent's tool dispatch/result events to the parent's
-// event stream, tagged with the parent task call's ID so a frontend nests them
-// under it. The sub-agent's own turn/usage/text/reasoning events are dropped —
-// only its tool activity (the part worth seeing live) and its final answer
-// (returned by Execute) reach the parent. The forwarded call IDs are namespaced
-// with the parent ID so a sub-agent call can never collide with a parent call in
-// the frontend's dispatch→result matching. Falls back to Discard when there's no
-// parent stream (the headless run loop, or a direct Execute in tests).
+// subSink forwards a sub-agent's tool dispatch/result events and billable usage
+// to the parent's event stream. Only tool activity is nested visually; the
+// sub-agent's text/reasoning stays isolated and only its final answer is returned.
+//
+// The sub-agent's own turn/text/reasoning events are dropped — forwarding them
+// would make the parent transcript noisy and could imply they belong to the
+// parent model context, which they do not.
+//
+// Usage events are observability only, so forwarding them preserves billing
+// totals without polluting the parent provider-visible prefix.
+//
+// Tool events are tagged with the parent task call's ID so a frontend nests them
+// under it. The forwarded call IDs are namespaced with the parent ID so a
+// sub-agent call can never collide with a parent call in the frontend's
+// dispatch→result matching. Falls back to Discard when there's no parent stream
+// (the headless run loop, or a direct Execute in tests).
 func subSink(ctx context.Context) event.Sink {
 	parentID, parent, _, ok := CallContext(ctx)
 	if !ok || parent == nil {
@@ -519,6 +529,11 @@ func subSinkFor(parentID string, parent event.Sink) event.Sink {
 		case event.ToolDispatch, event.ToolResult:
 			e.Tool.ParentID = parentID
 			e.Tool.ID = parentID + "/" + e.Tool.ID
+			parent.Emit(e)
+		case event.Usage:
+			if e.UsageSource == "" {
+				e.UsageSource = event.UsageSourceSubagent
+			}
 			parent.Emit(e)
 		}
 	})

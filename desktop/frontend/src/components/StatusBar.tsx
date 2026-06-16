@@ -1,12 +1,17 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
+import { Activity, CircleDollarSign, CircleGauge, Database, Layers, Percent, RefreshCw, Wallet, Zap } from "lucide-react";
 import { Tooltip } from "./Tooltip";
-import { useI18n } from "../lib/i18n";
+import { useI18n, type Translator } from "../lib/i18n";
+import { formatMoney } from "../lib/money";
+import { normalizeStatusBarItems, type StatusBarItemId } from "../lib/statusBarItems";
 import { type BalanceInfo, type CollaborationMode, type ContextInfo, type JobView, type ToolApprovalMode, type WireUsage } from "../lib/types";
+
+type StatusBarLabelStyle = "icon" | "text";
 
 // JobsChip is the status-bar background-jobs indicator: a count that opens an
 // upward popover listing the running jobs (id · label · status), mirroring the
-// ModelSwitcher's click-to-open pattern. With no jobs it still reserves a stable
-// "任务 0" slot so the IDE-style status order does not jump.
+// ModelSwitcher's click-to-open pattern. With no jobs it stays hidden so the
+// high-priority status metrics keep the compact left-to-right scan.
 function JobsChip({ jobs }: { jobs: JobView[] }) {
   const { t } = useI18n();
   const [open, setOpen] = useState(false);
@@ -23,12 +28,7 @@ function JobsChip({ jobs }: { jobs: JobView[] }) {
     return () => document.removeEventListener("click", closeOnOutsideClick);
   }, [open]);
   if (jobs.length === 0) {
-    return (
-      <span className="stat stat--jobs">
-        <span className="stat__label">{t("status.jobsLabel")}</span>
-        <b>-</b>
-      </span>
-    );
+    return null;
   }
   return (
     <div className="statusbar__jobswrap" ref={wrapRef}>
@@ -78,17 +78,31 @@ function avgRate(u?: WireUsage): string | null {
   return formatRate(u.sessionCacheHitTokens, denom);
 }
 
-function currencySymbol(currency?: string): string {
-  const value = (currency || "¥").trim();
-  if (/^(cny|rmb|yuan)$/i.test(value)) return "¥";
-  if (/^(usd|dollar)$/i.test(value)) return "$";
-  return value || "¥";
+function rateValueClass(rate: string | null): string {
+  if (rate === null) return "stat__value--empty";
+  const pct = Number.parseFloat(rate);
+  if (!Number.isFinite(pct)) return "";
+  if (pct >= 80) return "statusbar__rate-value--good";
+  if (pct >= 50) return "statusbar__rate-value--notice";
+  return "statusbar__rate-value--critical";
 }
 
-function formatMoney(amount?: number, currency?: string): string {
-  const symbol = currencySymbol(currency);
-  if (typeof amount !== "number" || amount <= 0) return `${symbol}0.0000`;
-  return `${symbol}${amount < 1 ? amount.toFixed(4) : amount.toFixed(2)}`;
+function formatTokenCount(tokens?: number): string {
+  if (typeof tokens !== "number" || tokens <= 0) return "-";
+  return tokens.toLocaleString();
+}
+
+function formatTurnCount(turns: number | undefined, t: Translator): string {
+  if (typeof turns !== "number" || turns < 0) return "-";
+  return t(turns === 1 ? "history.turnOne" : "history.turnOther", { n: turns });
+}
+
+function MetricLabel({ style, icon, label }: { style: StatusBarLabelStyle; icon: ReactNode; label: string }) {
+  return (
+    <span className={`stat__label stat__label--${style}`} aria-hidden={style === "icon" ? "true" : undefined}>
+      {style === "icon" ? icon : label}
+    </span>
+  );
 }
 
 export function StatusBar({
@@ -99,10 +113,15 @@ export function StatusBar({
   running,
   collaborationMode,
   toolApprovalMode,
+  sessionTurns,
+  sessionTokens,
+  turnTokens,
+  turnCost,
   cost,
   currency,
   modelLabel,
-  currentTurnCount,
+  labelStyle = "text",
+  items,
 }: {
   context: ContextInfo;
   usage?: WireUsage;
@@ -111,75 +130,160 @@ export function StatusBar({
   running: boolean;
   collaborationMode: CollaborationMode;
   toolApprovalMode: ToolApprovalMode;
+  sessionTurns?: number;
+  sessionTokens?: number;
+  turnTokens?: number;
+  turnCost?: number;
   cost?: number;
   currency?: string;
   modelLabel?: string;
-  currentTurnCount?: number;
+  labelStyle?: StatusBarLabelStyle;
+  items?: readonly string[];
 }) {
   const { t } = useI18n();
   const pct = context.window ? Math.min(100, Math.round((context.used / context.window) * 100)) : null;
   const compactPct = context.compactRatio ? Math.round(context.compactRatio * 100) : null;
+  const compactNear = pct !== null && compactPct !== null && pct >= Math.max(0, compactPct - 10);
+  const compactReached = pct !== null && compactPct !== null && pct >= compactPct;
   const nowPct = nowRate(usage);
   const avgPct = avgRate(usage);
   const jobsList = jobs ?? [];
+  const turnCostLabel = formatMoney(turnCost, currency);
   const costLabel = formatMoney(cost, currency);
+  const turnLabel = formatTurnCount(sessionTurns, t);
+  const tokenLabel = formatTokenCount(sessionTokens);
+  const turnTokenLabel = formatTokenCount(turnTokens);
   const balanceLabel = balance?.available && balance.display ? balance.display : "-";
   const planMode = collaborationMode === "plan";
   const goalMode = collaborationMode === "goal";
-
-  return (
-    <div className="statusbar">
-      <span className="stat stat--model">
-        <span className={`statusbar__dot ${running ? "statusbar__dot--busy" : ""}`} />
-        {modelLabel && <span className="statusbar__model">{modelLabel}</span>}
-      </span>
-      {typeof currentTurnCount === "number" && currentTurnCount > 0 && (
-        <span className="stat statusbar__turns" title={t("status.sessionTurnsTitle")}>
-          <span className="stat__label">{t("status.sessionTurnsLabel")}</span>
-          <b>{t(currentTurnCount === 1 ? "history.turnOne" : "history.turnOther", { n: currentTurnCount })}</b>
+  const metricLabelStyle = labelStyle === "text" ? "text" : "icon";
+  const visibleItems = normalizeStatusBarItems(items);
+  const itemRenderers: Record<StatusBarItemId, ReactNode> = {
+    model: (
+      <Tooltip label={t("status.modelTitle")}>
+        <span className="stat stat--model">
+          <span className={`statusbar__dot ${running ? "statusbar__dot--busy" : ""}`} />
+          {modelLabel && <span className="statusbar__model">{modelLabel}</span>}
         </span>
-      )}
-      <span className="stat statusbar__ctx">
-        <span className="stat__label">{t("status.ctxLabel")}</span>
-        <b>{pct !== null ? `${pct}%` : "-"}</b>
-      </span>
-      <span className="stat statusbar__compact">
-        <span className="stat__label">{t("status.compactLabel")}</span>
-        <b>{compactPct !== null ? `${compactPct}%` : "-"}</b>
-      </span>
-      <span className="stat statusbar__cache">
-        <span className="stat__label">{t("status.cacheLabel")}</span>
-        <b>{nowPct !== null ? `${nowPct}%` : "-"}</b>
-      </span>
-      <span className="stat statusbar__avg">
-        <span className="stat__label">{t("status.cacheAvgLabel")}</span>
-        <b>{avgPct !== null ? `${avgPct}%` : "-"}</b>
-      </span>
-      <span className="statusbar__spacer" />
-      <JobsChip jobs={jobsList} />
-      <Tooltip label={t("status.spendTitle")}>
+      </Tooltip>
+    ),
+    cache: (
+      <Tooltip label={t("status.cacheTitle")} className="statusbar__metric statusbar__metric--cache">
+        <span className="stat statusbar__cache">
+          <MetricLabel style={metricLabelStyle} icon={<Percent size={12} />} label={t("status.cacheLabel")} />
+          <b className={rateValueClass(nowPct) || undefined}>{nowPct !== null ? `${nowPct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    cache_avg: (
+      <Tooltip label={t("status.cacheAvgTitle")} className="statusbar__metric statusbar__metric--avg">
+        <span className="stat statusbar__avg">
+          <MetricLabel style={metricLabelStyle} icon={<Activity size={12} />} label={t("status.cacheAvgLabel")} />
+          <b className={rateValueClass(avgPct) || undefined}>{avgPct !== null ? `${avgPct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    session_tokens: (
+      <Tooltip label={t("status.sessionTokensTitle")} className="statusbar__metric statusbar__metric--tokens">
+        <span className="stat statusbar__tokens">
+          <MetricLabel style={metricLabelStyle} icon={<Database size={12} />} label={t("status.sessionTokensLabel")} />
+          <b className={tokenLabel === "-" ? "stat__value--empty" : undefined}>{tokenLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    turn_tokens: (
+      <Tooltip label={t("status.turnTokensTitle")} className="statusbar__metric statusbar__metric--turn-tokens">
+        <span className="stat statusbar__turn-tokens">
+          <MetricLabel style={metricLabelStyle} icon={<Zap size={12} />} label={t("status.turnTokensLabel")} />
+          <b className={turnTokenLabel === "-" ? "stat__value--empty" : undefined}>{turnTokenLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    turn_cost: (
+      <Tooltip label={t("status.turnCostTitle")} className="statusbar__metric statusbar__metric--turn-cost">
+        <span className="stat statusbar__turn-cost">
+          <MetricLabel style={metricLabelStyle} icon={<CircleDollarSign size={12} />} label={t("status.turnCostLabel")} />
+          <b>{turnCostLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    session_turns: (
+      <Tooltip label={t("status.sessionTurnsTitle")} className="statusbar__metric statusbar__metric--turns">
+        <span className="stat statusbar__turns">
+          <MetricLabel style={metricLabelStyle} icon={<RefreshCw size={12} />} label={t("status.sessionTurnsLabel")} />
+          <b className={turnLabel === "-" ? "stat__value--empty" : undefined}>{turnLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    context: (
+      <Tooltip label={t("status.ctxTitle")} className="statusbar__metric statusbar__metric--ctx">
+        <span className="stat statusbar__ctx">
+          <MetricLabel style={metricLabelStyle} icon={<CircleGauge size={12} />} label={t("status.ctxLabel")} />
+          <b className={pct === null ? "stat__value--empty" : undefined}>{pct !== null ? `${pct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    compact: (
+      <Tooltip label={t("status.compactTitle")} className="statusbar__metric statusbar__metric--compact">
+        <span className="stat statusbar__compact">
+          <MetricLabel style={metricLabelStyle} icon={<Layers size={12} />} label={t("status.compactLabel")} />
+          <b
+            className={[
+              compactPct === null ? "stat__value--empty" : undefined,
+              compactReached ? "statusbar__compact-value--critical" : compactNear ? "statusbar__compact-value--warn" : undefined,
+            ].filter(Boolean).join(" ") || undefined}
+          >
+            {compactPct !== null ? `${compactPct}%` : "-"}
+          </b>
+        </span>
+      </Tooltip>
+    ),
+    cost: (
+      <Tooltip label={t("status.spendTitle")} className="statusbar__metric statusbar__metric--cost">
         <span className="stat statusbar__cost">
-          <span className="stat__label">{t("status.costLabel")}</span>
+          <MetricLabel style={metricLabelStyle} icon={<CircleDollarSign size={12} />} label={t("status.costLabel")} />
           <b>{costLabel}</b>
         </span>
       </Tooltip>
-      <Tooltip label={t("status.balanceTitle")}>
+    ),
+    balance: (
+      <Tooltip label={t("status.balanceTitle")} className="statusbar__metric statusbar__metric--balance">
         <span className="stat stat--balance statusbar__balance">
-          <span className="stat__label">{t("status.balanceLabel")}</span>
-          <b>{balanceLabel}</b>
+          <MetricLabel style={metricLabelStyle} icon={<Wallet size={12} />} label={t("status.balanceLabel")} />
+          <b className={balanceLabel === "-" ? "stat__value--empty" : undefined}>{balanceLabel}</b>
         </span>
       </Tooltip>
-      {planMode && <span className="statusbar__plan">{t("status.plan")}</span>}
-      {goalMode && <span className="statusbar__plan">{t("composer.goalMode")}</span>}
-      {toolApprovalMode === "auto" && (
-        <Tooltip label={t("composer.accessAutoTitle")}>
-          <span className="statusbar__yolo">{t("composer.accessAuto")}</span>
-        </Tooltip>
-      )}
-      {toolApprovalMode === "yolo" && (
-        <Tooltip label={t("status.yoloTitle")}>
-          <span className="statusbar__yolo">{t("composer.accessYolo")}</span>
-        </Tooltip>
+    ),
+  };
+  const modeIndicators = [
+    planMode ? <span className="statusbar__plan" key="plan">{t("status.plan")}</span> : null,
+    goalMode ? <span className="statusbar__plan" key="goal">{t("composer.goalMode")}</span> : null,
+    toolApprovalMode === "auto" ? (
+      <Tooltip label={t("composer.accessAutoTitle")} key="auto">
+        <span className="statusbar__yolo">{t("composer.accessAuto")}</span>
+      </Tooltip>
+    ) : null,
+    toolApprovalMode === "yolo" ? (
+      <Tooltip label={t("status.yoloTitle")} key="yolo">
+        <span className="statusbar__yolo">{t("composer.accessYolo")}</span>
+      </Tooltip>
+    ) : null,
+  ].filter(Boolean);
+
+  return (
+    <div className={`statusbar statusbar--${metricLabelStyle}`}>
+      <div className="statusbar__group statusbar__group--items">
+        {visibleItems.map((id) => (
+          <span className="statusbar__item" data-statusbar-item={id} key={id}>
+            {itemRenderers[id]}
+          </span>
+        ))}
+      </div>
+      {modeIndicators.length > 0 && <div className="statusbar__group statusbar__group--modes">{modeIndicators}</div>}
+      {jobsList.length > 0 && (
+        <div className="statusbar__group statusbar__group--jobs">
+          <JobsChip jobs={jobsList} />
+        </div>
       )}
     </div>
   );

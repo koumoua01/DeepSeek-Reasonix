@@ -1,12 +1,48 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 )
+
+func isolateUserConfigHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	return home
+}
+
+func TestUserConfigDisplayPathCollapsesHome(t *testing.T) {
+	home := isolateUserConfigHome(t)
+	got := userConfigDisplayPath()
+	if !strings.HasPrefix(got, "~/") {
+		t.Fatalf("display path = %q, want ~/ prefix", got)
+	}
+	if !strings.HasSuffix(got, "reasonix/config.toml") {
+		t.Fatalf("display path = %q, want reasonix/config.toml suffix", got)
+	}
+	if strings.Contains(got, home) {
+		t.Fatalf("display path %q must not embed the absolute home", got)
+	}
+}
+
+func TestRenderTOMLHeaderShowsResolvedConfigPath(t *testing.T) {
+	isolateUserConfigHome(t)
+	out := RenderTOML(Default())
+	want := "> " + userConfigDisplayPath() + " > built-in defaults."
+	if !strings.Contains(out, want) {
+		t.Fatalf("rendered header missing resolved config path %q", want)
+	}
+}
 
 // TestRenderTOMLRoundTrips ensures the annotated TOML we emit parses back into
 // an equivalent config — i.e. the wizard never writes a file it can't read.
@@ -16,15 +52,24 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Language = "zh"
 	orig.UI.Theme = "light"
 	orig.UI.ThemeStyle = "glacier"
+	orig.UI.ShortcutLayout = "desktop"
 	orig.Desktop.Language = "en"
+	orig.Desktop.LayoutStyle = "workbench"
 	orig.Desktop.Theme = "dark"
 	orig.Desktop.ThemeStyle = "graphite"
 	orig.Desktop.CloseBehavior = "background"
+	orig.Desktop.StatusBarStyle = "text"
+	orig.Desktop.StatusBarItems = []string{"model", "balance", "cache"}
+	orig.Desktop.CheckUpdates = boolPtr(false)
+	orig.Desktop.Telemetry = boolPtr(false)
 	orig.Notifications.Enabled = true
 	orig.Notifications.TurnDone = true
 	orig.Notifications.ApprovalRequest = true
 	orig.Notifications.AskRequest = true
+	orig.Agent.MaxSteps = 30
+	orig.Agent.PlannerMaxSteps = 0
 	orig.Agent.AutoPlanClassifier = "deepseek-flash"
+	orig.Agent.ReasoningLanguage = "zh"
 	orig.Agent.SubagentModel = "mimo-pro"
 	orig.Agent.SubagentModels = map[string]string{"review": "deepseek-pro"}
 	orig.Tools.BashTimeoutSeconds = intPtr(900)
@@ -49,6 +94,27 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	orig.Skills.DisabledSkills = []string{"review", "explore"}
 	orig.Skills.MaxDepth = 2
 	orig.Codegraph = CodegraphConfig{Enabled: true, AutoInstall: false, Path: "/opt/codegraph", Tier: "background"}
+	orig.BuiltInMCPUpdates = BuiltInMCPUpdatesConfig{Mode: BuiltInMCPUpdateModeDownload, CheckInterval: "12h"}
+	orig.Bot.ToolApprovalMode = "auto"
+	orig.Bot.Connections = []BotConnectionConfig{{
+		ID:               "feishu-lark",
+		Provider:         "feishu",
+		Domain:           "lark",
+		Label:            "Lark",
+		Enabled:          true,
+		Status:           "connected",
+		Model:            "deepseek-pro",
+		ToolApprovalMode: "yolo",
+		WorkspaceRoot:    "/tmp/reasonix-bot",
+		Credential:       BotConnectionCredential{AppID: "cli_lark", AppSecretEnv: "LARK_BOT_APP_SECRET"},
+		SessionMappings: []BotConnectionSessionMapping{{
+			RemoteID:      "ou_123",
+			SessionID:     "topic:topic_bot",
+			Scope:         "project",
+			WorkspaceRoot: "/tmp/reasonix-bot",
+			UpdatedAt:     "2026-06-11T00:00:00Z",
+		}},
+	}}
 	orig.LSP = LSPConfig{
 		Enabled: true,
 		Servers: map[string]LSPServer{
@@ -94,8 +160,14 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.UI.ThemeStyle != "glacier" {
 		t.Errorf("ui.theme_style = %q, want glacier", got.UI.ThemeStyle)
 	}
+	if got.UI.ShortcutLayout != "desktop" {
+		t.Errorf("ui.shortcut_layout = %q, want desktop", got.UI.ShortcutLayout)
+	}
 	if got.Desktop.Language != "en" {
 		t.Errorf("desktop.language = %q, want en", got.Desktop.Language)
+	}
+	if got.Desktop.LayoutStyle != "workbench" {
+		t.Errorf("desktop.layout_style = %q, want workbench", got.Desktop.LayoutStyle)
 	}
 	if got.Desktop.Theme != "dark" {
 		t.Errorf("desktop.theme = %q, want dark", got.Desktop.Theme)
@@ -106,6 +178,15 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Desktop.CloseBehavior != "background" {
 		t.Errorf("desktop.close_behavior = %q, want background", got.Desktop.CloseBehavior)
 	}
+	if got.Desktop.StatusBarStyle != "text" {
+		t.Errorf("desktop.status_bar_style = %q, want text", got.Desktop.StatusBarStyle)
+	}
+	if want := []string{"model", "balance", "cache"}; !reflect.DeepEqual(got.Desktop.StatusBarItems, want) {
+		t.Errorf("desktop.status_bar_items = %v, want %v", got.Desktop.StatusBarItems, want)
+	}
+	if got.Desktop.CheckUpdates == nil || *got.Desktop.CheckUpdates {
+		t.Errorf("desktop.check_updates = %+v, want false", got.Desktop.CheckUpdates)
+	}
 	if !got.Notifications.Enabled || !got.Notifications.TurnDone || !got.Notifications.ApprovalRequest || !got.Notifications.AskRequest {
 		t.Errorf("notifications not preserved: %+v", got.Notifications)
 	}
@@ -115,6 +196,15 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	if got.Agent.PlannerMaxSteps != orig.Agent.PlannerMaxSteps {
 		t.Errorf("planner_max_steps = %d, want %d", got.Agent.PlannerMaxSteps, orig.Agent.PlannerMaxSteps)
 	}
+	if len(got.Bot.Connections) != 1 || got.Bot.Connections[0].Model != "deepseek-pro" || got.Bot.Connections[0].WorkspaceRoot != "/tmp/reasonix-bot" {
+		t.Errorf("bot connection not preserved: %+v", got.Bot.Connections)
+	}
+	if got.Bot.ToolApprovalMode != "auto" || got.Bot.Connections[0].ToolApprovalMode != "yolo" {
+		t.Errorf("bot tool approval mode not preserved: bot=%q connection=%q", got.Bot.ToolApprovalMode, got.Bot.Connections[0].ToolApprovalMode)
+	}
+	if len(got.Bot.Connections[0].SessionMappings) != 1 || got.Bot.Connections[0].SessionMappings[0].Scope != "project" || got.Bot.Connections[0].SessionMappings[0].WorkspaceRoot != "/tmp/reasonix-bot" {
+		t.Errorf("bot session mapping scope not preserved: %+v", got.Bot.Connections[0].SessionMappings)
+	}
 	if got.Agent.Temperature != orig.Agent.Temperature {
 		t.Errorf("temperature = %v, want %v", got.Agent.Temperature, orig.Agent.Temperature)
 	}
@@ -123,6 +213,9 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if got.Agent.AutoPlanClassifier != "deepseek-flash" {
 		t.Errorf("auto_plan_classifier = %q, want deepseek-flash", got.Agent.AutoPlanClassifier)
+	}
+	if got.Agent.ReasoningLanguage != "zh" {
+		t.Errorf("reasoning_language = %q, want zh", got.Agent.ReasoningLanguage)
 	}
 	if got.Agent.SoftCompactRatio != orig.Agent.SoftCompactRatio {
 		t.Errorf("soft_compact_ratio = %v, want %v", got.Agent.SoftCompactRatio, orig.Agent.SoftCompactRatio)
@@ -147,6 +240,12 @@ func TestRenderTOMLRoundTrips(t *testing.T) {
 	}
 	if got.Codegraph.Tier != "" {
 		t.Errorf("codegraph.tier = %q, want migrated empty", got.Codegraph.Tier)
+	}
+	if got.BuiltInMCPUpdates.ResolvedMode() != BuiltInMCPUpdateModeDownload {
+		t.Errorf("builtin_mcp_updates.mode = %q, want download", got.BuiltInMCPUpdates.ResolvedMode())
+	}
+	if got.BuiltInMCPUpdates.ResolvedCheckInterval() != "12h0m0s" {
+		t.Errorf("builtin_mcp_updates.check_interval = %q, want 12h0m0s", got.BuiltInMCPUpdates.ResolvedCheckInterval())
 	}
 	if !got.LSP.Enabled {
 		t.Error("lsp.enabled = false, want true")
@@ -348,16 +447,18 @@ func TestScopedRenderSeparatesUserAndProjectConfig(t *testing.T) {
 	c.Desktop.Theme = "dark"
 	c.Desktop.ThemeStyle = "graphite"
 	c.Desktop.CloseBehavior = "background"
+	c.Desktop.StatusBarStyle = "text"
+	c.Desktop.CheckUpdates = boolPtr(false)
 
 	user := RenderTOMLForScope(c, RenderScopeUser)
-	for _, want := range []string{"config_version = 2", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, "[notifications]"} {
+	for _, want := range []string{"config_version = 2", "[desktop]", `theme = "dark"`, `close_behavior = "background"`, `status_bar_style = "text"`, `check_updates = false`, "[notifications]", "[builtin_mcp_updates]"} {
 		if !strings.Contains(user, want) {
 			t.Fatalf("user render missing %q:\n%s", want, user)
 		}
 	}
 
 	project := RenderTOMLForScope(c, RenderScopeProject)
-	for _, forbidden := range []string{"[desktop]", "[notifications]", "close_behavior ="} {
+	for _, forbidden := range []string{"[desktop]", "[notifications]", "[builtin_mcp_updates]", "close_behavior =", "check_updates ="} {
 		if strings.Contains(project, forbidden) {
 			t.Fatalf("project render should not contain %q:\n%s", forbidden, project)
 		}
@@ -386,6 +487,132 @@ func TestProjectRenderPreservesNonDefaultLegacySections(t *testing.T) {
 	}
 }
 
+func TestRenderTOMLRoundTripsPerModelPrices(t *testing.T) {
+	orig := Default()
+	orig.Providers = []ProviderEntry{{
+		Name:      "deepseek",
+		Kind:      "openai",
+		BaseURL:   "https://api.deepseek.com",
+		Models:    []string{"deepseek-v4-flash", "deepseek-v4-pro"},
+		Default:   "deepseek-v4-flash",
+		APIKeyEnv: "DEEPSEEK_API_KEY",
+		Prices:    deepSeekV4Prices(),
+	}}
+
+	var got Config
+	if _, err := toml.Decode(RenderTOML(orig), &got); err != nil {
+		t.Fatalf("rendered TOML does not parse: %v", err)
+	}
+	p, ok := got.Provider("deepseek")
+	if !ok {
+		t.Fatal("deepseek provider missing after round trip")
+	}
+	if p.Prices["deepseek-v4-flash"].Input != 0.14 || p.Prices["deepseek-v4-pro"].Output != 0.87 {
+		t.Fatalf("prices after round trip = %+v", p.Prices)
+	}
+}
+
 func boolPtr(v bool) *bool { return &v }
 
 func intPtr(v int) *int { return &v }
+
+func TestRenderTOMLDefaultStepsCommentedOut(t *testing.T) {
+	isolateUserConfigHome(t)
+	out := RenderTOML(Default())
+	agentLines := extractSectionLines(out, "[agent]")
+	for _, line := range agentLines {
+		if strings.HasPrefix(line, "max_steps ") || strings.HasPrefix(line, "max_steps=") {
+			if !strings.HasPrefix(line, "#") {
+				t.Errorf("default max_steps should be commented out in [agent], got: %s", line)
+			}
+		}
+		if strings.HasPrefix(line, "planner_max_steps ") || strings.HasPrefix(line, "planner_max_steps=") {
+			if !strings.HasPrefix(line, "#") {
+				t.Errorf("default planner_max_steps should be commented out in [agent], got: %s", line)
+			}
+		}
+	}
+}
+
+func extractSectionLines(toml, section string) []string {
+	var lines []string
+	inSection := false
+	for _, line := range strings.Split(toml, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, section) {
+			inSection = true
+			continue
+		}
+		if inSection && strings.HasPrefix(trimmed, "[") && !strings.HasPrefix(trimmed, "[[") {
+			break
+		}
+		if inSection {
+			lines = append(lines, trimmed)
+		}
+	}
+	return lines
+}
+
+func TestRenderTOMLNonDefaultStepsWrittenExplicitly(t *testing.T) {
+	isolateUserConfigHome(t)
+	c := Default()
+	c.Agent.MaxSteps = 5
+	c.Agent.PlannerMaxSteps = 0
+	out := RenderTOML(c)
+	agentLines := extractSectionLines(out, "[agent]")
+	foundMax, foundPlanner := false, false
+	for _, line := range agentLines {
+		if !strings.HasPrefix(line, "#") && strings.HasPrefix(line, "max_steps ") {
+			foundMax = true
+		}
+		if !strings.HasPrefix(line, "#") && strings.HasPrefix(line, "planner_max_steps ") {
+			foundPlanner = true
+		}
+	}
+	if !foundMax {
+		t.Error("non-default max_steps should be written explicitly in [agent]")
+	}
+	if !foundPlanner {
+		t.Error("non-default planner_max_steps should be written explicitly in [agent]")
+	}
+}
+
+func TestRenderTOMLDefaultStepsDoNotOverrideGlobalConfig(t *testing.T) {
+	home := isolateUserConfigHome(t)
+	globalDir := filepath.Join(home, ".config", "reasonix")
+	if err := os.MkdirAll(globalDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	globalPath := filepath.Join(globalDir, "config.toml")
+	if err := os.WriteFile(globalPath, []byte("[agent]\nplanner_max_steps = 0\nmax_steps = 100\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	projectDir := t.TempDir()
+	projectTOML := RenderTOML(Default())
+	projectPath := filepath.Join(projectDir, "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte(projectTOML), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	if err := mergeFile(cfg, globalPath); err != nil {
+		t.Fatalf("global merge failed: %v", err)
+	}
+	if cfg.Agent.PlannerMaxSteps != 0 {
+		t.Fatalf("after global: planner_max_steps = %d, want 0", cfg.Agent.PlannerMaxSteps)
+	}
+	if cfg.Agent.MaxSteps != 100 {
+		t.Fatalf("after global: max_steps = %d, want 100", cfg.Agent.MaxSteps)
+	}
+
+	if err := mergeFile(cfg, projectPath); err != nil {
+		t.Fatalf("project merge failed: %v", err)
+	}
+	if cfg.Agent.PlannerMaxSteps != 0 {
+		t.Errorf("after project: planner_max_steps = %d, want 0 (global should not be overridden by commented-out default)", cfg.Agent.PlannerMaxSteps)
+	}
+	if cfg.Agent.MaxSteps != 100 {
+		t.Errorf("after project: max_steps = %d, want 100 (global should not be overridden by commented-out default)", cfg.Agent.MaxSteps)
+	}
+}

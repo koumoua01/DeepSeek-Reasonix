@@ -17,7 +17,8 @@ export type EventKind =
   | "turn_done"
   | "compaction_started"
   | "compaction_done"
-  | "retrying";
+  | "retrying"
+  | "steer";
 
 export interface WireCompaction {
   trigger?: string; // "auto" | "manual"
@@ -42,6 +43,9 @@ export interface WireTool {
   durationMs?: number;
   partial?: boolean; // an early dispatch (name only) — a full one with args follows
   parentId?: string; // set on a sub-agent's calls — the parent `task` call's id
+  diff?: string;
+  added?: number;
+  removed?: number;
   profile?: WireProfile; // subagent model/effort resolved for this call
 }
 
@@ -52,6 +56,7 @@ export interface WireUsage {
   cacheHitTokens: number;
   cacheMissTokens: number;
   reasoningTokens?: number;
+  source?: string;
   // Session-cumulative cache tokens — the status bar shows the aggregate
   // hit-rate (Σhit/Σ(hit+miss)), steadier than the single-turn cacheHitTokens.
   sessionCacheHitTokens: number;
@@ -125,6 +130,8 @@ export interface TabMeta {
   workspaceName: string;
   topicId: string;
   topicTitle: string;
+  sessionPath?: string;
+  readOnly?: boolean;
   filePath?: string;
   projectColor?: string;
   label: string;
@@ -133,6 +140,7 @@ export interface TabMeta {
   mode: Mode;
   collaborationMode?: CollaborationMode;
   toolApprovalMode?: ToolApprovalMode;
+  tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
   startupErr?: string;
@@ -142,10 +150,11 @@ export interface TabMeta {
 
 export interface ProjectNode {
   key: string;
-  kind: "project" | "topic" | "global_folder" | "global_topic";
+  kind: "project" | "topic" | "session" | "global_folder" | "global_topic" | "global_session";
   label: string;
   root?: string;
   topicId?: string;
+  sessionPath?: string;
   projectColor?: string;
   turns?: number;
   createdAt?: number;
@@ -153,10 +162,11 @@ export interface ProjectNode {
   open?: boolean;
   running?: boolean;
   status?: ProjectTopicStatus;
+  pinned?: boolean;
   children?: ProjectNode[];
 }
 
-export type ProjectTopicStatus = "thinking" | "streaming" | "waiting_confirmation" | "paused" | "error";
+export type ProjectTopicStatus = "thinking" | "streaming" | "waiting_confirmation" | "background_job" | "paused" | "error";
 
 export interface TopicMeta {
   id: string;
@@ -169,6 +179,7 @@ export interface ContextPanelInfo {
   windowTokens: number;
   promptTokens: number;
   completionTokens: number;
+  totalTokens: number;
   reasoningTokens: number;
   cacheHitTokens: number;
   cacheMissTokens: number;
@@ -178,9 +189,23 @@ export interface ContextPanelInfo {
   sessionCurrency?: string;
   // Deprecated compatibility alias. Prefer sessionCost + sessionCurrency.
   sessionCostUsd?: number;
+  sources?: Record<string, UsageSourceStats>;
   mock?: boolean;
   readFiles: ReadFileRecord[];
   changedFiles: ChangedFileInfo[];
+}
+
+export interface UsageSourceStats {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  reasoningTokens: number;
+  cacheHitTokens: number;
+  cacheMissTokens: number;
+  requestCount: number;
+  sessionCost?: number;
+  sessionCurrency?: string;
+  sessionCostUsd?: number;
 }
 
 export interface ReadFileRecord {
@@ -211,6 +236,8 @@ export interface HistoryMessage {
   toolCalls?: HistoryToolCall[];
   toolCallId?: string;
   toolName?: string;
+  toolResultArchived?: boolean;
+  toolResultError?: string;
   pending?: boolean;
   trigger?: string;
   messages?: number;
@@ -222,6 +249,26 @@ export interface HistoryToolCall {
   id: string;
   name: string;
   arguments: string;
+  subject?: string;
+  summary?: string;
+  diff?: string;
+  added?: number;
+  removed?: number;
+  argumentsArchived?: boolean;
+}
+
+export interface PromptHistoryEntry {
+  text: string;
+  at: number;          // unix ms
+  sessionPath: string;
+  turn: number;
+}
+
+export interface PromptHistoryResult {
+  entries: PromptHistoryEntry[] | null;
+  nonce: string;
+  olderCursor?: string;
+  hasOlder?: boolean;
 }
 
 // CheckpointMeta is one rewind point (a user turn) for the rewind UI.
@@ -250,6 +297,14 @@ export interface SessionMeta {
   workspaceRoot?: string;
   topicId?: string;
   topicTitle?: string;
+  kind?: "session" | "channel" | string;
+  channel?: string;
+  channelLabel?: string;
+  remoteId?: string;
+  chatType?: string;
+  userId?: string;
+  threadId?: string;
+  sessionSource?: string;
 }
 
 // SessionReference is a session selected via @ past:chats for context injection.
@@ -271,6 +326,7 @@ export interface WorkspaceView {
 export interface ContextInfo {
   used: number;
   window: number;
+  sessionTokens: number;
   compactRatio?: number;
 }
 
@@ -282,13 +338,16 @@ export interface Meta {
   cwd: string;
   autoApproveTools?: boolean;
   bypass?: boolean; // legacy JSON key for YOLO/full-access tool auto-approval
+  collaborationMode?: CollaborationMode;
   toolApprovalMode?: ToolApprovalMode;
+  tokenMode?: TokenMode;
   goal?: string;
   goalStatus?: GoalStatus;
 }
 
 export type CollaborationMode = "normal" | "plan" | "goal";
 export type ToolApprovalMode = "ask" | "auto" | "yolo";
+export type TokenMode = "full" | "economy";
 export type GoalStatus = "running" | "complete" | "blocked" | "stopped";
 
 export function normalizeCollaborationMode(mode?: string, goal?: string, legacyMode?: Mode): CollaborationMode {
@@ -302,6 +361,11 @@ export function normalizeToolApprovalMode(mode?: string, legacyMode?: Mode, lega
   if (mode === "auto" || mode === "yolo" || mode === "ask") return mode;
   if (legacyAutoApproveTools || (legacyMode && modeHasAutoApproveTools(legacyMode))) return "yolo";
   return "ask";
+}
+
+export function normalizeTokenMode(mode?: string): TokenMode {
+  if (mode === "economy") return "economy";
+  return "full";
 }
 
 // Mode is the compatibility string for two independent composer axes:
@@ -459,6 +523,23 @@ export interface CapabilitiesView {
   skills: SkillView[];
   skillRoots: SkillRootView[];
 }
+export interface BuiltInMCPUpdateResult {
+  name: string;
+  version: string;
+  path: string;
+}
+
+export type BuiltInMCPUpdatePhase = "current" | "available" | "downloaded" | "activated" | "skipped" | "error";
+
+export interface BuiltInMCPUpdateStatus {
+  name: string;
+  mode: string;
+  current: string;
+  latest: string;
+  phase: BuiltInMCPUpdatePhase;
+  path?: string;
+  err?: string;
+}
 export interface MCPServerInput {
   name: string;
   transport: string; // stdio | http | sse
@@ -510,21 +591,57 @@ export interface MemoryFact {
   body: string;
 }
 
+export interface MemoryArchive extends MemoryFact {
+  path: string;
+  archivedAt?: string;
+}
+
 export interface MemoryScope {
   scope: string; // "user" | "project" | "local"
   path: string;
 }
 
+export interface MemorySuggestion {
+  id: string;
+  name: string;
+  title: string;
+  description: string;
+  type: string;
+  body: string;
+  reason: string;
+  evidence: string[];
+}
+
+export interface SkillSuggestion {
+  id: string;
+  name: string;
+  description: string;
+  scope: string;
+  body: string;
+  reason: string;
+  evidence: string[];
+}
+
+export interface MemorySuggestionsView {
+  memories: MemorySuggestion[];
+  skills: SkillSuggestion[];
+  generatedAt: string;
+  available: boolean;
+  source: string;
+}
+
 export interface MemoryView {
   docs: MemoryDoc[];
   facts: MemoryFact[];
+  archives: MemoryArchive[];
   scopes: MemoryScope[];
   storeDir: string;
+  storeGlobalDir?: string;
   available: boolean;
 }
 
 // SettingsTab is the top-level navigation item in the Settings Centre modal.
-export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "memory" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
+export type SettingsTab = "general" | "models" | "providers" | "bots" | "mcp" | "skills" | "memory" | "hooks" | "shortcuts" | "permissions" | "sandbox" | "network" | "appearance" | "updates";
 
 // Settings panel payloads (desktop/settings_app.go).
 export interface ProviderView {
@@ -575,6 +692,7 @@ export interface SandboxView {
   network: boolean;
   workspaceRoot: string;
   allowWrite: string[];
+  shell: string; // "auto" | "bash" | "powershell" | "pwsh"
 }
 
 export interface NetworkProxyView {
@@ -597,6 +715,8 @@ export interface AgentView {
   maxSteps: number;
   plannerMaxSteps: number;
   systemPrompt: string;
+  coldResumePrune: boolean;
+  reasoningLanguage: string; // "auto" | "zh" | "en"
 }
 
 export interface BotAllowlistView {
@@ -615,6 +735,7 @@ export interface QQBotView {
   appId: string;
   appSecretEnv: string;
   secretSet: boolean;
+  sandbox: boolean;
 }
 
 export interface FeishuBotView {
@@ -648,6 +769,12 @@ export interface BotConnectionCredentialView {
 export interface BotConnectionSessionMappingView {
   remoteId: string;
   sessionId: string;
+  sessionSource: string;
+  chatType: string;
+  userId: string;
+  threadId: string;
+  scope: "global" | "project" | string;
+  workspaceRoot: string;
   updatedAt: string;
 }
 
@@ -658,6 +785,9 @@ export interface BotConnectionView {
   label: string;
   enabled: boolean;
   status: "disconnected" | "pending" | "connected" | "error" | string;
+  model: string;
+  toolApprovalMode: ToolApprovalMode | "" | string;
+  workspaceRoot: string;
   credential: BotConnectionCredentialView;
   sessionMappings: BotConnectionSessionMappingView[];
   lastError: string;
@@ -668,6 +798,7 @@ export interface BotConnectionView {
 export interface BotSettingsView {
   enabled: boolean;
   model: string;
+  toolApprovalMode: ToolApprovalMode | "" | string;
   maxSteps: number;
   debounceMs: number;
   allowlist: BotAllowlistView;
@@ -675,6 +806,14 @@ export interface BotSettingsView {
   feishu: FeishuBotView;
   weixin: WeixinBotView;
   connections: BotConnectionView[];
+}
+
+export interface BotRuntimeStatusView {
+  running: boolean;
+  status: string;
+  message: string;
+  connections: number;
+  startedAt: string;
 }
 
 export interface BotInstallStartResult {
@@ -698,12 +837,35 @@ export interface BotInstallPollResult {
   error: string;
 }
 
+export interface HookConfigView {
+  event: string;
+  match?: string;
+  command: string;
+  description?: string;
+  timeout?: number;
+  cwd?: string;
+}
+
+export interface HooksSettingsView {
+  scope: string;
+  path: string;
+  projectRoot: string;
+  trusted: boolean;
+  hooks: HookConfigView[];
+  events: string[];
+}
+
 export interface BotConnectionDiagnostic {
   id: string;
   label: string;
   status: string;
   message: string;
   messageId: string;
+  phase: string;
+  code: string;
+  reportKind: string;
+  reportDetail: string;
+  occurredAt: string;
 }
 
 export interface SettingsView {
@@ -720,9 +882,16 @@ export interface SettingsView {
   agent: AgentView;
   bot: BotSettingsView;
   desktopLanguage: string; // "" | "en" | "zh"; empty = auto
+  desktopLayoutStyle: string; // "classic" | "workbench"
   desktopTheme: string; // "auto" | "dark" | "light"
   desktopThemeStyle: string;
   closeBehavior: string; // "background" | "quit"
+  displayMode: string;   // "standard" | "compact"
+  statusBarStyle: string; // "icon" | "text"
+  statusBarItems: string[]; // ordered visible status bar item ids
+  checkUpdates: boolean; // check for new versions on startup
+  telemetry: boolean; // anonymous launch ping (install id + version + OS)
+  metrics: boolean; // opt-in aggregate agent metrics (anonymous signal/bucket counts)
   configPath: string;
   providerKinds: string[]; // provider implementations the kernel registered (for the kind picker)
   autoApproveTools: boolean;
