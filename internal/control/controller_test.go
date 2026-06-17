@@ -25,6 +25,18 @@ type typedNilControllerSink struct{}
 
 func (*typedNilControllerSink) Emit(event.Event) {}
 
+func isolateControlConfigHome(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("REASONIX_CREDENTIALS_STORE", "file")
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData"))
+	t.Chdir(t.TempDir())
+	return home
+}
+
 type appendingRunner struct {
 	session *agent.Session
 }
@@ -149,7 +161,7 @@ func TestSnapshotDoesNotRefreshSessionActivity(t *testing.T) {
 	sess := agent.NewSession("sys")
 	sess.Add(provider.Message{Role: provider.RoleUser, Content: "first"})
 	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
-	c := New(Options{Executor: exec, SessionDir: dir, Label: "test"})
+	c := New(Options{Executor: exec, SessionDir: dir, Label: "test", ModelRef: "provider/model-a"})
 	c.SetSessionPath(filepath.Join(dir, "session.jsonl"))
 
 	if err := c.SnapshotActivity(); err != nil {
@@ -171,6 +183,9 @@ func TestSnapshotDoesNotRefreshSessionActivity(t *testing.T) {
 	}
 	if !second.UpdatedAt.Equal(first.UpdatedAt) {
 		t.Fatalf("Snapshot refreshed activity: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+	if second.Model != "provider/model-a" {
+		t.Fatalf("snapshot model = %q, want provider/model-a", second.Model)
 	}
 }
 
@@ -201,6 +216,32 @@ func TestSnapshotActivityRefreshesSessionActivity(t *testing.T) {
 	}
 	if !second.UpdatedAt.After(first.UpdatedAt) {
 		t.Fatalf("SnapshotActivity did not refresh activity: first=%s second=%s", first.UpdatedAt, second.UpdatedAt)
+	}
+}
+
+func TestSnapshotActivitySavesTranscriptBeforeModelMeta(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session.jsonl")
+	sess := agent.NewSession("sys")
+	sess.Add(provider.Message{Role: provider.RoleUser, Content: "must persist"})
+	exec := agent.New(nil, nil, sess, agent.Options{}, event.Discard)
+	c := New(Options{Executor: exec, SessionDir: dir, SessionPath: path, Label: "test", ModelRef: "provider/model-a"})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(agent.BranchMetaPath(path), []byte("{bad json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.SnapshotActivity(); err == nil {
+		t.Fatal("SnapshotActivity should report malformed branch metadata")
+	}
+	loaded, err := agent.LoadSession(path)
+	if err != nil {
+		t.Fatalf("transcript was not saved before metadata error: %v", err)
+	}
+	if len(loaded.Messages) == 0 || loaded.Messages[len(loaded.Messages)-1].Content != "must persist" {
+		t.Fatalf("saved transcript = %+v, want persisted user message", loaded.Messages)
 	}
 }
 
@@ -285,7 +326,13 @@ func TestDisconnectMCPServerRemovesLazyPlaceholder(t *testing.T) {
 }
 
 func TestRemoveMCPServerRemovesUnconnectedLazyPlaceholder(t *testing.T) {
+	isolateControlConfigHome(t)
 	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
 	t.Chdir(dir)
 	if err := os.WriteFile("reasonix.toml", []byte(`
 [[plugins]]

@@ -273,6 +273,7 @@ type Agent struct {
 	softCompactNoticed  bool
 	recentKeep          int
 	archiveDir          string
+	keepPolicy          KeepPolicy
 	compactStuck        bool
 	consecutiveCompacts int
 
@@ -295,6 +296,15 @@ type Agent struct {
 	repeatSuccessCounts map[string]int
 }
 
+// KeepPolicy is a bitmask controlling which messages are preserved beyond the
+// recent tail during compaction.
+type KeepPolicy int
+
+const (
+	KeepErrors KeepPolicy = 1 << iota
+	KeepUserMarked
+)
+
 // SetPlanMode flips the read-only gate. While true, executeOne refuses any
 // non-ReadOnly tool the model calls and returns a "blocked" result instead of
 // running it. The cache-friendly bits — system prompt, tools schema, message
@@ -310,7 +320,7 @@ func (a *Agent) SetReasoningLanguage(lang string) {
 	a.reasoningLanguage.Store(NormalizeReasoningLanguage(lang))
 }
 
-// SetGate installs the per-call permission gate. Used by `reasonix chat` to swap the
+// SetGate installs the per-call permission gate. Used by interactive CLI sessions to swap the
 // headless gate built in setup for an interactive one that prompts the user;
 // nil disables gating. Safe to call before the run loop starts.
 func (a *Agent) SetGate(g Gate) {
@@ -357,13 +367,15 @@ func (a *Agent) Session() *Session {
 }
 
 // SetSession replaces the agent's conversation wholesale. Used by
-// `reasonix chat --resume` to load a saved JSONL transcript before the first turn,
+// `reasonix --resume` to load a saved JSONL transcript before the first turn,
 // so the model picks up exactly where it left off. Callers serialise it against a
 // running turn (it only fires while idle); sessMu guards the pointer swap itself.
 func (a *Agent) SetSession(s *Session) {
 	a.sessMu.Lock()
 	a.session = s
 	a.sessMu.Unlock()
+	a.sessCacheHit.Store(0)
+	a.sessCacheMiss.Store(0)
 	if s != nil {
 		a.rebuildTodoState(s.Snapshot())
 	}
@@ -484,6 +496,7 @@ type Options struct {
 	CompactForceRatio float64
 	RecentKeep        int
 	ArchiveDir        string
+	KeepPolicy        KeepPolicy
 
 	// Hooks fires PreToolUse / PostToolUse shell hooks around tool calls. nil
 	// disables hook firing.
@@ -553,6 +566,7 @@ func New(prov provider.Provider, tools *tool.Registry, session *Session, opts Op
 		compactForceRatio: opts.CompactForceRatio,
 		recentKeep:        opts.RecentKeep,
 		archiveDir:        opts.ArchiveDir,
+		keepPolicy:        opts.KeepPolicy,
 	}
 	a.SetReasoningLanguage(opts.ReasoningLanguage)
 	return a
