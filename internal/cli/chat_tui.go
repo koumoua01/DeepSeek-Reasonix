@@ -45,7 +45,7 @@ import (
 // prevents taps from raising the soft keyboard, so it stays in the normal buffer
 // and commits finalized output to native scrollback via tea.Println.
 type chatTUI struct {
-	ctrl    *control.Controller
+	ctrl    control.SessionAPI
 	label   string
 	missing string // missing-key warning surfaced once in the banner, "" when ready
 
@@ -171,6 +171,10 @@ type chatTUI struct {
 	toolStreamStart time.Time
 	toolStreamFrame int
 	transcriptDirty bool
+	// forceGotoBottom is set by replayActiveBranch and resetFreshContextView to
+	// pin the viewport to the bottom after a session / branch / clear switch
+	// regardless of the previous wasAtBottom state (#4584).
+	forceGotoBottom bool
 	eventCh         chan event.Event
 	started         bool // banner + resumed history committed once
 
@@ -294,7 +298,7 @@ type chatTUI struct {
 	// and kills plugin subprocesses, both of which corrupt the terminal's
 	// raw mode). Instead they are closed at process exit when the terminal
 	// is already being restored.
-	oldControllers []*control.Controller
+	oldControllers []control.SessionAPI
 
 	// completion is the live autocomplete menu (slash commands; @-refs later).
 	completion completion
@@ -390,8 +394,8 @@ func (m chatTUI) refreshGitStatus() tea.Cmd {
 // mode that would occur if Close() were called from the build goroutine.
 type modelSwitchMsg struct {
 	ref      string
-	ctrl     *control.Controller
-	oldCtrl  *control.Controller
+	ctrl     control.SessionAPI
+	oldCtrl  control.SessionAPI
 	label    string
 	commands []command.Command
 	skills   []skill.Skill
@@ -402,7 +406,7 @@ type modelSwitchMsg struct {
 // fetchBalance queries the provider's wallet balance off the event loop. It's a
 // no-op readout ("") when the provider declares no balance_url or the fetch
 // fails, so the status line stays quiet rather than surfacing an error.
-func fetchBalance(ctrl *control.Controller) tea.Cmd {
+func fetchBalance(ctrl control.Status) tea.Cmd {
 	return func() tea.Msg {
 		b, err := ctrl.Balance(context.Background())
 		if err != nil || b == nil {
@@ -446,7 +450,7 @@ type clipboardPasteMsg struct {
 // with an event sink that feeds eventCh; the TUI issues commands to it and
 // renders the events it emits. Label, history, host, and commands are read from
 // the controller, so a resumed session pre-populates scrollback.
-func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Event, termW int) chatTUI {
+func newChatTUI(ctrl control.SessionAPI, missing string, eventCh chan event.Event, termW int) chatTUI {
 	ti := textarea.New()
 	configureChatTextarea(&ti)
 
@@ -456,6 +460,7 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 
 	commitBuf := []string{}
 	nativeScrollback := detectTermuxTerminal()
+	renderW := transcriptContentWidth(termW, nativeScrollback)
 	return chatTUI{
 		ctrl:                 ctrl,
 		label:                ctrl.Label(),
@@ -473,7 +478,7 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 		reasoning:            &strings.Builder{},
 		pending:              &strings.Builder{},
 		pendingCommit:        &commitBuf,
-		renderer:             newMarkdownRenderer(termW),
+		renderer:             newMarkdownRenderer(renderW),
 		diffMaxLines:         diffFoldLimit,
 		showReasoning:        nativeScrollback,
 		shellOutputs:         make(map[string]string),
@@ -488,6 +493,13 @@ func newChatTUI(ctrl *control.Controller, missing string, eventCh chan event.Eve
 		viewport:             viewport.New(viewport.WithWidth(termW)),
 		statusLineCount:      2,
 	}
+}
+
+func transcriptContentWidth(termW int, nativeScrollback bool) int {
+	if !nativeScrollback {
+		termW-- // reserve the last column for the transcript scrollbar
+	}
+	return max(termW, 1)
 }
 
 func configureChatTextarea(ti *textarea.Model) {
@@ -664,14 +676,7 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	cm := next.(chatTUI)
 
-	contentW := cm.width - 1 // last column is the scrollbar
-	if contentW < 1 {
-		contentW = 1
-	}
-	// Recompute the wrapped status-line count so bottomRows reserves the right
-	// height for the viewport. The data-line tags (model, git, effort, context,
-	// cache, jobs, balance) are the ones most likely to wrap on a narrow terminal.
-	cm.statusLineCount = cm.computeStatusLineCount(contentW)
+	contentW := transcriptContentWidth(cm.width, cm.nativeScrollback)
 	cm.viewport.SetWidth(contentW)
 	// Recompute the wrapped status-line count so bottomRows reserves the right
 	// height for the viewport. Use cm.width (same as boxW in View()) so the
@@ -684,8 +689,9 @@ func (m chatTUI) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		wrapped := wrapTranscript(strings.Join(cm.transcript, "\n"), contentW)
 		cm.viewport.SetContent(wrapped)
 		cm.wrappedLines = strings.Split(wrapped, "\n")
-		if wasAtBottom {
+		if wasAtBottom || cm.forceGotoBottom {
 			cm.viewport.GotoBottom() // tail-follow: stay pinned to newest output
+			cm.forceGotoBottom = false
 		}
 	}
 	cm.transcriptDirty = false
@@ -709,16 +715,17 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.input.SetWidth(msg.Width - 4)
-		m.renderer = newMarkdownRenderer(msg.Width)
+		contentW := transcriptContentWidth(msg.Width, m.nativeScrollback)
+		m.renderer = newMarkdownRenderer(contentW)
 		// Commit the banner — and a resumed session's transcript — once, now
 		// that the width is known.
 		if !m.started {
 			m.started = true
 			var b strings.Builder
-			b.WriteString(renderTUIBanner(m.label, m.missing, msg.Width))
+			b.WriteString(renderTUIBanner(m.label, m.missing, contentW))
 			if len(m.history) > 0 {
-				r := newMarkdownRenderer(msg.Width)
-				for _, sec := range replaySectionsFor(m.history, msg.Width, r) {
+				r := newMarkdownRenderer(contentW)
+				for _, sec := range replaySectionsFor(m.history, contentW, r) {
 					b.WriteString(sec)
 				}
 				m.history = nil
@@ -1012,6 +1019,9 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				if m.bubblePending {
 					m.unsendPending() // server not yet replied — restore text, leave no trace
+				} else if m.cancelRequested() {
+					m.ctrl.Cancel()
+					return m, tea.Quit
 				} else {
 					m.ctrl.Cancel()
 				}
@@ -1164,6 +1174,11 @@ func (m chatTUI) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 			sentLine := m.expandPastedBlocks(line)
 			m.input.Reset()
+			if goal, ok := m.ctrl.AutoStartResearchGoal(sentLine); ok {
+				m.pastedBlocks = nil
+				cmds = append(cmds, m.startTurnWithRaw("Start pursuing the active goal now.", line, line, goal))
+				return m, finalize(m, cmds)
+			}
 
 			// @references (local files / MCP resources, including inline image
 			// attachments) are resolved off the event loop by the controller; the turn
@@ -2153,6 +2168,46 @@ var (
 	workingStyle        lipgloss.Style
 )
 
+func (m chatTUI) cancelRequested() bool {
+	if m.state != tuiRunning || m.ctrl == nil {
+		return false
+	}
+	return m.ctrl.CancelRequested()
+}
+
+func (m chatTUI) runningWorkingLine(cancelRequested, styled bool) string {
+	if m.state != tuiRunning {
+		return ""
+	}
+	if m.retryAttempt > 0 && !cancelRequested {
+		return fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
+	}
+
+	var working string
+	if cancelRequested {
+		working = fmt.Sprintf("  "+i18n.M.ChatStatusCancellingFmt, m.spinner.View(), m.elapsed)
+	} else {
+		working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
+	}
+	if m.turnTokens > 0 {
+		working += " · ↓" + shortTokens(m.turnTokens)
+	}
+	if n := len(m.pendingInterject); n > 0 {
+		var queued string
+		if n == 1 {
+			queued = " · ✎ feedback queued"
+		} else {
+			queued = fmt.Sprintf(" · ✎ %d queued", n)
+		}
+		if styled {
+			working += dim(queued)
+		} else {
+			working += queued
+		}
+	}
+	return working
+}
+
 func (m chatTUI) View() tea.View {
 	boxW := m.width
 	if boxW < 10 {
@@ -2160,6 +2215,7 @@ func (m chatTUI) View() tea.View {
 	}
 	hideComposer := m.hideComposer()
 	shellMode := strings.HasPrefix(strings.TrimSpace(m.input.Value()), "!")
+	cancelRequested := m.cancelRequested()
 	var box string
 	if !hideComposer {
 		style := inputBoxStyle.Width(boxW)
@@ -2215,6 +2271,8 @@ func (m chatTUI) View() tea.View {
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusPlanApproval
 	case m.pendingApproval != nil:
 		status = "  " + modeTag + " · " + i18n.M.ChatStatusToolApproval
+	case cancelRequested:
+		status = "  " + modeTag + " · " + i18n.M.CtrlCQuitHint
 	case shellMode:
 		status = "  " + modeTag + " · " + i18n.M.ShellModeHint
 	case m.ctrl.AutoApproveTools():
@@ -2231,24 +2289,7 @@ func (m chatTUI) View() tea.View {
 	// The spinning "thinking…" indicator is its own line ABOVE the input box (shown
 	// only while a turn runs); the status/data rows stay below. This mirrors Claude
 	// Code: live progress over the composer, shortcuts + stats under it.
-	var working string
-	if m.state == tuiRunning {
-		if m.retryAttempt > 0 {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
-		} else {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
-			if m.turnTokens > 0 {
-				working += " · ↓" + shortTokens(m.turnTokens)
-			}
-			if n := len(m.pendingInterject); n > 0 {
-				if n == 1 {
-					working += dim(" · ✎ feedback queued")
-				} else {
-					working += dim(fmt.Sprintf(" · ✎ %d queued", n))
-				}
-			}
-		}
-	}
+	working := m.runningWorkingLine(cancelRequested, true)
 	// Second status row: the live data (model, git, effort, context gauge, cache
 	// rates, jobs, balance). It lives on its own row so it's always visible; if it
 	// exceeds the terminal width it wraps to additional rows instead of being
@@ -2677,6 +2718,7 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 		return 2 // safe default for tests without a real controller
 	}
 	shellMode := strings.HasPrefix(strings.TrimSpace(m.input.Value()), "!")
+	cancelRequested := m.cancelRequested()
 
 	// Replicate the first status line (mode tag + state) from View().
 	// ModeTag is rendered with Padding(0,1) in View() — add the same padding
@@ -2703,6 +2745,8 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 		status += " · " + i18n.M.ChatStatusPlanApproval
 	case m.pendingApproval != nil:
 		status += " · " + i18n.M.ChatStatusToolApproval
+	case cancelRequested:
+		status += " · " + i18n.M.CtrlCQuitHint
 	case shellMode:
 		status += " · " + i18n.M.ShellModeHint
 	case m.ctrl.AutoApproveTools():
@@ -2740,24 +2784,7 @@ func (m chatTUI) computeStatusLineCount(width int) int {
 	}
 
 	// Replicate the working (spinner) line from View(), shown only while a turn runs.
-	var working string
-	if m.state == tuiRunning {
-		if m.retryAttempt > 0 {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusRetryingFmt, m.spinner.View(), m.retryAttempt, m.retryMax)
-		} else {
-			working = fmt.Sprintf("  "+i18n.M.ChatStatusThinkingFmt, m.spinner.View(), m.elapsed)
-			if m.turnTokens > 0 {
-				working += " · ↓" + shortTokens(m.turnTokens)
-			}
-			if n := len(m.pendingInterject); n > 0 {
-				if n == 1 {
-					working += " · ✎ feedback queued"
-				} else {
-					working += fmt.Sprintf(" · ✎ %d queued", n)
-				}
-			}
-		}
-	}
+	working := m.runningWorkingLine(cancelRequested, false)
 
 	// Count wrapped rows for every piece that View() renders as wrapped.
 	var lines int
@@ -3595,7 +3622,8 @@ func (m *chatTUI) runGoalSubcommand(input string) tea.Cmd {
 	case control.GoalCommandSet:
 		m.planMode = false
 		m.ctrl.SetPlanMode(false)
-		m.ctrl.SetGoal(cmd.Text)
+		m.ctrl.SetGoalWithResearchMode(cmd.Text, cmd.ResearchMode)
+		m.ctrl.GoalStrict(cmd.Strict)
 		m.notice(fmt.Sprintf(i18n.M.GoalSetFmt, control.ShortGoalForNotice(cmd.Text)))
 		return m.startTurn("Start pursuing the active goal now.", input, input)
 	case control.GoalCommandClear:

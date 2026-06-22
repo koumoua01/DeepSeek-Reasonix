@@ -13,6 +13,7 @@ import (
 	"reasonix/internal/config"
 	"reasonix/internal/control"
 	"reasonix/internal/fileutil"
+	"reasonix/internal/jobs"
 )
 
 // sessions.go holds the desktop-only session-management state that the shared
@@ -49,12 +50,16 @@ func desktopSessionDir(root string) string {
 // loadSessionTitles reads the basename→title map (missing/corrupt → empty).
 func loadSessionTitles(dir string) map[string]string {
 	m := map[string]string{}
-	b, err := os.ReadFile(sessionTitlesPath(dir))
+	b, err := readFileWithTimeout(sessionTitlesPath(dir), topicFileReadTimeout)
 	if err != nil {
 		return m
 	}
 	_ = json.Unmarshal(b, &m)
 	return m
+}
+
+func loadSessionTitlesForUpdate(dir string) (map[string]string, error) {
+	return loadStringMapForUpdate(sessionTitlesPath(dir))
 }
 
 // saveSessionTitles writes the map atomically (temp file + rename).
@@ -89,7 +94,10 @@ func setSessionTitle(dir, sessionPath, title string) error {
 	if err != nil {
 		return err
 	}
-	m := loadSessionTitles(dir)
+	m, err := loadSessionTitlesForUpdate(dir)
+	if err != nil {
+		return err
+	}
 	key := filepath.Base(sessionPath)
 	if strings.TrimSpace(title) == "" {
 		delete(m, key)
@@ -117,6 +125,52 @@ type trashedSessionMeta struct {
 
 func trashSessionArtifacts(dir, sessionPath, key string) error {
 	return trashSessionArtifactsBeforeMove(dir, sessionPath, key, nil)
+}
+
+func reconcileDesktopCleanupPending(dir string) error {
+	return agent.ReconcileCleanupPending(dir, func(item agent.CleanupPendingInfo) error {
+		if strings.TrimSpace(item.Meta.Operation) == "delete" {
+			sessionPath, key, err := validateSessionPath(dir, item.SessionPath)
+			if err != nil {
+				return err
+			}
+			return reconcileDesktopTrashSessionArtifacts(dir, sessionPath, key)
+		}
+		return removeDesktopSessionArtifacts(item.SessionPath)
+	})
+}
+
+func reconcileDesktopTrashSessionArtifacts(dir, sessionPath, key string) error {
+	itemDir := filepath.Join(sessionTrashPath(dir), key)
+	if err := os.MkdirAll(itemDir, 0o755); err != nil {
+		return err
+	}
+	if err := movePathIfExists(sessionPath, filepath.Join(itemDir, key)); err != nil {
+		return err
+	}
+	if err := movePathIfExists(sessionPath+".meta", filepath.Join(itemDir, key+".meta")); err != nil {
+		return err
+	}
+	ckptName := strings.TrimSuffix(key, ".jsonl") + ".ckpt"
+	if err := movePathIfExists(strings.TrimSuffix(sessionPath, ".jsonl")+".ckpt", filepath.Join(itemDir, ckptName)); err != nil {
+		return err
+	}
+	jobsName := strings.TrimSuffix(key, ".jsonl") + ".jobs"
+	if err := movePathIfExists(jobs.ArtifactDir(sessionPath), filepath.Join(itemDir, jobsName)); err != nil {
+		return err
+	}
+	if err := trashSubagentArtifacts(dir, sessionPath, itemDir); err != nil {
+		return err
+	}
+	meta := trashedSessionMeta{Key: key, DeletedAt: time.Now().UnixMilli()}
+	b, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(filepath.Join(itemDir, sessionTrashMetaFile), b, 0o644); err != nil {
+		return err
+	}
+	return agent.ClearCleanupPending(sessionPath)
 }
 
 func validateSessionTrashTarget(dir, sessionPath, key string) error {
@@ -160,6 +214,10 @@ func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove fu
 	if err := movePathIfExists(strings.TrimSuffix(sessionPath, ".jsonl")+".ckpt", filepath.Join(itemDir, ckptName)); err != nil {
 		return err
 	}
+	jobsName := strings.TrimSuffix(key, ".jsonl") + ".jobs"
+	if err := movePathIfExists(jobs.ArtifactDir(sessionPath), filepath.Join(itemDir, jobsName)); err != nil {
+		return err
+	}
 	if err := trashSubagentArtifacts(dir, sessionPath, itemDir); err != nil {
 		return err
 	}
@@ -169,6 +227,9 @@ func trashSessionArtifactsBeforeMove(dir, sessionPath, key string, beforeMove fu
 		return err
 	}
 	if err := os.WriteFile(filepath.Join(itemDir, sessionTrashMetaFile), b, 0o644); err != nil {
+		return err
+	}
+	if err := agent.ClearCleanupPending(sessionPath); err != nil {
 		return err
 	}
 	return nil
@@ -243,6 +304,10 @@ func restoreTrashedSessionFile(dir, path string) error {
 	if err := movePathIfExists(filepath.Join(itemDir, ckptName), filepath.Join(dir, ckptName)); err != nil {
 		return err
 	}
+	jobsName := strings.TrimSuffix(key, ".jsonl") + ".jobs"
+	if err := movePathIfExists(filepath.Join(itemDir, jobsName), filepath.Join(dir, jobsName)); err != nil {
+		return err
+	}
 	if err := restoreSubagentArtifacts(dir, itemDir); err != nil {
 		return err
 	}
@@ -257,7 +322,10 @@ func purgeTrashedSessionFile(dir, path string) error {
 	if err := os.RemoveAll(itemDir); err != nil {
 		return err
 	}
-	m := loadSessionTitles(dir)
+	m, err := loadSessionTitlesForUpdate(dir)
+	if err != nil {
+		return err
+	}
 	if _, ok := m[key]; ok {
 		delete(m, key)
 		if err := saveSessionTitles(dir, m); err != nil {
