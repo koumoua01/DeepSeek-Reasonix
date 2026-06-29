@@ -5,7 +5,7 @@ import { useT } from "../lib/i18n";
 import { AssistantMessage, TurnActions, UserMessage } from "./Message";
 import { ProcessCompactIcon, ProcessPhaseIcon } from "./ProcessCard";
 import { ToolCard } from "./ToolCard";
-import { ChevronRight } from "lucide-react";
+import { ArrowDown, ChevronRight } from "lucide-react";
 import { Welcome } from "./Welcome";
 import { ReadOnlyBatch } from "./ReadOnlyBatch";
 import { ToolGroup, isCreationGroupableTool, toolGroupKind, type ToolGroupKind } from "./ToolGroup";
@@ -14,7 +14,7 @@ import { isReadOnlyTool } from "../lib/useController";
 import { useGSAPCollapse } from "../lib/useGSAPCollapse";
 import { useEntranceAnimation } from "../lib/useEntranceAnimation";
 import { useScrollManager } from "../lib/useScrollManager";
-import { buildTurnGroups, compactQuestionText, questionAnchorId, scrollVersion, warmUserPreview, type QuestionAnchor, type TurnGroup } from "../lib/transcriptGrouping";
+import { buildTurnGroups, compactQuestionText, createWarmLayerState, questionAnchorId, questionTurnsById, scrollVersion, warmColdPageForTurn, warmLayerWithColdPageAtLeast, warmLayerWithExpandedTurn, warmLayerWithNextColdPage, warmPagination, warmUserPreview, type QuestionAnchor, type TurnGroup, type WarmLayerState } from "../lib/transcriptGrouping";
 
 type ToolItem = Extract<Item, { kind: "tool" }>;
 type AssistantItem = Extract<Item, { kind: "assistant" }>;
@@ -93,6 +93,12 @@ export function Transcript({
   creationMode = false,
   actionHoverMenus = false,
   rewindSignal = 0,
+  revealSignal = 0,
+  hydrating = false,
+  hasOlderHistory = false,
+  olderHistoryCount = 0,
+  loadingOlderHistory = false,
+  onLoadOlderHistory,
 }: {
   items: Item[];
   live?: LiveStream;
@@ -110,20 +116,32 @@ export function Transcript({
   creationMode?: boolean;
   actionHoverMenus?: boolean;
   rewindSignal?: number;
+  revealSignal?: number;
+  hydrating?: boolean;
+  hasOlderHistory?: boolean;
+  olderHistoryCount?: number;
+  loadingOlderHistory?: boolean;
+  onLoadOlderHistory?: () => void;
 }) {
+  const t = useT();
   const {
     scrollRef,
     stick,
     onScroll,
+    isAtBottom,
     smoothScrollTo,
+    scrollToBottomAfterLayout,
     trackQuestions,
-    repinIfWasPinned,
+    scheduleRepinIfWasPinned,
     resizeFrame,
     lastClientHeight,
     lastFooterHeight,
   } = useScrollManager();
   const autoScrollFrame = useRef<number | null>(null);
+  const pendingRevealBottomScroll = useRef(false);
+  const pendingQuestionJump = useRef<QuestionAnchor | null>(null);
   const sessionKey = useMemo(() => `${items[0]?.id ?? ""}|${items[items.length - 1]?.id ?? ""}`, [items]);
+  const warmLayerSessionKey = useMemo(() => `${tabId ?? ""}|${revealSignal}|${items[0]?.id ?? ""}`, [items, revealSignal, tabId]);
   const entranceRef = useEntranceAnimation<HTMLDivElement>(sessionKey, items.length);
 
   const [displayMode, setDisplayMode] = useState<DisplayMode>(() => getDisplayMode());
@@ -134,7 +152,7 @@ export function Transcript({
     let turn = 0;
     for (const it of items) {
       if (it.kind !== "user") continue;
-      anchors.push({ id: it.id, text: compactQuestionText(it.text), turn });
+      anchors.push({ id: it.id, text: compactQuestionText(it.text), turn, checkpointTurn: it.checkpointTurn });
       turn += 1;
     }
     return anchors;
@@ -150,7 +168,17 @@ export function Transcript({
   // disables auto-scroll when the user had scrolled up in the old tab (#4584).
   useEffect(() => {
     stick.current = true;
-  }, [tabId]);
+    pendingRevealBottomScroll.current = true;
+  }, [tabId, revealSignal]);
+
+  useEffect(() => {
+    if (!pendingRevealBottomScroll.current || items.length === 0) return;
+    pendingRevealBottomScroll.current = false;
+    const frame = requestAnimationFrame(() => {
+      scrollToBottomAfterLayout(5);
+    });
+    return () => cancelAnimationFrame(frame);
+  }, [items.length, revealSignal, scrollToBottomAfterLayout, tabId]);
 
   // Auto-scroll to bottom during streaming. Coalesce fast token/reasoning
   // updates into one layout read/write per animation frame.
@@ -180,11 +208,12 @@ export function Transcript({
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === "undefined") return;
     lastClientHeight.current = el.clientHeight;
-    const observer = new ResizeObserver(() => {
-      const previous = lastClientHeight.current ?? el.clientHeight;
-      lastClientHeight.current = el.clientHeight;
+    const observer = new ResizeObserver((entries) => {
+      const height = entries[0]?.contentRect.height ?? el.clientHeight;
+      const previous = lastClientHeight.current ?? height;
+      lastClientHeight.current = height;
       if (items.length === 0) return;
-      repinIfWasPinned(el.clientHeight - previous);
+      scheduleRepinIfWasPinned(height - previous);
     });
     observer.observe(el);
     return () => {
@@ -194,7 +223,7 @@ export function Transcript({
         resizeFrame.current = null;
       }
     };
-  }, [items.length]);
+  }, [items.length, scheduleRepinIfWasPinned]);
 
   // Footer height changes → smooth scroll repin with GSAP.
   useEffect(() => {
@@ -203,8 +232,8 @@ export function Transcript({
     const previous = lastFooterHeight.current ?? footerHeight;
     lastFooterHeight.current = footerHeight;
     if (items.length === 0) return;
-    repinIfWasPinned(previous - footerHeight);
-  }, [footerHeight, items.length]);
+    scheduleRepinIfWasPinned(previous - footerHeight);
+  }, [footerHeight, items.length, scheduleRepinIfWasPinned]);
 
   // After a non-fork rewind, scroll to the last user message (the
   // rewound-to point) so the user knows where they are.
@@ -233,8 +262,12 @@ export function Transcript({
   }, [items]);
 
   // ── Layer state ────────────────────────────────────────────────────────────
-  const [expandedWarmTurns, setExpandedWarmTurns] = useState<Set<number>>(new Set());
-  const [coldPage, setColdPage] = useState(0);
+  const [warmLayerState, setWarmLayerState] = useState<WarmLayerState>(() => createWarmLayerState(warmLayerSessionKey));
+  const defaultWarmLayerState = useMemo<WarmLayerState>(() => createWarmLayerState(warmLayerSessionKey), [warmLayerSessionKey]);
+  const activeWarmLayerState = warmLayerState.sessionKey === warmLayerSessionKey
+    ? warmLayerState
+    : defaultWarmLayerState;
+  const { expandedWarmTurns, coldPage } = activeWarmLayerState;
 
   // Compute turn groups from the structural item list. Streaming text updates
   // keep the same items[] reference, so this stays out of the token hot path.
@@ -253,9 +286,20 @@ export function Transcript({
   }, [items]);
 
   // How many turns are in the cold zone (not yet shown).
-  const warmTurnCount = turnGroups.length - Math.min(turnGroups.length, HOT_TURNS);
-  const shownWarmStart = Math.max(0, warmTurnCount - coldPage * WARM_PAGE_SIZE);
-  const coldTurnCount = shownWarmStart;
+  const { warmStartTurn, warmEndTurn, coldTurnCount } = useMemo(
+    () => warmPagination({ turnCount: turnGroups.length, hotTurns: HOT_TURNS, pageSize: WARM_PAGE_SIZE, coldPage }),
+    [coldPage, turnGroups.length],
+  );
+
+  useLayoutEffect(() => {
+    const question = pendingQuestionJump.current;
+    if (!question) return;
+    const node = document.getElementById(questionAnchorId(question.id));
+    if (!node) return;
+    pendingQuestionJump.current = null;
+    stick.current = false;
+    smoothScrollTo(node, 12);
+  }, [expandedWarmTurns, smoothScrollTo, stick, warmStartTurn]);
 
   // ── The turn action menu ──────────────────────────────────────────────────
   const [openAction, setOpenAction] = useState<OpenTurnAction | null>(null);
@@ -269,28 +313,36 @@ export function Transcript({
     return () => document.removeEventListener("mousedown", onDown);
   }, [openAction]);
 
-  const userTurn = useMemo(() => new Map(questions.map((question) => [question.id, question.turn])), [questions]);
+  const userTurn = useMemo(() => questionTurnsById(questions), [questions]);
   const checkpointsByTurn = useMemo(() => new Map(checkpoints.map((checkpoint) => [checkpoint.turn, checkpoint])), [checkpoints]);
 
   // ── JumpBar integration ───────────────────────────────────────────────────
   const jumpToQuestion = (question: QuestionAnchor) => {
     const node = document.getElementById(questionAnchorId(question.id));
     if (!node) return;
+    pendingQuestionJump.current = null;
     stick.current = false;
     smoothScrollTo(node, 12);
   };
 
   const handleJumpToQuestion = useCallback((question: QuestionAnchor) => {
+    pendingQuestionJump.current = question;
     // Auto-expand the warm turn when jumping to an old question.
     const warmTurnStart = turnGroups.length - HOT_TURNS;
     if (question.turn < warmTurnStart) {
-      setExpandedWarmTurns((prev) => {
-        if (prev.has(question.turn)) return prev;
-        return new Set([...prev, question.turn]);
+      const neededColdPage = warmColdPageForTurn({
+        turn: question.turn,
+        turnCount: turnGroups.length,
+        hotTurns: HOT_TURNS,
+        pageSize: WARM_PAGE_SIZE,
+      });
+      setWarmLayerState((prev) => {
+        const paged = warmLayerWithColdPageAtLeast(prev, warmLayerSessionKey, neededColdPage);
+        return warmLayerWithExpandedTurn(paged, warmLayerSessionKey, question.turn, true);
       });
     }
     jumpToQuestion(question);
-  }, [turnGroups.length]);
+  }, [turnGroups.length, warmLayerSessionKey]);
 
   // ── Hot zone: fully rendered from hotStartIdx to end ─────────────────────
   // Memoized separately from the assembly so streaming tokens don't rebuild
@@ -578,52 +630,73 @@ export function Transcript({
   // don't rebuild it. The hot zone uses LiveAssistantMessage (reads live from
   // LiveStreamContext) so streaming updates are captured immediately.
   return (
-    <div
-      className={`transcript${empty ? " transcript--empty" : ""}`}
-      ref={scrollRef}
-      onScroll={onScroll}
-    >
-      {empty && <Welcome onPrompt={onPrompt} variant={welcomeVariant} />}
+    <div className="transcript-shell">
+      <div
+        className={`transcript${empty ? " transcript--empty" : ""}`}
+        ref={scrollRef}
+        onScroll={onScroll}
+      >
+        {empty && !hydrating && <Welcome onPrompt={onPrompt} variant={welcomeVariant} />}
+
+        <LiveStreamContext.Provider value={live}>
+          {hasOlderHistory && (
+            <button
+              type="button"
+              className="warm-collapse"
+              onClick={onLoadOlderHistory}
+              disabled={loadingOlderHistory}
+            >
+              {loadingOlderHistory ? t("common.loading") : t("transcript.showEarlierHistory", { n: olderHistoryCount })}
+            </button>
+          )}
+          {turnGroups.length > HOT_TURNS && (
+            <WarmZone
+              turnGroups={turnGroups}
+              expandedWarmTurns={expandedWarmTurns}
+              warmStartTurn={warmStartTurn}
+              warmEndTurn={warmEndTurn}
+              coldTurnCount={coldTurnCount}
+              scrollRef={scrollRef}
+              warmItems={items}
+              warmSubcalls={subcallsByParent}
+              warmUserTurn={userTurn}
+              warmCheckpoints={checkpointsByTurn}
+              warmOpenAction={openAction}
+              warmActionPending={actionPending}
+              warmRewindDisabled={rewindDisabled}
+              warmActionHoverMenus={actionHoverMenus}
+              warmOnRewind={onRewind}
+              warmSetOpenAction={setOpenAction}
+              warmOnEdit={onEditPrompt}
+              tabId={tabId}
+              creationMode={creationMode}
+              onToggleColdPage={() => setWarmLayerState((prev) => warmLayerWithNextColdPage(prev, warmLayerSessionKey))}
+              onToggleWarmTurn={(g, expand) => {
+                setWarmLayerState((prev) => warmLayerWithExpandedTurn(prev, warmLayerSessionKey, g, expand));
+              }}
+            />
+          )}
+          <div ref={entranceRef}>
+            {hotZoneNodes}
+          </div>
+        </LiveStreamContext.Provider>
+      </div>
 
       {!empty && showQuestionNav && (
         <QuestionJumpBar questions={questions} onJump={handleJumpToQuestion} />
       )}
 
-      <LiveStreamContext.Provider value={live}>
-        {turnGroups.length > HOT_TURNS && (
-          <WarmZone
-            turnGroups={turnGroups}
-            expandedWarmTurns={expandedWarmTurns}
-            shownWarmStart={shownWarmStart}
-            coldTurnCount={coldTurnCount}
-            scrollRef={scrollRef}
-            warmItems={items}
-            warmSubcalls={subcallsByParent}
-            warmUserTurn={userTurn}
-            warmCheckpoints={checkpointsByTurn}
-            warmOpenAction={openAction}
-            warmActionPending={actionPending}
-            warmRewindDisabled={rewindDisabled}
-            warmActionHoverMenus={actionHoverMenus}
-            warmOnRewind={onRewind}
-            warmSetOpenAction={setOpenAction}
-            warmOnEdit={onEditPrompt}
-            tabId={tabId}
-            creationMode={creationMode}
-            onToggleColdPage={() => setColdPage((p) => p + 1)}
-            onToggleWarmTurn={(g, expand) => {
-              setExpandedWarmTurns((prev) => {
-                const next = new Set(prev);
-                if (expand) next.add(g); else next.delete(g);
-                return next;
-              });
-            }}
-          />
-        )}
-        <div ref={entranceRef}>
-          {hotZoneNodes}
-        </div>
-      </LiveStreamContext.Provider>
+      {!empty && !isAtBottom && (
+        <button
+          type="button"
+          className="transcript__jump-bottom"
+          onClick={() => scrollToBottomAfterLayout(2)}
+          aria-label={t("transcript.jumpToBottom")}
+          title={t("transcript.jumpToBottom")}
+        >
+          <ArrowDown size={18} strokeWidth={2.2} aria-hidden="true" />
+        </button>
+      )}
     </div>
   );
 }
@@ -635,7 +708,8 @@ export function Transcript({
 const WarmZone = memo(function WarmZone({
   turnGroups,
   expandedWarmTurns,
-  shownWarmStart,
+  warmStartTurn,
+  warmEndTurn,
   coldTurnCount,
   scrollRef,
   warmItems,
@@ -656,7 +730,8 @@ const WarmZone = memo(function WarmZone({
 }: {
   turnGroups: TurnGroup[];
   expandedWarmTurns: ReadonlySet<number>;
-  shownWarmStart: number;
+  warmStartTurn: number;
+  warmEndTurn: number;
   coldTurnCount: number;
   scrollRef: React.RefObject<HTMLDivElement | null>;
   warmItems: readonly Item[];
@@ -693,10 +768,8 @@ const WarmZone = memo(function WarmZone({
   }
 
   // 2. Warm zone: collapsed/expanded warm turn cards.
-  let warmStartTurn = 0;
   if (turnGroups.length > HOT_TURNS) {
-    warmStartTurn = turnGroups.length - HOT_TURNS - shownWarmStart;
-    for (let g = warmStartTurn; g < turnGroups.length - HOT_TURNS; g++) {
+    for (let g = warmStartTurn; g < warmEndTurn; g++) {
       const group = turnGroups[g];
       if (!group) continue;
       const expanded = expandedWarmTurns.has(g);
