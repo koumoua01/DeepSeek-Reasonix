@@ -25,10 +25,19 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
+
+// defaultStreamIdleTimeout caps how long a started SSE stream may go silent before
+// it's treated as a dropped connection — a half-open TCP connection (proxy switched
+// mid-stream) sends no RST, so scanner.Scan() would block forever. Generous on
+// purpose; live streams emit far more often. Stored per-client (client.idleTimeout)
+// so a test can shorten it without a shared global that races other watchdogs.
+const defaultStreamIdleTimeout = 120 * time.Second
 
 const (
 	// anthropicVersion is the required API version header value.
@@ -61,21 +70,41 @@ func New(cfg provider.Config) (provider.Provider, error) {
 		baseURL = defaultBaseURL
 	}
 	keyEnv, _ := cfg.Extra["api_key_env"].(string) // for actionable auth errors
+	keySource, _ := cfg.Extra["api_key_source"].(string)
 	thinking, _ := cfg.Extra["thinking"].(string)
 	effort, _ := cfg.Extra["effort"].(string)
+	vision, _ := cfg.Extra["vision"].(bool)
 	httpClient, err := newHTTPClient(cfg)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: network: %w", err)
 	}
+	// Anthropic's API surface is at {root}/v1/messages, so c.baseURL stores
+	// the *root* — without any trailing /v1. The setup wizard, however, lets
+	// users paste a full OpenAI-compatible URL (e.g.
+	// "https://proxy.example.com/v1") because that's what /models probes
+	// expect. Stripping the trailing /v1 here makes both forms land on the
+	// same endpoint without forcing users to remember Anthropic's quirky
+	// root-vs-versioned split. Without this, a user pasting
+	// "https://proxy.example.com/v1" would probe /v1/models successfully
+	// but get the chat client concatenating onto
+	// "https://proxy.example.com/v1/v1/messages" — a 404.
+	root := strings.TrimRight(baseURL, "/")
+	root = strings.TrimSuffix(root, "/v1")
+	if root == "" {
+		root = defaultBaseURL
+	}
 	return &client{
-		name:     name,
-		apiKey:   cfg.APIKey,
-		keyEnv:   keyEnv,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		model:    cfg.Model,
-		thinking: thinking,
-		effort:   effort,
-		http:     httpClient, // no overall timeout; lifecycle is ctx-driven
+		name:        name,
+		apiKey:      cfg.APIKey,
+		keyEnv:      keyEnv,
+		keySource:   keySource,
+		baseURL:     root,
+		model:       cfg.Model,
+		thinking:    thinking,
+		effort:      effort,
+		vision:      vision,
+		http:        httpClient, // no overall timeout; lifecycle is ctx-driven
+		idleTimeout: defaultStreamIdleTimeout,
 	}, nil
 }
 
@@ -85,17 +114,31 @@ func newHTTPClient(cfg provider.Config) (*http.Client, error) {
 }
 
 type client struct {
-	name     string
-	apiKey   string
-	keyEnv   string // api_key_env name, surfaced in auth errors
-	baseURL  string
-	model    string
-	thinking string // "adaptive" enables extended thinking; "" = off (config-driven)
-	effort   string // output_config.effort: low|medium|high|xhigh|max; "" = provider default
-	http     *http.Client
+	name        string
+	apiKey      string
+	keyEnv      string // api_key_env name, surfaced in auth errors
+	keySource   string // source of keyEnv, surfaced in auth errors
+	baseURL     string
+	model       string
+	thinking    string // "adaptive" enables extended thinking; "" = off (config-driven)
+	effort      string // output_config.effort: low|medium|high|xhigh|max; "" = provider default
+	vision      bool   // model accepts image input — embed attached images as base64 image blocks
+	http        *http.Client
+	idleTimeout time.Duration // SSE stall watchdog window; defaultStreamIdleTimeout unless a test overrides
+	authed      atomic.Bool   // a request has succeeded — gate transient-401 retry
 }
 
 func (c *client) Name() string { return c.name }
+
+func (c *client) sendOpts() provider.SendOptions {
+	return provider.SendOptions{
+		Provider:   c.name,
+		KeyEnv:     c.keyEnv,
+		KeySource:  c.keySource,
+		KeyPresent: c.apiKey != "",
+		RetryAuth:  c.authed.Load(),
+	}
+}
 
 // bufPool reuses byte buffers for JSON-marshalled request bodies, reducing GC
 // churn from repeated alloc/free of ~10-100KB buffers per turn.
@@ -125,13 +168,14 @@ func (c *client) Stream(ctx context.Context, req provider.Request) (<-chan provi
 		httpReq.Header.Set("anthropic-version", anthropicVersion)
 		return httpReq, nil
 	}
-	resp, err := provider.SendWithRetry(ctx, c.http, c.name, c.keyEnv, newReq)
+	resp, err := provider.SendWithRetry(ctx, c.http, c.sendOpts(), newReq)
 	if err != nil {
 		return nil, err
 	}
+	c.authed.Store(true)
 
 	out := make(chan provider.Chunk)
-	go c.readStream(resp, out)
+	go c.readStream(ctx, resp, out)
 	return out, nil
 }
 
@@ -166,6 +210,13 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 		case provider.RoleUser:
 			if m.Content != "" {
 				appendBlocks("user", contentBlock{Type: "text", Text: m.Content})
+			}
+			if c.vision {
+				for _, url := range m.Images {
+					if mt, data, ok := provider.ParseImageDataURL(url); ok {
+						appendBlocks("user", contentBlock{Type: "image", Source: &imageSource{Type: "base64", MediaType: mt, Data: data}})
+					}
+				}
 			}
 		case provider.RoleTool:
 			content := m.Content
@@ -250,9 +301,51 @@ func (c *client) buildRequest(req provider.Request) anthRequest {
 // and a complete ChunkToolCall when the block closes; usage is assembled from
 // message_start (input/cache) + message_delta (output + stop_reason) and emitted
 // once before ChunkDone.
-func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
+func (c *client) readStream(ctx context.Context, resp *http.Response, out chan<- provider.Chunk) {
 	defer resp.Body.Close()
 	defer close(out)
+
+	// Close the body if the stream stalls past c.idleTimeout so scanner.Scan()
+	// unblocks instead of hanging on a half-open connection. The watchdog owns the
+	// timer; the read loop only pings the buffered activity channel (no Timer.Reset
+	// race). A context cancel already unblocks the scan via the transport.
+	idleTimeout := c.idleTimeout
+	if idleTimeout <= 0 { // zero-value client (constructed without New)
+		idleTimeout = defaultStreamIdleTimeout
+	}
+	done := make(chan struct{})
+	defer close(done)
+	activity := make(chan struct{}, 1)
+	var stalled atomic.Bool
+	go func() {
+		idle := time.NewTimer(idleTimeout)
+		defer idle.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				resp.Body.Close()
+				return
+			case <-idle.C:
+				stalled.Store(true)
+				resp.Body.Close()
+				return
+			case <-activity:
+				if !idle.Stop() {
+					select {
+					case <-idle.C:
+					default:
+					}
+				}
+				idle.Reset(idleTimeout)
+			case <-done:
+				return
+			}
+		}
+	}()
+
+	send := func(chunk provider.Chunk) bool {
+		return sendChunk(ctx, out, chunk)
+	}
 
 	tools := map[int]*provider.ToolCall{} // tool_use blocks, keyed by content index
 	var inTok, outTok, cacheCreate, cacheRead int
@@ -263,6 +356,10 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 
 	for scanner.Scan() {
+		select { // ping the idle watchdog; non-blocking so a full buffer is fine
+		case activity <- struct{}{}:
+		default:
+		}
 		line := strings.TrimSpace(scanner.Text())
 		// SSE carries `event:` and `data:` lines; the data JSON's own `type` field
 		// is authoritative, so we only need the data payloads.
@@ -276,7 +373,7 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 
 		var ev streamEvent
 		if err := json.Unmarshal([]byte(data), &ev); err != nil {
-			out <- provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: decode stream: %w", c.name, err)}
+			send(provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: decode stream: %w", c.name, err)})
 			return
 		}
 
@@ -292,7 +389,9 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 			if ev.ContentBlock != nil && ev.ContentBlock.Type == "tool_use" {
 				tc := &provider.ToolCall{ID: ev.ContentBlock.ID, Name: ev.ContentBlock.Name}
 				tools[ev.Index] = tc
-				out <- provider.Chunk{Type: provider.ChunkToolCallStart, ToolCall: &provider.ToolCall{ID: tc.ID, Name: tc.Name}}
+				if !send(provider.Chunk{Type: provider.ChunkToolCallStart, ToolCall: &provider.ToolCall{ID: tc.ID, Name: tc.Name}}) {
+					return
+				}
 			}
 		case "content_block_delta":
 			if ev.Delta == nil {
@@ -301,15 +400,21 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 			switch ev.Delta.Type {
 			case "text_delta":
 				if ev.Delta.Text != "" {
-					out <- provider.Chunk{Type: provider.ChunkText, Text: ev.Delta.Text}
+					if !send(provider.Chunk{Type: provider.ChunkText, Text: ev.Delta.Text}) {
+						return
+					}
 				}
 			case "thinking_delta":
 				if ev.Delta.Thinking != "" {
-					out <- provider.Chunk{Type: provider.ChunkReasoning, Text: ev.Delta.Thinking}
+					if !send(provider.Chunk{Type: provider.ChunkReasoning, Text: ev.Delta.Thinking}) {
+						return
+					}
 				}
 			case "signature_delta":
 				if ev.Delta.Signature != "" {
-					out <- provider.Chunk{Type: provider.ChunkReasoning, Signature: ev.Delta.Signature}
+					if !send(provider.Chunk{Type: provider.ChunkReasoning, Signature: ev.Delta.Signature}) {
+						return
+					}
 				}
 			case "input_json_delta":
 				if tc := tools[ev.Index]; tc != nil {
@@ -318,7 +423,9 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 			}
 		case "content_block_stop":
 			if tc := tools[ev.Index]; tc != nil {
-				out <- provider.Chunk{Type: provider.ChunkToolCall, ToolCall: tc}
+				if !send(provider.Chunk{Type: provider.ChunkToolCall, ToolCall: tc}) {
+					return
+				}
 				delete(tools, ev.Index)
 			}
 		case "message_delta":
@@ -336,27 +443,50 @@ func (c *client) readStream(resp *http.Response, out chan<- provider.Chunk) {
 			if ev.Error != nil && ev.Error.Message != "" {
 				msg = ev.Error.Message
 			}
-			out <- provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: %s", c.name, msg)}
+			send(provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: %s", c.name, msg)})
 			return
 		}
 	}
 
+	if ctx.Err() != nil {
+		return
+	}
+	if stalled.Load() {
+		send(provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: stream stalled — no data for %s, connection likely dropped", c.name, idleTimeout)})
+		return
+	}
 	if err := scanner.Err(); err != nil {
-		out <- provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: read stream: %w", c.name, err)}
+		send(provider.Chunk{Type: provider.ChunkError, Err: fmt.Errorf("%s: read stream: %w", c.name, err)})
 		return
 	}
 
 	if haveUsage {
-		out <- provider.Chunk{Type: provider.ChunkUsage, Usage: &provider.Usage{
+		if !send(provider.Chunk{Type: provider.ChunkUsage, Usage: &provider.Usage{
 			PromptTokens:     inTok + cacheCreate + cacheRead,
 			CompletionTokens: outTok,
 			TotalTokens:      inTok + cacheCreate + cacheRead + outTok,
 			CacheHitTokens:   cacheRead,
 			CacheMissTokens:  inTok + cacheCreate, // uncached input + cache writes (billed ≥1×)
 			FinishReason:     mapStopReason(stopReason),
-		}}
+		}}) {
+			return
+		}
 	}
-	out <- provider.Chunk{Type: provider.ChunkDone}
+	send(provider.Chunk{Type: provider.ChunkDone})
+}
+
+func sendChunk(ctx context.Context, out chan<- provider.Chunk, chunk provider.Chunk) bool {
+	select {
+	case out <- chunk:
+		return true
+	default:
+	}
+	select {
+	case <-ctx.Done():
+		return false
+	case out <- chunk:
+		return true
+	}
 }
 
 // mapStopReason translates Anthropic stop reasons to the OpenAI-style finish
@@ -426,7 +556,14 @@ type contentBlock struct {
 	Input        json.RawMessage `json:"input,omitempty"`       // tool_use
 	ToolUseID    string          `json:"tool_use_id,omitempty"` // tool_result
 	Content      string          `json:"content,omitempty"`     // tool_result
+	Source       *imageSource    `json:"source,omitempty"`      // image
 	CacheControl *cacheControl   `json:"cache_control,omitempty"`
+}
+
+type imageSource struct {
+	Type      string `json:"type"` // "base64"
+	MediaType string `json:"media_type"`
+	Data      string `json:"data"`
 }
 
 type anthTool struct {

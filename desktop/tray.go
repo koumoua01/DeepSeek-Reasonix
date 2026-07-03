@@ -7,22 +7,34 @@ import (
 )
 
 type desktopTray struct {
-	end      func()
-	openItem *systray.MenuItem
-	quitItem *systray.MenuItem
-	once     sync.Once
+	end       func()
+	openItem  *systray.MenuItem
+	quitItem  *systray.MenuItem
+	once      sync.Once
+	ready     chan struct{}
+	readyOnce sync.Once
 }
 
-func (a *App) startTray() {
+func newDesktopTray() *desktopTray {
+	return &desktopTray{ready: make(chan struct{})}
+}
+
+func (t *desktopTray) markReady() {
+	t.readyOnce.Do(func() {
+		close(t.ready)
+	})
+}
+
+func (a *App) startTray() bool {
 	if !traySupported() {
-		return
+		return false
 	}
 	a.mu.Lock()
 	if a.tray != nil {
 		a.mu.Unlock()
-		return
+		return true
 	}
-	t := &desktopTray{}
+	t := newDesktopTray()
 	a.tray = t
 	a.mu.Unlock()
 
@@ -30,7 +42,11 @@ func (a *App) startTray() {
 		systray.SetIcon(trayIconBytes)
 		systray.SetTitle("Reasonix")
 		systray.SetTooltip("Reasonix")
-		systray.SetOnTapped(func() { a.showFromTray() })
+		// Run off the systray Win32 message loop: SetOnTapped fires inside wndProc,
+		// so a blocking showFromTray (a wedged webview after sleep freezes
+		// runtime.WindowShow) would stall the whole tray's message pump (#3834). The
+		// menu items below are already decoupled via goroutines for the same reason.
+		systray.SetOnTapped(func() { a.goSafe("showFromTray", a.showFromTray) })
 		// Keep secondary/right-click on systray's native menu path.
 		systray.SetOnSecondaryTapped(nil)
 
@@ -41,22 +57,27 @@ func (a *App) startTray() {
 		a.mu.Lock()
 		a.trayReady = true
 		a.mu.Unlock()
+		t.markReady()
 
-		go func() {
+		a.goSafe("trayOpenLoop", func() {
 			for range t.openItem.ClickedCh {
 				a.showFromTray()
 			}
-		}()
-		go func() {
+		})
+		a.goSafe("trayQuitLoop", func() {
 			for range t.quitItem.ClickedCh {
 				a.quitFromTray()
 			}
-		}()
+		})
 	}, func() {
 		a.mu.Lock()
-		a.trayReady = false
+		if a.tray == t {
+			a.trayReady = false
+			a.tray = nil
+		}
 		a.mu.Unlock()
 	})
+	return true
 }
 
 func (a *App) stopTray() {

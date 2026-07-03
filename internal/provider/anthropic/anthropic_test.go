@@ -154,7 +154,7 @@ func TestReadStream(t *testing.T) {
 	c := &client{name: "anthropic"}
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(sseFixture))}
 	ch := make(chan provider.Chunk)
-	go c.readStream(resp, ch)
+	go c.readStream(context.Background(), resp, ch)
 
 	var text strings.Builder
 	var started, full *provider.ToolCall
@@ -207,7 +207,7 @@ func TestReadStreamError(t *testing.T) {
 	c := &client{name: "anthropic"}
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(sse))}
 	ch := make(chan provider.Chunk)
-	go c.readStream(resp, ch)
+	go c.readStream(context.Background(), resp, ch)
 
 	var gotErr error
 	for ck := range ch {
@@ -269,6 +269,30 @@ func TestBuildRequestThinkingOff(t *testing.T) {
 	}
 }
 
+func TestBuildRequestDropsMemoryCitations(t *testing.T) {
+	c := &client{model: "claude-opus-4-8"}
+	r := c.buildRequest(provider.Request{Messages: []provider.Message{
+		{Role: provider.RoleUser, Content: "continue"},
+		{Role: provider.RoleUser, Content: "edited prompt", Edited: true, Original: "original prompt"},
+		{Role: provider.RoleAssistant, Content: "done", MemoryCitations: []provider.MemoryCitation{{
+			ID: "mem-1", Source: "MEMORY.md", LineStart: 116, LineEnd: 123, Note: "workflow",
+		}}},
+	}})
+	b, err := json.Marshal(r.Messages)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "memoryCitations") || strings.Contains(string(b), "MEMORY.md") {
+		t.Fatalf("local memory citations leaked into Anthropic request: %s", b)
+	}
+	if strings.Contains(string(b), "original prompt") || strings.Contains(string(b), `"edited"`) || strings.Contains(string(b), `"original"`) {
+		t.Fatalf("local edit metadata leaked into Anthropic request: %s", b)
+	}
+	if !strings.Contains(string(b), "done") {
+		t.Fatalf("assistant content was dropped with local metadata: %s", b)
+	}
+}
+
 const sseThinking = `event: content_block_start
 data: {"type":"content_block_start","index":0,"content_block":{"type":"thinking"}}
 
@@ -300,7 +324,7 @@ func TestReadStreamThinking(t *testing.T) {
 	c := &client{name: "anthropic"}
 	resp := &http.Response{Body: io.NopCloser(strings.NewReader(sseThinking))}
 	ch := make(chan provider.Chunk)
-	go c.readStream(resp, ch)
+	go c.readStream(context.Background(), resp, ch)
 
 	var reasoning, text strings.Builder
 	var sig string
@@ -323,6 +347,46 @@ func TestReadStreamThinking(t *testing.T) {
 	}
 	if text.String() != "Hi" {
 		t.Fatalf("text = %q", text.String())
+	}
+}
+
+// TestBaseURLNormalizedForV1Messages checks the URL-rewriting step in New().
+// Anthropic's Messages endpoint is {root}/v1/messages, but the setup wizard
+// accepts OpenAI-style URLs (e.g. "https://proxy.example.com/v1") because
+// /models probes expect that shape. Without the strip, the chat client would
+// concatenate /v1/messages onto an already-versioned root and the request
+// would go to https://proxy.example.com/v1/v1/messages — failing 404.
+func TestBaseURLNormalizedForV1Messages(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"plain root (no /v1)", "https://api.anthropic.com", "https://api.anthropic.com"},
+		{"versioned v1 (OpenAI shape)", "https://proxy.example.com/v1", "https://proxy.example.com"},
+		{"versioned v1 with trailing slash", "https://proxy.example.com/v1/", "https://proxy.example.com"},
+		{"versioned v1 with path prefix", "https://gateway.example.com/api/v1", "https://gateway.example.com/api"},
+		{"trailing slash only", "https://api.anthropic.com/", "https://api.anthropic.com"},
+		{"empty falls back to default", "", "https://api.anthropic.com"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, err := New(provider.Config{
+				Name:    "test",
+				Model:   "claude-opus-4-8",
+				BaseURL: tc.in,
+			})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			c, ok := p.(*client)
+			if !ok {
+				t.Fatalf("provider type = %T, want *client", p)
+			}
+			if c.baseURL != tc.want {
+				t.Errorf("baseURL = %q, want %q", c.baseURL, tc.want)
+			}
+		})
 	}
 }
 

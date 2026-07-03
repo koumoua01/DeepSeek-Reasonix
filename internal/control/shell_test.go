@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"reasonix/internal/event"
+	"reasonix/internal/i18n"
 	"reasonix/internal/sandbox"
 )
 
@@ -26,10 +27,15 @@ func collectSink() (event.Sink, chan event.Event, *[]event.Event) {
 
 func waitForDone(t *testing.T, done chan event.Event) event.Event {
 	t.Helper()
+	return waitForDoneWithin(t, done, 5*time.Second)
+}
+
+func waitForDoneWithin(t *testing.T, done chan event.Event, d time.Duration) event.Event {
+	t.Helper()
 	select {
 	case e := <-done:
 		return e
-	case <-time.After(5 * time.Second):
+	case <-time.After(d):
 		t.Fatal("timed out waiting for TurnDone")
 		return event.Event{}
 	}
@@ -141,19 +147,40 @@ func TestRunShell_FailingCommand(t *testing.T) {
 }
 
 func TestRunShell_CancelStopsCommand(t *testing.T) {
-	sink, done, _ := collectSink()
+	sink, done, events := collectSink()
 	ctrl := &Controller{sink: sink}
 
 	command := "sleep 30"
-	if sandbox.ResolveShell().Kind == sandbox.ShellPowerShell {
+	if sandbox.ResolveShell("", "", nil).Kind == sandbox.ShellPowerShell {
 		command = "Start-Sleep -Seconds 30"
 	}
 	ctrl.RunShell(command)
 	time.Sleep(100 * time.Millisecond)
 	ctrl.Cancel()
 
-	e := waitForDone(t, done)
+	// Cancel kills the shell via the run context, but cmd.Wait honours
+	// shellWaitDelay (and on Windows cmd.Cancel spawns taskkill /F /T), so
+	// TurnDone can arrive almost a full shellWaitDelay after Cancel. Wait
+	// comfortably longer than that grace — a flat 5s budget equalled
+	// shellWaitDelay and lost the race on a loaded windows runner.
+	e := waitForDoneWithin(t, done, shellWaitDelay+10*time.Second)
 	if e.Kind != event.TurnDone {
 		t.Fatalf("done event kind = %v, want TurnDone", e.Kind)
+	}
+	if e.Err != nil {
+		t.Fatalf("cancelled shell TurnDone err = %v, want nil", e.Err)
+	}
+	var result *event.Event
+	for i := range *events {
+		if (*events)[i].Kind == event.ToolResult {
+			result = &(*events)[i]
+			break
+		}
+	}
+	if result == nil {
+		t.Fatal("expected ToolResult for cancelled shell")
+	}
+	if result.Tool.Err != i18n.M.TurnCancelled {
+		t.Fatalf("cancelled shell result err = %q, want %q", result.Tool.Err, i18n.M.TurnCancelled)
 	}
 }

@@ -17,7 +17,12 @@ import (
 // the final answer. boot wires this over the agent's sub-agent machinery; nil
 // means subagent skills are unavailable in this session (they error rather than
 // silently inlining, which would lose the isolation the author asked for).
-type SubagentRunner func(ctx context.Context, sk Skill, task string) (string, error)
+type SubagentRunOptions struct {
+	ContinueFrom string
+	ForkFrom     string
+}
+
+type SubagentRunner func(ctx context.Context, sk Skill, task string, opts SubagentRunOptions) (string, error)
 
 // ProfileResolver returns the model/effort profile a subagent skill will use.
 // It is optional; without one, skill frontmatter still supplies display metadata.
@@ -61,7 +66,8 @@ func (*runSkillTool) Schema() json.RawMessage {
 "type":"object",
 "properties":{
   "name":{"type":"string","description":"Skill identifier as it appears in the pinned Skills index (e.g. 'explore', 'review'). Case-sensitive. Just the identifier, not the [🧬 subagent] tag."},
-  "arguments":{"type":"string","description":"Free-form arguments. For inline skills: appended as an 'Arguments:' line; the skill's own instructions decide how to use them. For subagent skills: REQUIRED — becomes the entire task the subagent receives."}
+  "arguments":{"type":"string","description":"Free-form arguments. For inline skills: appended as an 'Arguments:' line; the skill's own instructions decide how to use them. For subagent skills: REQUIRED — becomes the entire task the subagent receives."},
+  "continue_from":{"type":"string","description":"Continue a prior compatible subagent transcript in the current conversation context. Only valid for runAs=subagent skills. Pass only the 'sa_...' value from the prior result's 'Subagent reference: ...' line."}
 },
 "required":["name"]
 }`)
@@ -71,6 +77,8 @@ func (t *runSkillTool) Execute(ctx context.Context, args json.RawMessage) (strin
 	var p struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
+		Continue  string `json:"continue_from"`
+		Fork      string `json:"fork_from"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("invalid args: %w", err)
@@ -84,6 +92,10 @@ func (t *runSkillTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		return "", fmt.Errorf("unknown skill %q — available: %s", name, availableNames(t.store))
 	}
 	rawArgs := strings.TrimSpace(p.Arguments)
+	opts := SubagentRunOptions{ContinueFrom: strings.TrimSpace(p.Continue), ForkFrom: strings.TrimSpace(p.Fork)}
+	if opts.ContinueFrom != "" && opts.ForkFrom != "" {
+		return "", fmt.Errorf("run_skill: continue_from and fork_from are mutually exclusive; pass only continue_from")
+	}
 
 	if sk.RunAs == RunSubagent {
 		if t.runner == nil {
@@ -92,7 +104,10 @@ func (t *runSkillTool) Execute(ctx context.Context, args json.RawMessage) (strin
 		if rawArgs == "" {
 			return "", fmt.Errorf("run_skill: skill %q is a subagent and requires 'arguments' — the subagent has no other context, so describe the concrete task", name)
 		}
-		return t.runner(ctx, sk, rawArgs)
+		return t.runner(ctx, sk, rawArgs, opts)
+	}
+	if opts.ContinueFrom != "" || opts.ForkFrom != "" {
+		return "", fmt.Errorf("run_skill: subagent continuation is only valid for runAs=subagent skills")
 	}
 	return renderInline(sk, rawArgs), nil
 }
@@ -116,8 +131,102 @@ func (t *runSkillTool) ResolveProfile(args json.RawMessage) *event.Profile {
 }
 
 func (t *runSkillTool) profileForSkill(sk Skill) *event.Profile {
-	if t.profileResolver != nil {
-		if pr := t.profileResolver(sk); pr != nil {
+	return profileForSkill(sk, t.profileResolver)
+}
+
+// --- read_only_skill ---
+
+type readOnlySkillTool struct {
+	store           *Store
+	runner          SubagentRunner
+	profileResolver ProfileResolver
+}
+
+// NewReadOnlySkillTool builds a plan-mode-safe skill entry point. Inline skills
+// are rendered like read_skill; subagent skills run through a host-provided
+// read-only subagent runner with no continuation/fork controls.
+func NewReadOnlySkillTool(store *Store, runner SubagentRunner, profileResolver ...ProfileResolver) tool.Tool {
+	var pr ProfileResolver
+	if len(profileResolver) > 0 {
+		pr = profileResolver[0]
+	}
+	return &readOnlySkillTool{store: store, runner: runner, profileResolver: pr}
+}
+
+func (*readOnlySkillTool) Name() string { return "read_only_skill" }
+
+func (*readOnlySkillTool) ReadOnly() bool { return true }
+
+// PlanModeSafe reports true: read_only_skill delegates to a skill sub-agent
+// restricted to read-only research tools and plan-mode-safe foreground bash, so
+// it is safe to run while planning.
+func (*readOnlySkillTool) PlanModeSafe() bool { return true }
+
+func (*readOnlySkillTool) Description() string {
+	return "Invoke a skill in read-only mode. Inline skills are loaded into context like read_skill. `[🧬 subagent]` skills run in an isolated ephemeral read-only subagent with only read-only research tools and safe foreground bash; no writes, installers, memory mutation, continuation/fork, background jobs, or writer-capable delegation are available. Read-only nested delegation may be available until max_subagent_depth is reached. Pass `name` as the bare skill identifier and `arguments` as the concrete task."
+}
+
+func (*readOnlySkillTool) Schema() json.RawMessage {
+	return json.RawMessage(`{
+"type":"object",
+"properties":{
+  "name":{"type":"string","description":"Skill identifier as it appears in the pinned Skills index. Just the identifier, not the [🧬 subagent] tag."},
+  "arguments":{"type":"string","description":"Free-form arguments. For inline skills: appended as an 'Arguments:' line. For subagent skills: REQUIRED — becomes the read-only subagent's entire task."}
+},
+"required":["name"]
+}`)
+}
+
+func (t *readOnlySkillTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
+	var p struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return "", fmt.Errorf("invalid args: %w", err)
+	}
+	name := cleanSkillName(p.Name)
+	if name == "" {
+		return "", fmt.Errorf("read_only_skill requires a 'name' argument (got %q, which is just a marker/tag)", p.Name)
+	}
+	sk, ok := t.store.Read(name)
+	if !ok {
+		return "", fmt.Errorf("unknown skill %q — available: %s", name, availableNames(t.store))
+	}
+	rawArgs := strings.TrimSpace(p.Arguments)
+	if sk.RunAs == RunSubagent {
+		if t.runner == nil {
+			return "", fmt.Errorf("read_only_skill: skill %q is runAs=subagent but no read-only subagent runner is configured in this session", name)
+		}
+		if rawArgs == "" {
+			return "", fmt.Errorf("read_only_skill: skill %q is a subagent and requires 'arguments' — the subagent has no other context, so describe the concrete read-only task", name)
+		}
+		return t.runner(ctx, sk, rawArgs, SubagentRunOptions{})
+	}
+	return renderInline(sk, rawArgs), nil
+}
+
+func (t *readOnlySkillTool) ResolveProfile(args json.RawMessage) *event.Profile {
+	var p struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(args, &p); err != nil {
+		return nil
+	}
+	name := cleanSkillName(p.Name)
+	if name == "" {
+		return nil
+	}
+	sk, ok := t.store.Read(name)
+	if !ok || sk.RunAs != RunSubagent {
+		return nil
+	}
+	return profileForSkill(sk, t.profileResolver)
+}
+
+func profileForSkill(sk Skill, resolver ProfileResolver) *event.Profile {
+	if resolver != nil {
+		if pr := resolver(sk); pr != nil {
 			return pr
 		}
 	}
@@ -198,12 +307,14 @@ func (t *subagentSkillTool) Description() string { return t.description }
 
 func (t *subagentSkillTool) Schema() json.RawMessage {
 	return json.RawMessage(`{"type":"object","properties":{"task":{"type":"string","description":` +
-		strconv.Quote(t.taskDesc) + `}},"required":["task"]}`)
+		strconv.Quote(t.taskDesc) + `},"continue_from":{"type":"string","description":"Continue a prior compatible subagent transcript in the current conversation context. Pass only the 'sa_...' value from the prior result's 'Subagent reference: ...' line."}},"required":["task"]}`)
 }
 
 func (t *subagentSkillTool) Execute(ctx context.Context, args json.RawMessage) (string, error) {
 	var p struct {
-		Task string `json:"task"`
+		Task     string `json:"task"`
+		Continue string `json:"continue_from"`
+		Fork     string `json:"fork_from"`
 	}
 	if err := json.Unmarshal(args, &p); err != nil {
 		return "", fmt.Errorf("invalid args: %w", err)
@@ -224,7 +335,11 @@ func (t *subagentSkillTool) Execute(ctx context.Context, args json.RawMessage) (
 	if t.runner == nil {
 		return "", fmt.Errorf("%s: no subagent runner is configured in this session", t.toolName)
 	}
-	return t.runner(ctx, sk, task)
+	opts := SubagentRunOptions{ContinueFrom: strings.TrimSpace(p.Continue), ForkFrom: strings.TrimSpace(p.Fork)}
+	if opts.ContinueFrom != "" && opts.ForkFrom != "" {
+		return "", fmt.Errorf("%s: continue_from and fork_from are mutually exclusive; pass only continue_from", t.toolName)
+	}
+	return t.runner(ctx, sk, task, opts)
 }
 
 func (t *subagentSkillTool) ResolveProfile(json.RawMessage) *event.Profile {
@@ -303,9 +418,9 @@ func (*installSkillTool) Name() string   { return "install_skill" }
 func (*installSkillTool) ReadOnly() bool { return false }
 
 func (t *installSkillTool) Description() string {
-	scope := "'global' (only option — no project workspace) writes to ~/.reasonix/skills/."
+	scope := "'global' (only option — no project workspace) writes to the Reasonix home skills directory."
 	if t.store.HasProjectScope() {
-		scope = "'project' (default) writes to <repo>/.reasonix/skills/ (this workspace only); 'global' writes to ~/.reasonix/skills/ (every project)."
+		scope = "'project' (default) writes to <repo>/.reasonix/skills/ (this workspace only); 'global' writes to the Reasonix home skills directory (every project)."
 	}
 	return "Author and save a new skill — a reusable playbook future turns invoke via run_skill (or /<name>). Runnable immediately this turn; appears in the pinned Skills index on the next launch. " + scope
 }
@@ -314,7 +429,7 @@ func (*installSkillTool) Schema() json.RawMessage {
 	return json.RawMessage(`{
 "type":"object",
 "properties":{
-  "name":{"type":"string","description":"Identifier — letters/digits/_/-/., 1-64 chars, starts alphanumeric. Becomes the skill folder name under ~/.reasonix/skills/<name>/SKILL.md."},
+  "name":{"type":"string","description":"Identifier — letters/digits/_/-/., 1-64 chars, starts alphanumeric. Becomes the skill folder name under the selected skills directory."},
   "description":{"type":"string","description":"≤120-char one-liner shown in the pinned Skills index — future agents read it to decide whether to invoke."},
   "body":{"type":"string","description":"Markdown playbook. For subagent skills, write the subagent's persona/rules — it gets no context besides 'arguments' at runtime."},
   "scope":{"type":"string","enum":["project","global"],"description":"Where to write. Defaults to project when a workspace exists, else global."},

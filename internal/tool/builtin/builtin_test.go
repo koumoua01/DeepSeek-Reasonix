@@ -42,7 +42,7 @@ func runTool(t *testing.T, tl tool.Tool, m map[string]any) string {
 }
 
 func TestBuiltinsRegistered(t *testing.T) {
-	want := []string{"bash", "edit_file", "glob", "grep", "ls", "multi_edit", "read_file", "web_fetch", "write_file"}
+	want := []string{"bash", "code_index", "edit_file", "glob", "grep", "ls", "move_file", "multi_edit", "read_file", "web_fetch", "write_file"}
 	for _, name := range want {
 		if _, ok := tool.LookupBuiltin(name); !ok {
 			t.Errorf("built-in %q not registered", name)
@@ -57,8 +57,8 @@ func TestBuiltinsRegistered(t *testing.T) {
 // many invocations are pure reads — args aren't introspected.
 func TestBuiltinReadOnlyClassification(t *testing.T) {
 	readOnly := map[string]bool{
-		"read_file": true, "ls": true, "glob": true, "grep": true, "web_fetch": true,
-		"write_file": false, "edit_file": false, "multi_edit": false, "bash": false,
+		"read_file": true, "ls": true, "glob": true, "grep": true, "code_index": true, "web_fetch": true,
+		"write_file": false, "edit_file": false, "multi_edit": false, "move_file": false, "bash": false,
 	}
 	for name, want := range readOnly {
 		tl, ok := tool.LookupBuiltin(name)
@@ -192,6 +192,8 @@ func TestEditFile(t *testing.T) {
 	args := argsJSON(t, map[string]any{"path": f, "old_string": "x", "new_string": "y"})
 	if _, err := (editFile{}).Execute(context.Background(), args); err == nil {
 		t.Fatal("expected not-unique error")
+	} else if !strings.Contains(err.Error(), "repeated separator lines") {
+		t.Fatalf("not-unique error should steer away from weak anchors, got: %v", err)
 	}
 	if b, _ := os.ReadFile(f); string(b) != "x x x" {
 		t.Fatalf("file modified despite error: %q", b)

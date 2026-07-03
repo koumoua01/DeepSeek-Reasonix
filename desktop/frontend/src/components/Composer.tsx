@@ -1,12 +1,18 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent, ReactNode } from "react";
-import { AlertTriangle, ArrowUp, Check, ChevronDown, Eye, FileText, Folder, FolderGit2, FolderPlus, List, MessageSquare, Search, Square, Trash2, X, Zap } from "lucide-react";
+import type { CSSProperties, ClipboardEvent, DragEvent, KeyboardEvent, PointerEvent as ReactPointerEvent } from "react";
+import { ArrowUp, Check, ChevronDown, ChevronUp, ChevronsUpDown, CornerDownRight, Eye, FileText, Folder, Gauge, List, MessageSquare, Search, Shield, ShieldAlert, ShieldCheck, SlidersHorizontal, Square, Target, Trash2, X } from "lucide-react";
 import { asArray } from "../lib/array";
+import { filterAtMatches } from "../lib/atMatches";
 import { DedupIndex, sha256 } from "../lib/attachDedup";
 import { app, onFilesDropped } from "../lib/bridge";
+import { canUsePromptHistory, isFnKeyEvent, promptHistoryDirectionFromEvent } from "../lib/composerKeyboard";
+import { cacheGeneration, loadOlder } from "../lib/composerHistory";
 import { SPINNER_WORDS, useI18n } from "../lib/i18n";
+import { detectShortcutPlatform, matchesShortcut } from "../lib/keyboardShortcuts";
 import { clearLayoutSize, loadOptionalLayoutSize, saveLayoutSize } from "../lib/layoutPreferences";
-import type { CommandInfo, ComposerInsertRequest, DirEntry, EffortInfo, HistoryMessage, Mode, SessionMeta, SessionReference, SlashArgItem, SlashArgsResult, WorkspaceView } from "../lib/types";
+import { createRafResizeUpdater } from "../lib/resizeDrag";
+import { useToast } from "../lib/toast";
+import { type CollaborationMode, type CommandInfo, type ComposerInsertRequest, type DirEntry, type EffortInfo, type HistoryMessage, type Mode, type PromptHistoryEntry, type SessionMeta, type SessionReference, type SlashArgItem, type SlashArgsResult, type TokenMode, type ToolApprovalMode } from "../lib/types";
 import {
   formatWorkspaceReference,
   parseWorkspaceReference,
@@ -15,15 +21,18 @@ import {
 } from "../lib/workspaceDrag";
 import { SlashMenu } from "./SlashMenu";
 import { ArgMenu } from "./ArgMenu";
-import { VirtualMenu } from "./VirtualMenu";
+import { ANCHORED_POPOVER_CLOSE_MS, AnchoredPopover } from "./AnchoredPopover";
 import { EffortSwitcher } from "./EffortSwitcher";
 import { ModelSwitcher } from "./ModelSwitcher";
 import { Tooltip } from "./Tooltip";
-import { AnchoredPopover } from "./AnchoredPopover";
+import { ComposerContextCard } from "./ComposerContextCard";
+import { VirtualMenu } from "./VirtualMenu";
+import { dirEntryMenuLabel, dirEntrySubmitPath } from "./FileReferenceMenu";
 
 interface Attachment {
   path: string;
   previewUrl?: string;
+  displayName?: string;
 }
 
 interface AttachmentDedupKey {
@@ -31,17 +40,19 @@ interface AttachmentDedupKey {
   source: string;
 }
 
-interface WorkspaceReference {
+export interface WorkspaceReference {
   path: string;
   isDir?: boolean;
+  displayPath?: string;
 }
 
 const LONG_PASTE_MIN_CHARS = 2000;
 const LONG_PASTE_MIN_LINES = 20;
-const COMPOSER_MIN_HEIGHT = 86;
+const COMPOSER_MIN_HEIGHT = 104;
 const COMPOSER_MAX_HEIGHT = 360;
 const COMPOSER_MAX_VIEWPORT_RATIO = 0.4;
 const COMPOSER_AUTO_RESERVED_HEIGHT = 58;
+const PROMPT_HISTORY_PREFETCH_REMAINING = 3;
 // Grace after compositionend to swallow a confirm-Enter that lands just after
 // it; the real gap is a few ms, so keep it short or a deliberate quick second
 // Enter (submit) gets eaten too.
@@ -52,9 +63,30 @@ type PastedBlock = {
   text: string;
 };
 
+type PendingGuidance = {
+  id: number;
+  text: string;
+  submitText: string;
+};
+
+type ComposerDraft = {
+  text: string;
+  attachments: Attachment[];
+  workspaceRefs: WorkspaceReference[];
+  pastedBlocks: PastedBlock[];
+  openPastedLabels: string[];
+  sessionRefs: SessionReference[];
+  attachmentDedupKeys: Record<string, AttachmentDedupKey>;
+  nextPasteId: number;
+  historyIndex: number;
+  savedText: string;
+};
+
 type WebkitFileEntry = {
   isDirectory?: boolean;
 };
+
+const DEFAULT_COMPOSER_DRAFT_KEY = "__default_composer_draft__";
 
 function lineCount(s: string): number {
   if (s === "") return 0;
@@ -70,12 +102,145 @@ function renderPastedBlock(block: PastedBlock): string {
 }
 
 function baseName(path: string): string {
-  const clean = path.replace(/\/$/, "");
-  return clean.split("/").filter(Boolean).pop() ?? path;
+  const clean = path.replace(/[\\/]+$/, "");
+  return clean.split(/[\\/]/).filter(Boolean).pop() ?? path;
+}
+
+function attachmentName(attachment: Attachment): string {
+  return (attachment.displayName || baseName(attachment.path) || "attachment").trim();
+}
+
+function attachmentExt(name: string): string {
+  const dot = name.lastIndexOf(".");
+  return dot >= 0 ? name.slice(dot + 1).toUpperCase() : "";
+}
+
+function hasImageAttachments(items: Attachment[]): boolean {
+  return items.some((attachment) => Boolean(attachment.previewUrl));
+}
+
+function displayRefName(name: string): string {
+  return name.replace(/[\[\]\(\)\r\n]+/g, " ").replace(/\s+/g, " ").trim() || "attachment";
+}
+
+function formatAttachmentDisplayReference(attachment: Attachment): string {
+  return `@[${displayRefName(attachmentName(attachment))}](${attachment.path})`;
+}
+
+function sortComposerAttachments(items: Attachment[]): Attachment[] {
+  return [...items].sort((a, b) => {
+    const ai = a.previewUrl ? 0 : 1;
+    const bi = b.previewUrl ? 0 : 1;
+    return ai - bi;
+  });
 }
 
 function workspaceReferenceKey(ref: WorkspaceReference): string {
   return `${ref.isDir ? "dir" : "file"}:${ref.path}`;
+}
+
+export function composerPickFileEntry(
+  text: string,
+  atRaw: string | null,
+  atDir: string,
+  entry: DirEntry,
+): { text: string; workspaceRef?: WorkspaceReference } {
+  const atPos = text.length - (atRaw?.length ?? 0) - 1; // index of '@'
+  const prefix = text.slice(0, Math.max(0, atPos));
+  const refPath = dirEntrySubmitPath(entry, atDir);
+  if (entry.path || entry.displayPath) {
+    return { text: prefix, workspaceRef: { path: refPath, isDir: entry.isDir, displayPath: entry.displayPath } };
+  }
+  return { text: prefix + "@" + refPath + (entry.isDir ? "/" : " ") };
+}
+
+function emptyComposerDraft(): ComposerDraft {
+  return {
+    text: "",
+    attachments: [],
+    workspaceRefs: [],
+    pastedBlocks: [],
+    openPastedLabels: [],
+    sessionRefs: [],
+    attachmentDedupKeys: {},
+    nextPasteId: 1,
+    historyIndex: -1,
+    savedText: "",
+  };
+}
+
+function guidanceTextMatches(queued: string, consumed: string): boolean {
+  const left = queued.trim();
+  const right = consumed.trim();
+  if (!left || !right) return false;
+  return left === right || left.includes(right) || right.includes(left);
+}
+
+function cloneComposerDraft(draft: ComposerDraft): ComposerDraft {
+  return {
+    text: draft.text,
+    attachments: [...draft.attachments],
+    workspaceRefs: [...draft.workspaceRefs],
+    pastedBlocks: [...draft.pastedBlocks],
+    openPastedLabels: [...draft.openPastedLabels],
+    sessionRefs: [...draft.sessionRefs],
+    attachmentDedupKeys: { ...draft.attachmentDedupKeys },
+    nextPasteId: draft.nextPasteId,
+    historyIndex: draft.historyIndex,
+    savedText: draft.savedText,
+  };
+}
+
+function attachmentDedupFromKeys(keys: Record<string, AttachmentDedupKey>): DedupIndex {
+  const index = new DedupIndex();
+  for (const key of Object.values(keys)) {
+    index.add(key.hash, key.source);
+  }
+  return index;
+}
+
+function draftHasAttachmentDedupKey(draft: ComposerDraft, key: AttachmentDedupKey): boolean {
+  return Object.values(draft.attachmentDedupKeys).some((existing) => existing.hash === key.hash && existing.source === key.source);
+}
+
+function fileKey(file: File): string {
+  return `${file.name}:${file.type}:${file.size}:${file.lastModified}`;
+}
+
+function clipboardFiles(data: DataTransfer): File[] {
+  const files = Array.from(data.files);
+  const seen = new Set(files.map(fileKey));
+  for (const item of Array.from(data.items)) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (!file) continue;
+    const key = fileKey(file);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    files.push(file);
+  }
+  return files;
+}
+
+function clipboardHasImageHint(data: DataTransfer): boolean {
+  const imageType = (value: string) => {
+    const type = value.toLowerCase();
+    return type.startsWith("image/") || type.includes("png") || type.includes("jpeg") || type.includes("jpg") || type.includes("tiff");
+  };
+  return Array.from(data.items).some((item) => imageType(item.type)) || Array.from(data.types).some(imageType);
+}
+
+function isPasteShortcut(e: KeyboardEvent<HTMLTextAreaElement>): boolean {
+  return e.key.toLowerCase() === "v" && (e.metaKey || e.ctrlKey) && !e.altKey;
+}
+
+async function dataURLHash(dataUrl: string): Promise<string> {
+  try {
+    const res = await fetch(dataUrl);
+    return sha256(await res.blob());
+  } catch {
+    return "";
+  }
 }
 
 function composerMaxHeight(): number {
@@ -248,46 +413,68 @@ async function buildSessionContext(refs: SessionReference[]): Promise<string> {
 
 export function Composer({
   running,
-  mode,
+  collaborationMode,
+  toolApprovalMode,
+  tokenMode,
+  goal,
   cwd,
   modelLabel,
+  imageInputEnabled = true,
   tabId,
   effort,
   onSend,
   onCancel,
   onCycleMode,
   onSetMode,
+  onSetCollaborationMode,
+  onSetToolApprovalMode,
+  onToggleYoloApprovalMode,
+  onClearGoal,
   onSwitchModel,
   onSetEffort,
-  onPickFolder,
-  onRemoveWorkspace,
+  onSetTokenMode,
   insertRequest,
   disabled,
+  submitDisabled = false,
+  readOnly = false,
   decisionPending = false,
   ready,
   turnStartAt,
   turnTokens,
   retry,
-  workspaceRefreshSignal,
+  transientDismissSignal,
+  sessionKey,
+  guidanceConsumedKey,
+  guidanceConsumedText,
+  guidanceQueuePreviewItems,
 }: {
   running: boolean;
-  mode: Mode;
+  collaborationMode: CollaborationMode;
+  toolApprovalMode: ToolApprovalMode;
+  tokenMode: TokenMode;
+  goal?: string;
   cwd?: string;
   modelLabel: string;
+  imageInputEnabled?: boolean;
   tabId?: string;
   effort?: EffortInfo;
-  onSend: (displayText: string, submitText?: string) => void;
+  onSend: (displayText: string, submitText?: string) => void | Promise<void>;
   // Returns the un-sent text when cancelling before the server replied (so it can
   // be restored to the input); undefined for a normal cancel.
   onCancel: () => string | undefined;
   onCycleMode: () => void;
   onSetMode: (mode: Mode) => void;
+  onSetCollaborationMode: (mode: CollaborationMode) => void;
+  onSetToolApprovalMode: (mode: ToolApprovalMode) => void;
+  onToggleYoloApprovalMode: () => void;
+  onClearGoal: () => void;
   onSwitchModel: (name: string) => void;
   onSetEffort: (level: string) => void;
-  onPickFolder: (path?: string) => Promise<string>;
-  onRemoveWorkspace: (path: string) => Promise<void>;
+  onSetTokenMode: (mode: TokenMode) => void;
   insertRequest?: ComposerInsertRequest | null;
   disabled?: boolean;
+  submitDisabled?: boolean;
+  readOnly?: boolean;
   decisionPending?: boolean;
   // ready/cwd/running re-trigger the command fetch: Commands() returns only
   // built-ins until boot.Build finishes (the controller, hence skills/custom/MCP,
@@ -297,9 +484,15 @@ export function Composer({
   turnStartAt?: number;
   turnTokens?: number;
   retry?: { attempt: number; max: number };
-  workspaceRefreshSignal?: number;
+  transientDismissSignal?: number;
+  sessionKey?: string;
+  guidanceConsumedKey?: string;
+  guidanceConsumedText?: string;
+  guidanceQueuePreviewItems?: readonly string[];
 }) {
   const { t, locale } = useI18n();
+  const { showToast } = useToast();
+  const shortcutPlatform = useMemo(() => detectShortcutPlatform(), []);
   const now = useTick(running);
   const [text, setText] = useState("");
   const [attachments, setAttachments] = useState<Attachment[]>([]);
@@ -312,50 +505,166 @@ export function Composer({
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState(false);
   const [dragOver, setDragOver] = useState(false);
-  const [workspaceMenuOpen, setWorkspaceMenuOpen] = useState(false);
-  const [workspaceQuery, setWorkspaceQuery] = useState("");
-  const [workspaces, setWorkspaces] = useState<WorkspaceView[]>([]);
-  // Two-click delete: the first click on the trash icon moves the row into a
-  // "Confirm?" state and shows a real label ("Delete?") on the icon; the
-  // second click (within ~3s) actually fires the removal. A click anywhere
-  // else, Escape, or a workspace switch resets the row. We keep the existing
-  // server-side RemoveWorkspace as the actual delete so the projects file
-  // stays the single source of truth — this is purely a confirmation gate.
-  const [confirmRemovePath, setConfirmRemovePath] = useState<string | null>(null);
   const [composerHeight, setComposerHeight] = useState<number | null>(loadComposerHeight);
   const [composerResizing, setComposerResizing] = useState(false);
   const [textareaAutoHeight, setTextareaAutoHeight] = useState<number | null>(null);
   const [textareaAutoOverflow, setTextareaAutoOverflow] = useState(false);
+  const [intentMenuOpen, setIntentMenuOpen] = useState(false);
+  const [intentMenuClosing, setIntentMenuClosing] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [moreMenuClosing, setMoreMenuClosing] = useState(false);
   const [showPastChats, setShowPastChats] = useState(false);
   const [pastChats, setPastChats] = useState<SessionMeta[]>([]);
   const [pastChatQuery, setPastChatQuery] = useState("");
   const [sessionRefs, setSessionRefs] = useState<SessionReference[]>([]);
+  const [pendingGuidance, setPendingGuidance] = useState<PendingGuidance[]>([]);
+  const [guidanceExpanded, setGuidanceExpanded] = useState(false);
+  const [guidanceSendingId, setGuidanceSendingId] = useState<number | null>(null);
+  const nextGuidanceId = useRef(1);
   const [loadingPastChats, setLoadingPastChats] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [composerPrompt, setComposerPrompt] = useState<string | null>(null);
+  // Prompt history navigation (plain ↑/↓)
+  // Use refs for values read inside async closures to avoid stale captures
+  // on rapid key presses (the React closure trap).
+  const historyIndexRef = useRef(-1);
+  const historyEntriesRef = useRef<PromptHistoryEntry[]>([]);
+  const historyLoadRef = useRef<Promise<void> | null>(null);
+  const historyGenerationRef = useRef(cacheGeneration());
+  // historyIndex state is written (via setHistoryIndex) for potential future
+  // UI feedback (e.g. "3/200" indicator); currently unused in render.
+  const [, setHistoryIndex] = useState(-1);
+  const savedTextRef = useRef("");
   const taRef = useRef<HTMLTextAreaElement>(null);
   const composerCardRef = useRef<HTMLDivElement>(null);
-  const workspaceAnchorRef = useRef<HTMLDivElement>(null);
+  const intentMenuAnchorRef = useRef<HTMLButtonElement>(null);
+  const moreMenuAnchorRef = useRef<HTMLButtonElement>(null);
+  const intentCloseTimerRef = useRef<number | null>(null);
+  const moreCloseTimerRef = useRef<number | null>(null);
   const wasRunning = useRef(running);
   const composingRef = useRef(false);
   const lastCompositionEndAt = useRef(0);
   const lastSelectionRef = useRef({ start: 0, end: 0 });
   const consumedInsertIdRef = useRef(0);
+  const lastTransientDismissSignal = useRef(transientDismissSignal);
+  const lastGuidanceConsumedKey = useRef(guidanceConsumedKey);
+  const selfDispatchedGuidanceRef = useRef<string[]>([]);
   const submittingRef = useRef(false);
+  const nativeClipboardPasteTimerRef = useRef<number | null>(null);
   // Snapshot of the current cwd so async callbacks (openPastChats) can detect
   // workspace switches and discard stale responses (issue #3601).
   const cwdRef = useRef(cwd);
   cwdRef.current = cwd;
   const attachmentDedupRef = useRef(new DedupIndex());
   const attachmentDedupKeysRef = useRef<Record<string, AttachmentDedupKey>>({});
+  const draftKey = sessionKey || tabId || DEFAULT_COMPOSER_DRAFT_KEY;
+  const guidanceQueuePreviewKey = (guidanceQueuePreviewItems ?? []).map((item) => item.trim()).filter(Boolean).join("\n");
+  const draftsBySessionRef = useRef<Record<string, ComposerDraft>>({});
+  const activeDraftKeyRef = useRef(draftKey);
+  const textRef = useRef(text);
+  const attachmentsRef = useRef(attachments);
+  const workspaceRefsRef = useRef(workspaceRefs);
+  const openPastedLabelsRef = useRef(openPastedLabels);
+  const sessionRefsRef = useRef(sessionRefs);
+  textRef.current = text;
+  attachmentsRef.current = attachments;
+  workspaceRefsRef.current = workspaceRefs;
+  pastedBlocksRef.current = pastedBlocks;
+  openPastedLabelsRef.current = openPastedLabels;
+  sessionRefsRef.current = sessionRefs;
+
+  const snapshotComposerDraft = (): ComposerDraft => ({
+    text: textRef.current,
+    attachments: [...attachmentsRef.current],
+    workspaceRefs: [...workspaceRefsRef.current],
+    pastedBlocks: [...pastedBlocksRef.current],
+    openPastedLabels: [...openPastedLabelsRef.current],
+    sessionRefs: [...sessionRefsRef.current],
+    attachmentDedupKeys: { ...attachmentDedupKeysRef.current },
+    nextPasteId: nextPasteId.current,
+    historyIndex: historyIndexRef.current,
+    savedText: savedTextRef.current,
+  });
+
+  const restoreComposerDraft = (draft: ComposerDraft) => {
+    const next = cloneComposerDraft(draft);
+    setText(next.text);
+    setAttachments(next.attachments);
+    setWorkspaceRefs(next.workspaceRefs);
+    pastedBlocksRef.current = next.pastedBlocks;
+    setPastedBlocks(next.pastedBlocks);
+    setOpenPastedLabels(next.openPastedLabels);
+    setSessionRefs(next.sessionRefs);
+    attachmentDedupKeysRef.current = next.attachmentDedupKeys;
+    attachmentDedupRef.current = attachmentDedupFromKeys(next.attachmentDedupKeys);
+    nextPasteId.current = next.nextPasteId;
+    historyIndexRef.current = next.historyIndex;
+    savedTextRef.current = next.savedText;
+    setHistoryIndex(next.historyIndex);
+    lastSelectionRef.current = { start: next.text.length, end: next.text.length };
+    setComposerPrompt(null);
+    setShowPastChats(false);
+    setPastChatQuery("");
+    setActive(0);
+    setIntentMenuOpen(false);
+    setIntentMenuClosing(false);
+    setMoreMenuOpen(false);
+    setMoreMenuClosing(false);
+  };
+
+  useLayoutEffect(() => {
+    const previousKey = activeDraftKeyRef.current;
+    if (previousKey === draftKey) return;
+    draftsBySessionRef.current[previousKey] = snapshotComposerDraft();
+    activeDraftKeyRef.current = draftKey;
+    restoreComposerDraft(draftsBySessionRef.current[draftKey] ?? emptyComposerDraft());
+  }, [draftKey]);
 
   useEffect(() => {
-    if (wasRunning.current && !running && text.trim() === "") {
-      pastedBlocksRef.current = [];
-      setPastedBlocks([]);
-      setOpenPastedLabels([]);
+    return () => {
+      draftsBySessionRef.current[activeDraftKeyRef.current] = snapshotComposerDraft();
+    };
+  }, []);
+
+  const clearNativeClipboardPasteTimer = () => {
+    if (nativeClipboardPasteTimerRef.current === null) return;
+    window.clearTimeout(nativeClipboardPasteTimerRef.current);
+    nativeClipboardPasteTimerRef.current = null;
+  };
+
+  useEffect(() => () => clearNativeClipboardPasteTimer(), []);
+
+  useEffect(() => {
+    if (wasRunning.current && !running) {
+      setPendingGuidance([]);
+      setGuidanceExpanded(false);
+      if (text.trim() === "") {
+        pastedBlocksRef.current = [];
+        setPastedBlocks([]);
+        setOpenPastedLabels([]);
+      }
     }
     wasRunning.current = running;
   }, [running, text]);
+
+  useEffect(() => {
+    setPendingGuidance([]);
+    setGuidanceExpanded(false);
+  }, [draftKey]);
+
+  useEffect(() => {
+    if (!running || !guidanceQueuePreviewKey) return;
+    setGuidanceExpanded(false);
+    setPendingGuidance(
+      guidanceQueuePreviewKey
+        .split("\n")
+        .map((text) => ({ id: nextGuidanceId.current++, text, submitText: text })),
+    );
+  }, [guidanceQueuePreviewKey, running]);
+
+  useEffect(() => {
+    if (guidanceExpanded && pendingGuidance.length <= 2) setGuidanceExpanded(false);
+  }, [guidanceExpanded, pendingGuidance.length]);
 
   // --- slash commands (whole-input "/token") ---
   const [commands, setCommands] = useState<CommandInfo[]>([]);
@@ -378,7 +687,7 @@ export function Composer({
   // by 120ms so rapid typing doesn't flood the backend with IPC calls — the
   // menu only updates after the user pauses.
   const [argRes, setArgRes] = useState<SlashArgsResult | null>(null);
-  const debounceRef = useRef<ReturnType<typeof setTimeout>>();
+  const debounceRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   useEffect(() => {
     if (!text.startsWith("/") || !/\s/.test(text)) {
       setArgRes(null);
@@ -504,13 +813,7 @@ export function Composer({
   const atMatches = useMemo(
     () => {
       if (atRaw === null) return [];
-      const local = entries.filter((e) => e.name.toLowerCase().includes(atFrag));
-      const seen = new Set(local.map((e) => e.name));
-      const searched = searchEntries.filter((e) => {
-        const basename = e.name.split("/").pop()?.toLowerCase() ?? "";
-        return basename.includes(atFrag) && !seen.has(e.name);
-      });
-      return [...local, ...searched];
+      return filterAtMatches(entries, searchEntries, atFrag);
     },
     [atRaw, atFrag, entries, searchEntries],
   );
@@ -557,6 +860,34 @@ export function Composer({
     setDismissed(false);
   }, [slashQuery, atRaw]);
 
+  useEffect(() => {
+    if (transientDismissSignal === undefined || transientDismissSignal === lastTransientDismissSignal.current) return;
+    lastTransientDismissSignal.current = transientDismissSignal;
+    setDismissed(true);
+  }, [transientDismissSignal]);
+
+  const takeSelfDispatchedGuidance = useCallback((text: string): boolean => {
+    const idx = selfDispatchedGuidanceRef.current.findIndex((queued) => guidanceTextMatches(queued, text));
+    if (idx < 0) return false;
+    selfDispatchedGuidanceRef.current.splice(idx, 1);
+    return true;
+  }, []);
+
+  useEffect(() => {
+    if (!guidanceConsumedKey || guidanceConsumedKey === lastGuidanceConsumedKey.current) return;
+    lastGuidanceConsumedKey.current = guidanceConsumedKey;
+    const consumed = (guidanceConsumedText ?? "").trim();
+    if (consumed && takeSelfDispatchedGuidance(consumed)) return;
+    setPendingGuidance((items) => {
+      if (items.length === 0) return items;
+      const idx = consumed
+        ? items.findIndex((item) => guidanceTextMatches(item.submitText, consumed) || guidanceTextMatches(item.text, consumed))
+        : -1;
+      const removeAt = idx >= 0 ? idx : 0;
+      return items.filter((_, index) => index !== removeAt);
+    });
+  }, [guidanceConsumedKey, guidanceConsumedText, takeSelfDispatchedGuidance]);
+
   // When the @ trigger disappears (user deleted the @), close the past:chats
   // sub-menu and reset related state. Without this, showPastChats can outlive
   // the @ token and leave the session list visible with no way to dismiss it.
@@ -567,6 +898,46 @@ export function Composer({
       setActive(0);
     }
   }, [menuMode]);
+
+  const resetPromptHistoryNavigation = () => {
+    if (historyIndexRef.current === -1) return;
+    historyIndexRef.current = -1;
+    setHistoryIndex(-1);
+  };
+
+  const syncPromptHistoryGeneration = () => {
+    const nextGeneration = cacheGeneration();
+    if (historyGenerationRef.current === nextGeneration) return;
+    historyGenerationRef.current = nextGeneration;
+    historyEntriesRef.current = [];
+    historyLoadRef.current = null;
+    historyIndexRef.current = -1;
+    setHistoryIndex(-1);
+  };
+
+  const ensurePromptHistoryIndex = async (index: number): Promise<boolean> => {
+    if (index < historyEntriesRef.current.length) return true;
+    if (historyLoadRef.current) await historyLoadRef.current;
+    while (index >= historyEntriesRef.current.length) {
+      let loaded = 0;
+      const task = loadOlder().then((entries) => {
+        loaded = entries.length;
+        if (loaded > 0) {
+          historyEntriesRef.current = historyEntriesRef.current.concat(entries);
+        }
+      });
+      historyLoadRef.current = task;
+      await task;
+      historyLoadRef.current = null;
+      if (loaded === 0) return index < historyEntriesRef.current.length;
+    }
+    return true;
+  };
+
+  const prefetchPromptHistoryTail = () => {
+    if (historyLoadRef.current) return;
+    void ensurePromptHistoryIndex(historyEntriesRef.current.length);
+  };
 
   const setTextCaretEnd = (next: string) => {
     setText(next);
@@ -607,11 +978,23 @@ export function Composer({
     });
   };
 
+  const replaceComposerText = (next: string) => {
+    clearAttachments();
+    setWorkspaceRefs([]);
+    setSessionRefs([]);
+    pastedBlocksRef.current = [];
+    setPastedBlocks([]);
+    setOpenPastedLabels([]);
+    setTextCaretEnd(next);
+  };
+
   const addWorkspaceReference = (ref: WorkspaceReference) => {
     setWorkspaceRefs((prev) => {
       const key = workspaceReferenceKey(ref);
       if (prev.some((item) => workspaceReferenceKey(item) === key)) return prev;
-      return [...prev, ref];
+      const next = [...prev, ref];
+      workspaceRefsRef.current = next;
+      return next;
     });
     requestAnimationFrame(() => taRef.current?.focus());
   };
@@ -619,6 +1002,10 @@ export function Composer({
   useEffect(() => {
     if (!insertRequest || insertRequest.id === consumedInsertIdRef.current) return;
     consumedInsertIdRef.current = insertRequest.id;
+    if (insertRequest.mode === "replace") {
+      replaceComposerText(insertRequest.text);
+      return;
+    }
     const ref = parseWorkspaceReference(insertRequest.text);
     if (ref) {
       addWorkspaceReference(ref);
@@ -651,6 +1038,7 @@ export function Composer({
   };
 
   const clearAttachments = () => {
+    attachmentsRef.current = [];
     setAttachments([]);
     attachmentDedupRef.current.clear();
     attachmentDedupKeysRef.current = {};
@@ -658,42 +1046,219 @@ export function Composer({
 
   const removeAttachment = (path: string) => {
     forgetAttachment(path);
-    setAttachments((prev) => prev.filter((x) => x.path !== path));
+    setAttachments(attachmentsRef.current.filter((x) => x.path !== path));
     requestAnimationFrame(() => taRef.current?.focus());
   };
+
+  const attachmentSeenInDraft = (targetDraftKey: string, key: AttachmentDedupKey): boolean => {
+    if (targetDraftKey === activeDraftKeyRef.current) return attachmentDedupRef.current.seen(key.hash, key.source);
+    const draft = draftsBySessionRef.current[targetDraftKey];
+    return draft ? draftHasAttachmentDedupKey(draft, key) : false;
+  };
+
+  const addAttachmentToDraft = (targetDraftKey: string, attachment: Attachment, key: AttachmentDedupKey): boolean => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      if (attachmentDedupRef.current.seen(key.hash, key.source)) return false;
+      rememberAttachment(attachment.path, key);
+      const next = [...attachmentsRef.current, attachment];
+      attachmentsRef.current = next;
+      setAttachments(next);
+      return true;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    if (draftHasAttachmentDedupKey(draft, key)) return false;
+    draft.attachmentDedupKeys[attachment.path] = key;
+    draft.attachments = [...draft.attachments, attachment];
+    draftsBySessionRef.current[targetDraftKey] = draft;
+    return true;
+  };
+
+  const addWorkspaceReferenceToDraft = (targetDraftKey: string, ref: WorkspaceReference) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      addWorkspaceReference(ref);
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    const key = workspaceReferenceKey(ref);
+    if (draft.workspaceRefs.some((item) => workspaceReferenceKey(item) === key)) return;
+    draft.workspaceRefs = [...draft.workspaceRefs, ref];
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const clearSubmittedDraft = (targetDraftKey: string) => {
+    if (targetDraftKey === activeDraftKeyRef.current) {
+      textRef.current = "";
+      setText("");
+      historyIndexRef.current = -1;
+      setHistoryIndex(-1);
+      clearAttachments();
+      workspaceRefsRef.current = [];
+      setWorkspaceRefs([]);
+      sessionRefsRef.current = [];
+      setSessionRefs([]);
+      pastedBlocksRef.current = [];
+      setPastedBlocks([]);
+      openPastedLabelsRef.current = [];
+      setOpenPastedLabels([]);
+      savedTextRef.current = "";
+      return;
+    }
+    const draft = cloneComposerDraft(draftsBySessionRef.current[targetDraftKey] ?? emptyComposerDraft());
+    draft.text = "";
+    draft.attachments = [];
+    draft.workspaceRefs = [];
+    draft.pastedBlocks = [];
+    draft.openPastedLabels = [];
+    draft.sessionRefs = [];
+    draft.attachmentDedupKeys = {};
+    draft.historyIndex = -1;
+    draft.savedText = "";
+    draftsBySessionRef.current[targetDraftKey] = draft;
+  };
+
+  const clearIntentCloseTimer = useCallback(() => {
+    if (intentCloseTimerRef.current === null) return;
+    window.clearTimeout(intentCloseTimerRef.current);
+    intentCloseTimerRef.current = null;
+  }, []);
+
+  const openIntentMenu = useCallback(() => {
+    clearIntentCloseTimer();
+    setIntentMenuClosing(false);
+    setIntentMenuOpen(true);
+  }, [clearIntentCloseTimer]);
+
+  const closeIntentMenu = useCallback((afterClose?: () => void) => {
+    clearIntentCloseTimer();
+    setIntentMenuClosing(true);
+    window.requestAnimationFrame(() => setIntentMenuOpen(false));
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    intentCloseTimerRef.current = window.setTimeout(() => {
+      intentCloseTimerRef.current = null;
+      setIntentMenuClosing(false);
+      afterClose?.();
+    }, reduceMotion ? 0 : ANCHORED_POPOVER_CLOSE_MS);
+  }, [clearIntentCloseTimer]);
+
+  useEffect(() => () => clearIntentCloseTimer(), [clearIntentCloseTimer]);
+
+  const clearMoreCloseTimer = useCallback(() => {
+    if (moreCloseTimerRef.current === null) return;
+    window.clearTimeout(moreCloseTimerRef.current);
+    moreCloseTimerRef.current = null;
+  }, []);
+
+  const openMoreMenu = useCallback(() => {
+    clearMoreCloseTimer();
+    setMoreMenuClosing(false);
+    setMoreMenuOpen(true);
+  }, [clearMoreCloseTimer]);
+
+  const closeMoreMenu = useCallback((afterClose?: () => void) => {
+    clearMoreCloseTimer();
+    setMoreMenuClosing(true);
+    window.requestAnimationFrame(() => setMoreMenuOpen(false));
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    moreCloseTimerRef.current = window.setTimeout(() => {
+      moreCloseTimerRef.current = null;
+      setMoreMenuClosing(false);
+      afterClose?.();
+    }, reduceMotion ? 0 : ANCHORED_POPOVER_CLOSE_MS);
+  }, [clearMoreCloseTimer]);
+
+  useEffect(() => () => clearMoreCloseTimer(), [clearMoreCloseTimer]);
 
   const fileDedupKey = async (file: File): Promise<AttachmentDedupKey> => ({
     hash: await sha256(file),
     source: `file:${file.name}:${file.size}:${file.lastModified}`,
   });
 
+  const planModeOn = collaborationMode === "plan";
+  const activeGoal = (goal ?? "").trim();
+  const goalModeOn = collaborationMode === "goal";
+  const tokenModeOn = tokenMode === "economy";
+  const warnImageInputFallback = useCallback((message = t("composer.imageInputUnsupported")) => {
+    showToast(message, "warn");
+  }, [showToast, t]);
+
   const submit = async () => {
-    if (disabled || submittingRef.current) return;
-    const t = text.trim();
-    if ((!t && attachments.length === 0 && workspaceRefs.length === 0) || pendingPaste > 0) return;
+    if (disabled || (!running && submitDisabled) || readOnly || submittingRef.current) return;
+    const submitDraftKey = activeDraftKeyRef.current;
+    const currentText = textRef.current;
+    const trimmedText = currentText.trim();
+    if (pendingPaste > 0) return;
+    if (!imageInputEnabled && hasImageAttachments(attachmentsRef.current)) {
+      warnImageInputFallback();
+    }
+    const currentAttachments = attachmentsRef.current;
+    const currentWorkspaceRefs = workspaceRefsRef.current;
+    if (!trimmedText && currentAttachments.length === 0 && currentWorkspaceRefs.length === 0) {
+      if (goalModeOn && !activeGoal) {
+        setComposerPrompt(t("composer.goalInputRequired"));
+        requestAnimationFrame(() => taRef.current?.focus());
+      }
+      return;
+    }
+    setComposerPrompt(null);
     submittingRef.current = true;
     setSubmitting(true);
     try {
-    const refs = [
-      ...workspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
-      ...attachments.map((a) => `@${a.path}`),
-    ].join(" ");
-    const displayText = [t, refs].filter(Boolean).join(t && refs ? " " : "");
-    // PR-B: when past:chats refs are attached, prepend their formatted transcript
-    // to submitText only (displayText stays unchanged so the user still sees their
-    // original prompt in the input preview). With no refs we keep the original
-    // submitText verbatim — no header, no rewording, byte-identical to pre-PR-B.
-    const sessionContext = sessionRefs.length === 0 ? "" : await buildSessionContext(sessionRefs);
-    const baseSubmitText = [expandPastedBlocks(t), refs].filter(Boolean).join(t && refs ? " " : "");
-    const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
-    onSend(displayText, submitText);
-    setText("");
-    clearAttachments();
-    setWorkspaceRefs([]);
-    setSessionRefs([]);
+      const orderedAttachments = sortComposerAttachments(currentAttachments);
+      const refs = [
+        ...currentWorkspaceRefs.map((ref) => formatWorkspaceReference(ref.path, ref.isDir)),
+        ...orderedAttachments.map((a) => `@${a.path}`),
+      ].join(" ");
+      const displayRefs = [
+        ...currentWorkspaceRefs.map((ref) => formatWorkspaceReference(ref.displayPath || ref.path, ref.isDir)),
+        ...orderedAttachments.map(formatAttachmentDisplayReference),
+      ].join(" ");
+      const displayText = [trimmedText, displayRefs].filter(Boolean).join(trimmedText && displayRefs ? " " : "");
+      // PR-B: when past:chats refs are attached, prepend their formatted transcript
+      // to submitText only (displayText stays unchanged so the user still sees their
+      // original prompt in the input preview). With no refs we keep the original
+      // submitText verbatim — no header, no rewording, byte-identical to pre-PR-B.
+      const currentSessionRefs = sessionRefsRef.current;
+      const sessionContext = currentSessionRefs.length === 0 ? "" : await buildSessionContext(currentSessionRefs);
+      const baseSubmitText = [expandPastedBlocks(trimmedText), refs].filter(Boolean).join(trimmedText && refs ? " " : "");
+      const submitText = sessionContext ? `${sessionContext}${baseSubmitText}` : baseSubmitText;
+      if (running) {
+        const guidanceText = displayText.trim();
+        const guidanceSubmitText = submitText.trim();
+        if (guidanceText) {
+          const id = nextGuidanceId.current++;
+          setPendingGuidance((items) => [...items, { id, text: guidanceText, submitText: guidanceSubmitText || guidanceText }]);
+        }
+        clearSubmittedDraft(submitDraftKey);
+        return;
+      }
+      await onSend(displayText, submitText);
+      clearSubmittedDraft(submitDraftKey);
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : String(error), "warn");
     } finally {
       submittingRef.current = false;
       setSubmitting(false);
+    }
+  };
+
+  const sendQueuedGuidance = async (item: PendingGuidance) => {
+    if (disabled || readOnly || guidanceSendingId !== null) return;
+    const displayText = item.text.trim();
+    const submitText = item.submitText.trim() || displayText;
+    if (!displayText || !submitText) return;
+    selfDispatchedGuidanceRef.current.push(submitText);
+    setGuidanceSendingId(item.id);
+    try {
+      await onSend(displayText, submitText);
+      setPendingGuidance((items) => items.filter((queued) => queued.id !== item.id));
+      window.setTimeout(() => {
+        takeSelfDispatchedGuidance(submitText);
+      }, 5000);
+    } catch (error) {
+      takeSelfDispatchedGuidance(submitText);
+      showToast(error instanceof Error ? error.message : String(error), "warn");
+    } finally {
+      setGuidanceSendingId((current) => (current === item.id ? null : current));
     }
   };
 
@@ -705,20 +1270,21 @@ export function Composer({
       reader.readAsDataURL(file);
     });
 
-  const attachImageFiles = async (files: File[]) => {
+  const attachImageFiles = async (files: File[], sourceDraftKey: string) => {
     const images = files.filter((f) => f.type.startsWith("image/"));
     if (images.length === 0) return;
     for (const file of images) {
       setPendingPaste((n) => n + 1);
       try {
         const key = await fileDedupKey(file);
-        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
+        if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
         const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedImage(dataUrl);
         const previewUrl = await app.AttachmentDataURL(path);
-        rememberAttachment(path, key);
-        setAttachments((prev) => [...prev, { path, previewUrl }]);
-      } catch {
+        addAttachmentToDraft(sourceDraftKey, { path, previewUrl, displayName: file.name }, key);
+      } catch (error) {
+        console.warn("[composer] failed to attach pasted image", error);
+        showToast(t("composer.attachImageFailed"), "warn");
         // non-fatal: a failed image attach must not block normal text input
       } finally {
         setPendingPaste((n) => Math.max(0, n - 1));
@@ -728,19 +1294,20 @@ export function Composer({
 
   // Non-image pastes (PDFs, docs): the clipboard hands us bytes, not a path, so
   // the kernel stores them and we reference the saved path — attached, not ignored.
-  const attachOtherFiles = async (files: File[]) => {
+  const attachOtherFiles = async (files: File[], sourceDraftKey: string) => {
     const others = files.filter((f) => !f.type.startsWith("image/"));
     if (others.length === 0) return;
     for (const file of others) {
       setPendingPaste((n) => n + 1);
       try {
         const key = await fileDedupKey(file);
-        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
+        if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
         const dataUrl = await readFileAsDataURL(file);
         const path = await app.SavePastedFile(file.name, dataUrl);
-        rememberAttachment(path, key);
-        setAttachments((prev) => [...prev, { path }]);
+        addAttachmentToDraft(sourceDraftKey, { path, displayName: file.name }, key);
       } catch {
+        console.warn("[composer] failed to attach pasted file");
+        showToast(t("composer.attachFileFailed"), "warn");
         // non-fatal: a failed attach must not block normal text input
       } finally {
         setPendingPaste((n) => Math.max(0, n - 1));
@@ -749,28 +1316,46 @@ export function Composer({
   };
 
   const attachFiles = (files: File[]) => {
-    void attachImageFiles(files);
-    void attachOtherFiles(files);
+    const sourceDraftKey = activeDraftKeyRef.current;
+    void attachImageFiles(files, sourceDraftKey);
+    void attachOtherFiles(files, sourceDraftKey);
+  };
+
+  const attachNativeClipboardImage = async (notifyOnError: boolean, sourceDraftKey: string) => {
+    setPendingPaste((n) => n + 1);
+    try {
+      const path = await app.SaveClipboardImage();
+      const previewUrl = await app.AttachmentDataURL(path);
+      const key = { hash: await dataURLHash(previewUrl), source: `native-clipboard:${path}` };
+      if (attachmentSeenInDraft(sourceDraftKey, key)) return;
+      addAttachmentToDraft(sourceDraftKey, { path, previewUrl }, key);
+    } catch (error) {
+      console.warn("[composer] failed to read native clipboard image", error);
+      if (notifyOnError) showToast(t("composer.pasteImageFailed"), "warn");
+    } finally {
+      setPendingPaste((n) => Math.max(0, n - 1));
+    }
   };
 
   // OS file drops arrive as absolute paths through the native bridge (the webview
   // withholds them from the HTML drop event); the kernel resolves each into a
   // workspace @reference or a stored attachment.
-  const attachDroppedPaths = async (paths: string[]) => {
+  const attachDroppedPaths = async (paths: string[], sourceDraftKey = activeDraftKeyRef.current) => {
     setDragOver(false);
     for (const path of paths) {
       setPendingPaste((n) => n + 1);
       try {
         const key = { hash: "", source: `path:${path}` };
-        if (attachmentDedupRef.current.seen(key.hash, key.source)) continue;
+        if (attachmentSeenInDraft(sourceDraftKey, key)) continue;
         const item = await app.AttachDropped(path);
         if (item.kind === "workspace") {
-          addWorkspaceReference({ path: item.path, isDir: item.isDir });
+          addWorkspaceReferenceToDraft(sourceDraftKey, { path: item.path, isDir: item.isDir, displayPath: item.displayPath });
         } else {
-          rememberAttachment(item.path, key);
-          setAttachments((prev) => [...prev, { path: item.path, previewUrl: item.previewUrl }]);
+          addAttachmentToDraft(sourceDraftKey, { path: item.path, previewUrl: item.previewUrl, displayName: baseName(path) }, key);
         }
       } catch {
+        console.warn("[composer] failed to attach dropped file");
+        showToast(t("composer.attachDropFailed"), "warn");
         // non-fatal: a failed drop attach must not block normal text input
       } finally {
         setPendingPaste((n) => Math.max(0, n - 1));
@@ -778,10 +1363,13 @@ export function Composer({
     }
   };
 
-  useEffect(() => onFilesDropped((paths) => void attachDroppedPaths(paths)), []);
+  useEffect(() => {
+    return onFilesDropped((paths) => void attachDroppedPaths(paths, activeDraftKeyRef.current));
+  }, []);
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData.files);
+    clearNativeClipboardPasteTimer();
+    const files = clipboardFiles(e.clipboardData);
     if (files.length > 0) {
       e.preventDefault();
       attachFiles(files);
@@ -789,28 +1377,56 @@ export function Composer({
     }
 
     const pasted = e.clipboardData.getData("text");
-    if (!shouldFoldPaste(pasted)) return;
+    const hasImageHint = clipboardHasImageHint(e.clipboardData);
+    if (hasImageHint || pasted === "") {
+      e.preventDefault();
+      void attachNativeClipboardImage(hasImageHint, activeDraftKeyRef.current);
+      return;
+    }
 
+    // Always prevent the browser default paste so React's controlled-input
+    // reconciliation cannot race with the native DOM update and lose the
+    // pasted content (WebView2 / Windows). We insert the text manually below.
     e.preventDefault();
     const ta = e.currentTarget;
     const start = ta.selectionStart ?? text.length;
     const end = ta.selectionEnd ?? text.length;
-    const id = nextPasteId.current++;
-    const lines = lineCount(pasted);
-    const label = t("composer.pastedLabel", { id, lines });
-    const block: PastedBlock = { label, text: pasted };
-    const next = text.slice(0, start) + label + text.slice(end);
 
-    pastedBlocksRef.current = [...pastedBlocksRef.current, block];
-    setPastedBlocks((prev) => [...prev, block]);
-    setText(next);
-    requestAnimationFrame(() => {
-      const node = taRef.current;
-      if (!node) return;
-      const pos = start + label.length;
-      node.focus();
-      node.selectionStart = node.selectionEnd = pos;
-    });
+    // Normalize CRLF from Windows clipboard so caret offsets match the
+    // textarea's normalized value. The raw text (with CRLF) is preserved
+    // in the PastedBlock for long pastes so block content is lossless.
+    const normalizedPasted = pasted.replace(/\r\n/g, "\n");
+
+    if (shouldFoldPaste(pasted)) {
+      // Long paste: fold into a collapsible block so the composer stays compact.
+      const id = nextPasteId.current++;
+      const lines = lineCount(pasted);
+      const label = t("composer.pastedLabel", { id, lines });
+      const block: PastedBlock = { label, text: pasted }; // keep raw text (CRLF preserved)
+      const next = text.slice(0, start) + label + text.slice(end);
+      pastedBlocksRef.current = [...pastedBlocksRef.current, block];
+      setPastedBlocks((prev) => [...prev, block]);
+      setText(next);
+      requestAnimationFrame(() => {
+        const node = taRef.current;
+        if (!node) return;
+        const pos = start + label.length;
+        node.focus();
+        node.selectionStart = node.selectionEnd = pos;
+      });
+    } else {
+      // Short paste: insert the raw text directly into state.
+      resetPromptHistoryNavigation();
+      const next = text.slice(0, start) + normalizedPasted + text.slice(end);
+      setText(next);
+      requestAnimationFrame(() => {
+        const node = taRef.current;
+        if (!node) return;
+        const pos = start + normalizedPasted.length;
+        node.focus();
+        node.selectionStart = node.selectionEnd = pos;
+      });
+    }
   };
 
   const hasWorkspaceReferenceDrag = (dataTransfer: DataTransfer): boolean =>
@@ -845,7 +1461,9 @@ export function Composer({
   };
 
   const onFileDropCapture = (e: DragEvent<HTMLDivElement>) => {
-    if (hasWorkspaceReferenceDrag(e.dataTransfer) || !hasFileDrag(e.dataTransfer) || !hasPathlessFileDrop(e.dataTransfer)) return;
+    if (hasWorkspaceReferenceDrag(e.dataTransfer) || !hasFileDrag(e.dataTransfer)) return;
+    e.preventDefault();
+    if (!hasPathlessFileDrop(e.dataTransfer)) return;
     const files = Array.from(e.dataTransfer.files);
     if (files.length === 0) return;
     stopNativeFileDrop(e);
@@ -863,8 +1481,11 @@ export function Composer({
     }
 
     // OS file drops deliver no usable bytes/paths here; the native bridge
-    // (onFilesDropped → AttachDropped) handles them. Just clear the hover state.
-    if (hasFileDrag(e.dataTransfer)) setDragOver(false);
+    // (onFilesDropped -> AttachDropped) handles them. Prevent webview navigation.
+    if (hasFileDrag(e.dataTransfer)) {
+      e.preventDefault();
+      setDragOver(false);
+    }
   };
 
   const onDragOver = (e: DragEvent<HTMLDivElement>) => {
@@ -880,12 +1501,14 @@ export function Composer({
   // replied, the just-sent text is handed back so we drop it back into the input.
   const handleCancel = () => {
     const restored = onCancel();
+    if (goalModeOn && activeGoal) onClearGoal();
     if (typeof restored === "string") setTextCaretEnd(restored);
   };
 
   const pickCommand = (c: CommandInfo) => setTextCaretEnd("/" + c.name + " ");
 
   const activePastedBlocks = pastedBlocks.filter((block) => text.includes(block.label));
+  const shellModeActive = text.trimStart().startsWith("!");
 
   const removeWorkspaceReference = (target: WorkspaceReference) => {
     const key = workspaceReferenceKey(target);
@@ -912,54 +1535,6 @@ export function Composer({
     setOpenPastedLabels((prev) => prev.filter((x) => x !== block.label));
     setTextCaretEnd(next);
   };
-
-  const workspaceName = useMemo(() => {
-    if (!cwd) return "";
-    const parts = cwd.split(/[/\\]/).filter(Boolean);
-    return parts.length > 0 ? parts[parts.length - 1] : cwd;
-  }, [cwd]);
-
-  const loadWorkspaces = () => {
-    app.ListWorkspaces().then((next) => setWorkspaces(asArray(next))).catch(() => setWorkspaces([]));
-  };
-
-  useEffect(() => {
-    if (workspaceMenuOpen) loadWorkspaces();
-  }, [workspaceMenuOpen, cwd, workspaceRefreshSignal]);
-
-  const filteredWorkspaces = useMemo(() => {
-    const q = workspaceQuery.trim().toLowerCase();
-    if (!q) return workspaces;
-    return workspaces.filter((w) => `${w.name} ${w.path}`.toLowerCase().includes(q));
-  }, [workspaceQuery, workspaces]);
-
-  const chooseWorkspace = async (path?: string) => {
-    const next = await onPickFolder(path);
-    if (next) {
-      setWorkspaceMenuOpen(false);
-      setWorkspaceQuery("");
-    }
-  };
-
-  const removeWorkspace = async (path: string) => {
-    await onRemoveWorkspace(path);
-    setWorkspaces((prev) => prev.filter((w) => w.path !== path));
-    setConfirmRemovePath(null);
-  };
-
-  // First click on the trash icon arms the confirmation; second click fires.
-  // We reset the armed state after a short idle window so the user doesn't
-  // accidentally delete a workspace they walked past 30s ago.
-  useEffect(() => {
-    if (!confirmRemovePath) return;
-    const id = window.setTimeout(() => setConfirmRemovePath(null), 3000);
-    return () => window.clearTimeout(id);
-  }, [confirmRemovePath]);
-
-  // Escape / menu close / workspace switch all clear the armed delete.
-  useEffect(() => {
-    if (!workspaceMenuOpen) setConfirmRemovePath(null);
-  }, [workspaceMenuOpen]);
 
   useEffect(() => {
     const onResize = () => setComposerHeight((height) => (height === null ? null : clampComposerHeight(height)));
@@ -1001,7 +1576,10 @@ export function Composer({
     };
     window.addEventListener("resize", update);
     const observer = new MutationObserver(update);
-    observer.observe(document.documentElement, { attributes: true, attributeFilter: ["data-text-size"] });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ["data-text-size", "data-font-family", "data-mono-font-family", "style"],
+    });
     return () => {
       if (frame) window.cancelAnimationFrame(frame);
       window.removeEventListener("resize", update);
@@ -1028,18 +1606,29 @@ export function Composer({
     const startHeight = composerHeight ?? card.getBoundingClientRect().height;
     let nextHeight = clampComposerHeight(startHeight);
     let moved = false;
+    card.style.setProperty("--composer-height", `${nextHeight}px`);
+    e.currentTarget.setAttribute("aria-valuenow", String(nextHeight));
+    const liveResize = createRafResizeUpdater({
+      target: card,
+      separator: e.currentTarget,
+      cssVar: "--composer-height",
+    });
     setComposerResizing(true);
     document.body.classList.add("composer-resizing");
 
     const onMove = (event: PointerEvent) => {
       moved = true;
       nextHeight = clampComposerHeight(startHeight + startY - event.clientY);
-      setComposerHeight(nextHeight);
+      liveResize.schedule(nextHeight);
     };
     const onUp = () => {
+      liveResize.flush();
       setComposerResizing(false);
       document.body.classList.remove("composer-resizing");
-      if (moved) saveComposerHeight(nextHeight);
+      if (moved) {
+        setComposerHeight(nextHeight);
+        saveComposerHeight(nextHeight);
+      }
       document.removeEventListener("pointermove", onMove);
       document.removeEventListener("pointerup", onUp);
       document.removeEventListener("pointercancel", onUp);
@@ -1067,10 +1656,14 @@ export function Composer({
   };
 
   const pickEntry = (e: DirEntry) => {
-    const atPos = text.length - (atRaw?.length ?? 0) - 1; // index of '@'
-    const prefix = text.slice(0, atPos);
+    const picked = composerPickFileEntry(text, atRaw, atDir, e);
+    if (picked.workspaceRef) {
+      setTextCaretEnd(picked.text);
+      addWorkspaceReference(picked.workspaceRef);
+      return;
+    }
     // A directory keeps the menu open (trailing "/"); a file completes it (space).
-    setTextCaretEnd(prefix + "@" + atDir + e.name + (e.isDir ? "/" : " "));
+    setTextCaretEnd(picked.text);
   };
 
   // --- past:chats session reference ---
@@ -1211,13 +1804,106 @@ export function Composer({
 
   const onKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     const composing = isImeKeyEvent(e, composingRef.current, lastCompositionEndAt.current);
-    if (e.key === "Enter" && composing) return;
+    const native = e.nativeEvent as globalThis.KeyboardEvent & {
+      keyCode?: number;
+      which?: number;
+      code?: string;
+    };
+    const fnKey = isFnKeyEvent(native);
+    const historyDirection = promptHistoryDirectionFromEvent({
+      key: e.key,
+      code: native.code,
+      keyCode: native.keyCode,
+      which: native.which,
+    });
 
-    // Shift+Tab cycles the input mode (normal → plan → YOLO → normal). Handled
-    // before the menus so it works even while one is open.
+    if (e.key === "Enter" && composing) return;
+    if (fnKey) return;
+
+    if (isPasteShortcut(e) && !composing) {
+      clearNativeClipboardPasteTimer();
+      const sourceDraftKey = activeDraftKeyRef.current;
+      nativeClipboardPasteTimerRef.current = window.setTimeout(() => {
+        nativeClipboardPasteTimerRef.current = null;
+        void attachNativeClipboardImage(false, sourceDraftKey);
+      }, 160);
+    }
+
+    // Shift+Tab toggles plan mode only. Tool access is deliberately changed via
+    // the access menu so keyboard cycling never crosses a permission boundary.
     if (e.key === "Tab" && e.shiftKey && !composing) {
       e.preventDefault();
       onCycleMode();
+      return;
+    }
+
+    if (matchesShortcut(e.nativeEvent, "toolApproval.yolo", shortcutPlatform) && !composing) {
+      e.preventDefault();
+      onToggleYoloApprovalMode();
+      return;
+    }
+
+    syncPromptHistoryGeneration();
+
+    const canUseCurrentPromptHistory = () => canUsePromptHistory({
+      direction: historyDirection,
+      menuOpen: Boolean(menuMode),
+      composing,
+      altKey: e.altKey,
+      ctrlKey: e.ctrlKey,
+      metaKey: e.metaKey,
+      shiftKey: e.shiftKey,
+      fnKey,
+      value: e.currentTarget.value,
+      selectionStart: e.currentTarget.selectionStart,
+      selectionEnd: e.currentTarget.selectionEnd,
+      historyIndex: historyIndexRef.current,
+    });
+
+    // Prompt history navigation: plain ↑/↓ only. Fn/Page/Home/End are left to
+    // the native textarea/OS so macOS dictation and text navigation keep working.
+
+    // When navigating history, any other key (letter, Backspace, etc.) resets
+    // back to the saved draft when another key is used.
+    if (historyIndexRef.current !== -1 && !canUseCurrentPromptHistory()) {
+      historyIndexRef.current = -1;
+      setHistoryIndex(-1);
+    }
+
+    if (canUseCurrentPromptHistory()) {
+      e.preventDefault();
+      void (async () => {
+        // Use refs for all mutable reads inside the async closure so rapid
+        // successive key presses always see the latest values.
+        if (historyIndexRef.current === -1) {
+          savedTextRef.current = text; // save current draft
+        }
+        const target =
+          historyDirection === "up"
+            ? historyIndexRef.current + 1
+            : historyDirection === "down"
+              ? historyIndexRef.current - 1
+              : historyIndexRef.current;
+        if (target >= historyEntriesRef.current.length && !(await ensurePromptHistoryIndex(target))) {
+          return;
+        }
+        const next =
+          historyDirection === "up"
+            ? Math.min(target, historyEntriesRef.current.length - 1)
+            : historyDirection === "down"
+              ? Math.max(target, -1)
+              : historyIndexRef.current;
+        historyIndexRef.current = next;
+        setHistoryIndex(next);
+        if (next === -1) {
+          setTextCaretEnd(savedTextRef.current);
+        } else {
+          setTextCaretEnd(historyEntriesRef.current[next].text);
+          if (historyDirection === "up" && historyEntriesRef.current.length - 1 - next <= PROMPT_HISTORY_PREFETCH_REMAINING) {
+            prefetchPromptHistoryTail();
+          }
+        }
+      })();
       return;
     }
 
@@ -1257,7 +1943,7 @@ export function Composer({
     }
     // Esc interrupts the in-flight turn (matches the Stop button's hint), and
     // restores the text if the server hadn't replied yet.
-    if (e.key === "Escape" && running && !decisionPending) {
+    if (e.key === "Escape" && running) {
       e.preventDefault();
       handleCancel();
     }
@@ -1291,11 +1977,49 @@ export function Composer({
     ? ({ height: `${textareaAutoHeight}px`, overflowY: textareaAutoOverflow ? "auto" : "hidden" } as CSSProperties)
     : undefined;
   const composerAutoExpanded = composerHeight === null && textareaAutoHeight !== null && textareaAutoHeight > 40;
-  const modeOptions: Array<{ id: Mode; label: string; icon: ReactNode }> = [
-    { id: "normal", label: "auto", icon: <Zap size={13} /> },
-    { id: "plan", label: "plan", icon: <List size={13} /> },
-    { id: "yolo", label: "yolo", icon: <AlertTriangle size={13} /> },
-  ];
+  const composerResizeValue = composerHeight ?? clampComposerHeight((textareaAutoHeight ?? 0) + COMPOSER_AUTO_RESERVED_HEIGHT);
+  void onSetMode;
+  const chooseApprovalMode = (nextMode: ToolApprovalMode) => {
+    onSetToolApprovalMode(nextMode);
+    requestAnimationFrame(() => taRef.current?.focus());
+  };
+  const choosePlanMode = () => {
+    closeIntentMenu(() => {
+      onSetCollaborationMode(planModeOn ? "normal" : "plan");
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
+  const chooseGoalMode = () => {
+    if (goalModeOn) {
+      closeIntentMenu(() => {
+        onClearGoal();
+        requestAnimationFrame(() => taRef.current?.focus());
+      });
+      return;
+    }
+    closeIntentMenu(() => {
+      onSetCollaborationMode("goal");
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
+  const chooseTokenMode = () => {
+    closeIntentMenu(() => {
+      onSetTokenMode(tokenModeOn ? "full" : "economy");
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
+  const effortLevels = asArray(effort?.levels);
+  const currentEffort = effort?.current || "auto";
+  const compactEffortTitle = currentEffort === "auto"
+    ? t("status.effortAutoTitle", { def: effort?.default || "auto" })
+    : `${t("status.effortTitle")}: ${currentEffort}`;
+  const hasEffort = Boolean(effort?.supported && effortLevels.length > 0);
+  const chooseEffortLevel = (level: string) => {
+    closeMoreMenu(() => {
+      if (level !== currentEffort) onSetEffort(level);
+      requestAnimationFrame(() => taRef.current?.focus());
+    });
+  };
   const runActivity = retry
     ? t("status.retrying", { attempt: retry.attempt, max: retry.max })
     : running && turnStartAt
@@ -1307,12 +2031,25 @@ export function Composer({
           return `${word}… ${fmtElapsed(elapsedMs)}${tok}`;
         })()
       : null;
-  const hasWorkspace = Boolean(cwd);
-  const hasEffort = Boolean(effort?.supported);
+  const submitEmpty = !text.trim() && attachments.length === 0 && workspaceRefs.length === 0;
+  const submitBlocked = submitting || pendingPaste > 0 || (submitEmpty && !(goalModeOn && !activeGoal)) || disabled || (!running && submitDisabled) || readOnly;
+  const submitTooltip = running ? t("composer.queueGuidance") : t("composer.send");
+  const composerPlaceholder = readOnly
+    ? t("composer.readOnlyChannel")
+    : disabled
+      ? t("common.loading")
+      : running
+        ? t("composer.steerPlaceholder")
+        : goalModeOn && !activeGoal
+          ? t("composer.goalInputPlaceholder")
+          : t("composer.placeholder");
+  const hiddenGuidanceCount = Math.max(0, pendingGuidance.length - 2);
+  const visibleGuidance = guidanceExpanded ? pendingGuidance : pendingGuidance.slice(0, 2);
+  const showGuidanceExpander = pendingGuidance.length > 2;
   const composerMetaClass = [
     "composer-meta",
-    hasWorkspace ? "composer-meta--has-workspace" : "composer-meta--no-workspace",
     hasEffort ? "composer-meta--has-effort" : "composer-meta--no-effort",
+    planModeOn || goalModeOn || tokenModeOn ? "composer-meta--has-intent-chip" : "composer-meta--no-intent-chip",
   ].join(" ");
 
   return (
@@ -1322,75 +2059,95 @@ export function Composer({
       onDropCapture={onFileDropCapture}
     >
       <AnchoredPopover
-        open={workspaceMenuOpen && !!cwd}
-        anchorRef={workspaceAnchorRef}
-        onClose={() => setWorkspaceMenuOpen(false)}
-        className="workspace-switcher workspace-switcher--portal"
+        open={intentMenuOpen}
+        closing={intentMenuClosing}
+        anchorRef={intentMenuAnchorRef}
+        onClose={() => closeIntentMenu()}
+        className="composer-access-menu composer-intent-menu"
+        align="start"
       >
-          <label className="workspace-switcher__search">
-            <Search size={14} />
-            <input
-              autoFocus
-              value={workspaceQuery}
-              onChange={(e) => setWorkspaceQuery(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Escape") setWorkspaceMenuOpen(false);
-              }}
-              placeholder={t("composer.searchProjects")}
-            />
-          </label>
-          <div className="workspace-switcher__list">
-            {filteredWorkspaces.map((w) => (
-              <div className="workspace-switcher__row" key={w.path}>
+        <div className="composer-access-menu__section">
+          <div className="composer-access-menu__label">{t("composer.intentMenuTitle")}</div>
+          <button
+            type="button"
+            className={`composer-access-menu__item composer-intent-menu__item${planModeOn ? " composer-access-menu__item--active" : ""}`}
+            onClick={choosePlanMode}
+            disabled={disabled || running}
+            title={planModeOn ? t("composer.exitPlanTitle") : t("composer.enterPlanTitle")}
+          >
+            <List size={16} />
+            <span className="composer-access-menu__copy">
+              <span className="composer-access-menu__title">{t("composer.modePlan")}</span>
+              <span className="composer-access-menu__desc">{t("composer.planModeDesc")}</span>
+            </span>
+            <span className={`composer-intent-switch${planModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
+              <span />
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`composer-access-menu__item composer-intent-menu__item${goalModeOn ? " composer-access-menu__item--active" : ""}`}
+            onClick={chooseGoalMode}
+            disabled={disabled || running}
+            title={goalModeOn ? activeGoal || t("composer.goalModeActiveDesc") : t("composer.goalModeDesc")}
+          >
+            <Target size={16} />
+            <span className="composer-access-menu__copy">
+              <span className="composer-access-menu__title">{t("composer.modeGoal")}</span>
+              <span className="composer-access-menu__desc">{goalModeOn ? activeGoal || t("composer.goalModeActiveDesc") : t("composer.goalModeDesc")}</span>
+            </span>
+            <span className={`composer-intent-switch${goalModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
+              <span />
+            </span>
+          </button>
+          <button
+            type="button"
+            className={`composer-access-menu__item composer-intent-menu__item${tokenModeOn ? " composer-access-menu__item--active" : ""}`}
+            onClick={chooseTokenMode}
+            disabled={disabled || running}
+            title={tokenModeOn ? t("composer.tokenEconomyOnDesc") : t("composer.tokenEconomyDesc")}
+          >
+            <Gauge size={16} />
+            <span className="composer-access-menu__copy">
+              <span className="composer-access-menu__title">{t("composer.tokenEconomy")}</span>
+              <span className="composer-access-menu__desc">{tokenModeOn ? t("composer.tokenEconomyOnDesc") : t("composer.tokenEconomyDesc")}</span>
+            </span>
+            <span className={`composer-intent-switch${tokenModeOn ? " composer-intent-switch--on" : ""}`} aria-hidden="true">
+              <span />
+            </span>
+          </button>
+        </div>
+      </AnchoredPopover>
+      <AnchoredPopover
+        open={moreMenuOpen && !disabled && !running}
+        closing={moreMenuClosing}
+        anchorRef={moreMenuAnchorRef}
+        onClose={() => closeMoreMenu()}
+        className="composer-access-menu composer-more-menu"
+        align="end"
+      >
+        {hasEffort && (
+          <div className="composer-access-menu__section">
+            <div className="composer-access-menu__label">{t("status.effortTitle")}</div>
+            <div className="composer-more-menu__items" role="listbox" aria-label={t("status.effortTitle")}>
+              {effortLevels.map((level) => (
                 <button
-                  className={`workspace-switcher__item${w.current ? " workspace-switcher__item--current" : ""}`}
-                  title={w.path}
-                  onClick={() => {
-                    if (w.current) {
-                      setWorkspaceMenuOpen(false);
-                      return;
-                    }
-                    void chooseWorkspace(w.path);
-                  }}
-                >
-                  <FolderGit2 size={15} />
-                  <span>{w.name}</span>
-                  {w.current && <Check size={15} />}
-                </button>
-                <button
-                  className={`workspace-switcher__remove${confirmRemovePath === w.path ? " workspace-switcher__remove--armed" : ""}${w.current ? " workspace-switcher__remove--current" : ""}`}
+                  key={level}
                   type="button"
-                  aria-label={confirmRemovePath === w.path ? t("composer.confirmRemoveProject") : t("composer.removeProject")}
-                  title={
-                    w.current
-                      ? t("composer.cannotRemoveCurrent")
-                      : confirmRemovePath === w.path
-                        ? t("composer.confirmRemoveProject")
-                        : t("composer.removeProject")
-                  }
-                  disabled={running || w.current}
-                  onClick={(event) => {
-                    event.stopPropagation();
-                    if (w.current) return;
-                    if (confirmRemovePath === w.path) {
-                      void removeWorkspace(w.path);
-                    } else {
-                      setConfirmRemovePath(w.path);
-                    }
-                  }}
+                  role="option"
+                  aria-selected={level === currentEffort}
+                  className={`composer-more-menu__item${level === currentEffort ? " composer-more-menu__item--active" : ""}`}
+                  onClick={() => chooseEffortLevel(level)}
+                  disabled={running}
                 >
-                  {confirmRemovePath === w.path ? <Check size={14} /> : <Trash2 size={14} />}
+                  <Gauge size={14} />
+                  <span>{level}</span>
+                  {level === currentEffort && <Check size={13} />}
                 </button>
-              </div>
-            ))}
-            {filteredWorkspaces.length === 0 && <div className="workspace-switcher__empty">{t("composer.noProjectMatches")}</div>}
+              ))}
+            </div>
           </div>
-          <div className="workspace-switcher__actions">
-            <button type="button" onClick={() => void chooseWorkspace()}>
-              <FolderPlus size={15} />
-              <span>{t("composer.addProject")}</span>
-            </button>
-          </div>
+        )}
       </AnchoredPopover>
       {menuMode === "slash" && (
         <SlashMenu items={slashMatches} activeIndex={active} onPick={pickCommand} onHover={setActive} />
@@ -1491,7 +2248,7 @@ export function Composer({
           <VirtualMenu
             items={atMenuItems}
             activeIndex={active}
-            itemKey={(it) => (it.kind === "pastChats" ? "past:chats" : (it.entry.isDir ? "d:" : "f:") + it.entry.name)}
+            itemKey={(it) => (it.kind === "pastChats" ? "past:chats" : (it.entry.isDir ? "d:" : "f:") + (it.entry.path || it.entry.name))}
             renderItem={(it, i) =>
               it.kind === "pastChats" ? (
                 <button
@@ -1522,7 +2279,7 @@ export function Composer({
                     <FileText size={13} className="filemenu__icon" />
                   )}
                   <span className="slashmenu__name slashmenu__name--file">
-                    {it.entry.name}
+                    {dirEntryMenuLabel(it.entry)}
                     {it.entry.isDir ? "/" : ""}
                   </span>
                 </button>
@@ -1531,78 +2288,100 @@ export function Composer({
           />
         )
       )}
-      <div className="composer-toolbar">
-        <div className="composer-modebar" role="toolbar" aria-label={t("composer.modeTitle")}>
-          {modeOptions.map((option) => (
-            <button
-              key={option.id}
-              type="button"
-              className={`composer-modebar__item composer-modebar__item--${option.id}${mode === option.id ? " composer-modebar__item--active" : ""}`}
-              onClick={() => onSetMode(option.id)}
-              aria-pressed={mode === option.id}
-              disabled={disabled || running}
-            >
-              {option.icon}
-              <span>{option.label}</span>
-            </button>
-          ))}
-        </div>
-        {runActivity && (
+      {runActivity && (
+        <div className="composer-toolbar composer-toolbar--status-only">
           <div className="composer-runstatus" role="status" aria-live="polite">
             <span className="composer-runstatus__dot" />
             <span className="composer-runstatus__text">{runActivity}</span>
             <Tooltip label={t("composer.stop")}>
-              <button className="composer-runstatus__stop" type="button" onClick={handleCancel} disabled={decisionPending}>
+              <button className="composer-runstatus__stop" type="button" onClick={handleCancel}>
                 <Square size={10} fill="currentColor" />
                 <span>{t("composer.stopShort")}</span>
               </button>
             </Tooltip>
           </div>
-        )}
-      </div>
+        </div>
+      )}
+      {pendingGuidance.length > 0 && (
+        <div className="composer-guidance-shelf" aria-label={t("composer.guidanceQueue")}>
+          <div className="composer-guidance-head">
+            <span className="composer-guidance-head__label">
+              <CornerDownRight size={14} />
+              <span>{t("composer.guidanceCount", { n: pendingGuidance.length })}</span>
+            </span>
+          </div>
+          <div className="composer-guidance-list">
+            {visibleGuidance.map((item) => (
+              <div className="composer-guidance-item" key={item.id}>
+                <CornerDownRight size={14} className="composer-guidance-item__icon" />
+                <span className="composer-guidance-item__text">{item.text}</span>
+                <Tooltip label={t("composer.guidanceSend")}>
+                  <button
+                    className="composer-guidance-item__guide"
+                    type="button"
+                    aria-label={t("composer.guidanceSend")}
+                    disabled={!running || disabled || readOnly || guidanceSendingId !== null}
+                    onClick={() => void sendQueuedGuidance(item)}
+                  >
+                    <CornerDownRight size={13} />
+                    <span>{t("composer.guidanceMode")}</span>
+                  </button>
+                </Tooltip>
+                <Tooltip label={t("composer.guidanceDismiss")}>
+                  <button
+                    className="composer-guidance-item__action"
+                    type="button"
+                    aria-label={t("composer.guidanceDismiss")}
+                    disabled={guidanceSendingId === item.id}
+                    onClick={() => setPendingGuidance((items) => items.filter((queued) => queued.id !== item.id))}
+                  >
+                    <Trash2 size={14} />
+                  </button>
+                </Tooltip>
+              </div>
+            ))}
+            {showGuidanceExpander && (
+              <button
+                className="composer-guidance-more"
+                type="button"
+                aria-expanded={guidanceExpanded}
+                onClick={() => setGuidanceExpanded((value) => !value)}
+              >
+                {guidanceExpanded ? <ChevronUp size={13} /> : <ChevronDown size={13} />}
+                <span>{guidanceExpanded ? t("composer.guidanceCollapse") : t("composer.guidanceRemaining", { n: hiddenGuidanceCount })}</span>
+              </button>
+            )}
+          </div>
+        </div>
+      )}
       {(attachments.length > 0 || workspaceRefs.length > 0 || sessionRefs.length > 0) && (
         <div className="composer-context" aria-label={t("composer.contextItems")}>
-          {attachments.map((a) => (
-            <div
-              className={`composer-context__item${a.previewUrl ? " composer-context__item--image" : " composer-context__item--attachment"}`}
-              key={a.path}
-            >
-              <Tooltip label={a.path}>
-                <span className="composer-context__label">
-                  {a.previewUrl ? <img src={a.previewUrl} alt="" draggable={false} /> : <FileText size={15} />}
-                  <span>{a.path.split("/").pop()}</span>
-                </span>
-              </Tooltip>
-              <Tooltip label={t("composer.removeImage")}>
-                <button
-                  type="button"
-                  onClick={() => removeAttachment(a.path)}
-                >
-                  <X size={14} />
-                </button>
-              </Tooltip>
-            </div>
-          ))}
+          {sortComposerAttachments(attachments).map((a) => {
+            const imageOnly = Boolean(a.previewUrl) && attachments.every((item) => item.previewUrl) && workspaceRefs.length === 0 && sessionRefs.length === 0;
+            return (
+              <ComposerContextCard
+                key={a.path}
+                variant="attachment"
+                tooltipLabel={a.path}
+                removeLabel={t("composer.removeImage")}
+                onRemove={() => removeAttachment(a.path)}
+                previewUrl={a.previewUrl}
+                imageOnly={imageOnly}
+                name={attachmentName(a)}
+                meta={attachmentExt(attachmentName(a)) || t("msg.fileAttachment")}
+              />
+            );
+          })}
           {workspaceRefs.map((ref) => (
-            <div
-              className={`composer-context__item composer-context__item--workspace${ref.isDir ? " composer-context__item--folder" : " composer-context__item--file"}`}
+            <ComposerContextCard
               key={workspaceReferenceKey(ref)}
-            >
-              <Tooltip label={formatWorkspaceReference(ref.path, ref.isDir)}>
-                <span className="composer-context__label">
-                  {ref.isDir ? <Folder size={15} /> : <FileText size={15} />}
-                  <span>{ref.isDir ? `${baseName(ref.path)}/` : baseName(ref.path)}</span>
-                </span>
-              </Tooltip>
-              <Tooltip label={t("composer.removeReference")}>
-                <button
-                  type="button"
-                  onClick={() => removeWorkspaceReference(ref)}
-                >
-                  <X size={13} />
-                </button>
-              </Tooltip>
-            </div>
+              variant="workspace"
+              tooltipLabel={ref.displayPath ? formatWorkspaceReference(ref.displayPath, ref.isDir) : formatWorkspaceReference(ref.path, ref.isDir)}
+              removeLabel={t("composer.removeReference")}
+              onRemove={() => removeWorkspaceReference(ref)}
+              folder={Boolean(ref.isDir)}
+              label={ref.isDir ? `${baseName(ref.displayPath || ref.path)}/` : baseName(ref.displayPath || ref.path)}
+            />
           ))}
           {sessionRefs.map((ref) => (
             <div
@@ -1664,31 +2443,42 @@ export function Composer({
         </div>
       )}
       <div
-        className={`composer-card${composerHeight !== null ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}`}
+        className={`composer-card${composerHeight !== null || composerResizing ? " composer-card--resized" : ""}${composerAutoExpanded ? " composer-card--autosized" : ""}${composerResizing ? " composer-card--resizing" : ""}${running ? " composer-card--running" : ""}`}
         ref={composerCardRef}
         style={composerCardStyle}
       >
         <button
           className="composer-resize-handle"
           type="button"
+          role="separator"
+          aria-orientation="horizontal"
           aria-label={t("composer.resize")}
+          aria-valuemin={COMPOSER_MIN_HEIGHT}
+          aria-valuemax={composerMaxHeight()}
+          aria-valuenow={composerResizeValue}
           title={t("composer.resize")}
           onPointerDown={onComposerResizeStart}
           onKeyDown={onComposerResizeKeyDown}
           onDoubleClick={resetComposerHeight}
         />
         <div
-          className={`composer${dragOver ? " composer--dragover" : ""}${disabled ? " composer--disabled" : ""}${text.trimStart().startsWith("!") ? " composer--shell" : ""}`}
+          className={`composer${dragOver ? " composer--dragover" : ""}${disabled || readOnly ? " composer--disabled" : ""}${shellModeActive ? " composer--shell" : ""}`}
           onDrop={onDrop}
           onDragOver={onDragOver}
           onDragLeave={onDragLeave}
         >
-          <span className="composer__caret">{text.trimStart().startsWith("!") ? "$" : "›"}</span>
+          <span className="composer__caret">{shellModeActive ? "$" : "›"}</span>
           <textarea
+            id="composer-input"
             ref={taRef}
             className="composer__input"
+            aria-label={t("composer.placeholder")}
             value={text}
-            onChange={(e) => setText(e.target.value)}
+            onChange={(e) => {
+              resetPromptHistoryNavigation();
+              setText(e.target.value);
+              if (composerPrompt) setComposerPrompt(null);
+            }}
             onSelect={rememberCaret}
             onClick={rememberCaret}
             onKeyUp={rememberCaret}
@@ -1703,45 +2493,170 @@ export function Composer({
               lastCompositionEndAt.current = Date.now();
             }}
             style={textareaStyle}
-            placeholder={disabled ? t("common.loading") : t("composer.placeholder")}
+            placeholder={composerPlaceholder}
             rows={1}
-            disabled={disabled}
+            disabled={disabled || readOnly}
           />
-          {!running && (
-            <Tooltip label={t("composer.send")}>
-              <button
-                className="composer__btn composer__btn--send"
-                onClick={submit}
-                disabled={submitting || pendingPaste > 0 || (!text.trim() && attachments.length === 0 && workspaceRefs.length === 0) || disabled}
-              >
-                <ArrowUp size={16} />
-              </button>
-            </Tooltip>
+          {composerPrompt && (
+            <span className="composer__prompt" role="status">
+              {composerPrompt}
+            </span>
           )}
+          <Tooltip label={submitTooltip}>
+            <button
+              className={`composer__btn composer__btn--send${running ? " composer__btn--steer" : ""}`}
+              onClick={submit}
+              disabled={submitBlocked}
+              aria-label={submitTooltip}
+            >
+              <ArrowUp size={16} />
+            </button>
+          </Tooltip>
         </div>
         <div className={composerMetaClass}>
-          {cwd && (
-            <div className="composer-meta__control composer-meta__control--workspace composer-workspace-wrap" ref={workspaceAnchorRef}>
-              <button
-                className={`composer__workspace${workspaceMenuOpen ? " composer__workspace--open" : ""}`}
-                onClick={() => {
-                  if (!running) setWorkspaceMenuOpen((open) => !open);
-                }}
-                disabled={running}
-              >
-                <FolderGit2 size={13} />
-                <span>{workspaceName}</span>
-                <ChevronDown size={12} />
-              </button>
-            </div>
-          )}
           <div className="composer-meta__params">
+            <div className="composer-meta__control composer-meta__control--intent">
+              <Tooltip label={t("composer.intentMenuTitle")} disabled={intentMenuOpen || intentMenuClosing}>
+                <button
+                  ref={intentMenuAnchorRef}
+                  type="button"
+                  className={`composer-action-trigger${intentMenuOpen || intentMenuClosing ? " composer-action-trigger--open" : ""}`}
+                  onClick={() => (intentMenuOpen || intentMenuClosing ? closeIntentMenu() : openIntentMenu())}
+                  disabled={disabled || running}
+                  aria-haspopup="menu"
+                  aria-expanded={intentMenuOpen && !intentMenuClosing}
+                  aria-label={t("composer.intentMenuTitle")}
+                  title={intentMenuOpen || intentMenuClosing ? undefined : t("composer.intentMenuTitle")}
+                >
+                  <SlidersHorizontal size={17} />
+                </button>
+              </Tooltip>
+              {planModeOn && (
+                <Tooltip label={t("composer.exitPlanTitle")}>
+                  <button
+                    type="button"
+                    className="composer-mode-chip composer-mode-chip--plan"
+                    onClick={choosePlanMode}
+                    disabled={disabled}
+                    title={t("composer.exitPlanTitle")}
+                    aria-label={t("composer.exitPlanTitle")}
+                  >
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--mode" aria-hidden="true">
+                      <List size={14} />
+                    </span>
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--dismiss" aria-hidden="true">
+                      <X size={11} />
+                    </span>
+                    <span className="composer-mode-chip__label">{t("composer.modePlan")}</span>
+                  </button>
+                </Tooltip>
+              )}
+              {goalModeOn && (
+                <Tooltip label={t("composer.exitGoalTitle")}>
+                  <button
+                    type="button"
+                    className="composer-mode-chip composer-mode-chip--goal"
+                    onClick={chooseGoalMode}
+                    disabled={disabled}
+                    title={activeGoal || t("composer.exitGoalTitle")}
+                    aria-label={t("composer.exitGoalTitle")}
+                  >
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--mode" aria-hidden="true">
+                      <Target size={14} />
+                    </span>
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--dismiss" aria-hidden="true">
+                      <X size={11} />
+                    </span>
+                    <span className="composer-mode-chip__label">{t("composer.modeGoal")}</span>
+                  </button>
+                </Tooltip>
+              )}
+              {tokenModeOn && (
+                <Tooltip label={t("composer.tokenEconomyOnDesc")}>
+                  <button
+                    type="button"
+                    className="composer-mode-chip composer-mode-chip--token"
+                    onClick={chooseTokenMode}
+                    disabled={disabled || running}
+                    title={t("composer.tokenEconomyExitTitle")}
+                    aria-label={t("composer.tokenEconomyExitTitle")}
+                  >
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--mode" aria-hidden="true">
+                      <Gauge size={14} />
+                    </span>
+                    <span className="composer-mode-chip__icon composer-mode-chip__icon--dismiss" aria-hidden="true">
+                      <X size={11} />
+                    </span>
+                    <span className="composer-mode-chip__label">{t("composer.tokenEconomyShort")}</span>
+                  </button>
+                </Tooltip>
+              )}
+            </div>
+            <div className="composer-meta__control composer-meta__control--approval">
+              <div className="composer-modebar composer-modebar--approval" data-mode={toolApprovalMode} title={t("composer.accessMenuTitle")}>
+                <span className="composer-modebar__thumb" aria-hidden="true" />
+                <button
+                  type="button"
+                  className={`composer-modebar__item composer-modebar__item--ask${toolApprovalMode === "ask" ? " composer-modebar__item--active" : ""}`}
+                  onClick={() => chooseApprovalMode("ask")}
+                  disabled={disabled}
+                  aria-pressed={toolApprovalMode === "ask"}
+                  title={t("composer.accessAskTitle")}
+                >
+                  <Shield size={14} />
+                  <span>{t("composer.modeAsk")}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`composer-modebar__item composer-modebar__item--auto${toolApprovalMode === "auto" ? " composer-modebar__item--active" : ""}`}
+                  onClick={() => chooseApprovalMode("auto")}
+                  disabled={disabled}
+                  aria-pressed={toolApprovalMode === "auto"}
+                  title={t("composer.accessAutoTitle")}
+                >
+                  <ShieldCheck size={14} />
+                  <span>{t("composer.modeNormal")}</span>
+                </button>
+                <button
+                  type="button"
+                  className={`composer-modebar__item composer-modebar__item--yolo${toolApprovalMode === "yolo" ? " composer-modebar__item--active" : ""}`}
+                  onClick={() => chooseApprovalMode("yolo")}
+                  disabled={disabled}
+                  aria-pressed={toolApprovalMode === "yolo"}
+                  title={t("composer.accessYoloTitle")}
+                >
+                  <ShieldAlert size={14} />
+                  <span>{t("composer.modeYolo")}</span>
+                </button>
+              </div>
+            </div>
             <div className="composer-meta__control composer-meta__control--model">
               <ModelSwitcher label={modelLabel} tabId={tabId} onPick={onSwitchModel} />
             </div>
-            {effort?.supported && (
+            {hasEffort && (
               <div className="composer-meta__control composer-meta__control--effort">
                 <EffortSwitcher effort={effort} disabled={running} onPick={onSetEffort} />
+              </div>
+            )}
+            {hasEffort && (
+              <div className="composer-meta__control composer-meta__control--more">
+                <Tooltip label={compactEffortTitle} disabled={moreMenuOpen || moreMenuClosing}>
+                  <button
+                    ref={moreMenuAnchorRef}
+                    type="button"
+                    className={`composer-more-trigger composer-more-trigger--effort${currentEffort !== "auto" ? " composer-more-trigger--explicit" : ""}${moreMenuOpen || moreMenuClosing ? " composer-more-trigger--open" : ""}`}
+                    onClick={() => (moreMenuOpen || moreMenuClosing ? closeMoreMenu() : openMoreMenu())}
+                    disabled={disabled || running}
+                    aria-haspopup="menu"
+                    aria-expanded={moreMenuOpen && !moreMenuClosing}
+                    aria-label={compactEffortTitle}
+                    title={moreMenuOpen || moreMenuClosing ? undefined : compactEffortTitle}
+                  >
+                    <Gauge size={14} />
+                    <span>{currentEffort}</span>
+                    <ChevronsUpDown size={11} />
+                  </button>
+                </Tooltip>
               </div>
             )}
           </div>

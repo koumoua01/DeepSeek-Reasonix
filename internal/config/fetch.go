@@ -28,7 +28,7 @@ func (e *ProviderEntry) FetchModels(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("fetch models: provider %q has no base_url", e.Name)
 	}
 	key := e.APIKey()
-	if key == "" {
+	if e.RequiresAPIKey() && key == "" {
 		return nil, fmt.Errorf("fetch models: provider %q has no API key (set %s in .env)", e.Name, e.APIKeyEnv)
 	}
 	candidates, err := BuildModelFetchURLs(e.BaseURL, e.ModelsURL)
@@ -36,15 +36,19 @@ func (e *ProviderEntry) FetchModels(ctx context.Context) ([]string, error) {
 		return nil, err
 	}
 	var lastErr error
+	var firstHardErr error
 	for _, u := range candidates {
-		models, err := openai.FetchModels(ctx, u, key)
+		models, err := openai.FetchModels(ctx, u, key, e.Headers)
 		if err == nil {
 			return models, nil
 		}
 		lastErr = err
-		if !openai.IsModelFetchEndpointMiss(err) {
-			break
+		if !openai.IsModelFetchEndpointMiss(err) && firstHardErr == nil {
+			firstHardErr = err
 		}
+	}
+	if firstHardErr != nil {
+		return nil, firstHardErr
 	}
 	return nil, lastErr
 }

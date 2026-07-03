@@ -1,47 +1,12 @@
-import { useState } from "react";
+import { type ReactNode } from "react";
+import { Activity, CircleDollarSign, CircleGauge, Database, Folder, GitBranch, Layers, Percent, RefreshCw, Wallet, Zap } from "lucide-react";
 import { Tooltip } from "./Tooltip";
-import { useI18n } from "../lib/i18n";
-import type { BalanceInfo, ContextInfo, JobView, Mode, WireUsage } from "../lib/types";
+import { useI18n, type Translator } from "../lib/i18n";
+import { formatMoneyLocalized } from "../lib/money";
+import { normalizeStatusBarItems, type StatusBarItemId } from "../lib/statusBarItems";
+import { type BalanceInfo, type ContextInfo, type UsageSourceStats, type WireUsage } from "../lib/types";
 
-// JobsChip is the status-bar background-jobs indicator: a count that opens an
-// upward popover listing the running jobs (id · label · status), mirroring the
-// ModelSwitcher's click-to-open pattern. With no jobs it still reserves a stable
-// "jobs 0" slot so the IDE-style status order does not jump.
-function JobsChip({ jobs }: { jobs: JobView[] }) {
-  const { t } = useI18n();
-  const [open, setOpen] = useState(false);
-  if (jobs.length === 0) {
-    return (
-      <span className="statusbar__item">
-        {t("status.jobsCount", { n: 0 })}
-      </span>
-    );
-  }
-  return (
-    <div className="statusbar__jobswrap">
-      <Tooltip label={t("status.jobsTitle")}>
-        <button className="statusbar__item statusbar__jobs" onClick={() => setOpen((v) => !v)}>
-          {t("status.jobsCount", { n: jobs.length })}
-        </button>
-      </Tooltip>
-      {open && (
-        <>
-          <div className="modelsw__backdrop" onClick={() => setOpen(false)} />
-          <div className="modelsw__menu jobsmenu" role="listbox">
-            <div className="jobsmenu__head">{t("status.jobsTitle")}</div>
-            {jobs.map((j) => (
-              <div className="jobsmenu__item" key={j.id} role="option">
-                <span className="jobsmenu__id">{j.id}</span>
-                <span className="jobsmenu__label">{j.label || j.kind}</span>
-                <span className="jobsmenu__status">{j.status}</span>
-              </div>
-            ))}
-          </div>
-        </>
-      )}
-    </div>
-  );
-}
+type StatusBarLabelStyle = "icon" | "text";
 
 function formatRate(hit: number, denom: number): string | null {
   if (denom <= 0) return null;
@@ -52,8 +17,7 @@ function formatRate(hit: number, denom: number): string | null {
 // steeper number on a non-compacting DeepSeek session. null when nothing yet.
 function nowRate(u?: WireUsage): string | null {
   if (!u) return null;
-  let denom = u.cacheHitTokens + u.cacheMissTokens;
-  if (denom === 0) denom = u.promptTokens;
+  const denom = u.cacheHitTokens + u.cacheMissTokens;
   return formatRate(u.cacheHitTokens, denom);
 }
 
@@ -67,72 +31,301 @@ function avgRate(u?: WireUsage): string | null {
   return formatRate(u.sessionCacheHitTokens, denom);
 }
 
-function currencySymbol(currency?: string): string {
-  const value = (currency || "¥").trim();
-  if (/^(cny|rmb|yuan)$/i.test(value)) return "¥";
-  if (/^(usd|dollar)$/i.test(value)) return "$";
-  return value || "¥";
+// contextAvgRate computes the session-aggregate cache-hit % from ContextInfo
+// cache tokens (loaded from persisted telemetry on session resume). Used as a
+// fallback when no live WireUsage is available yet.
+function contextAvgRate(ctx: ContextInfo): string | null {
+  const hit = ctx.cacheHitTokens ?? 0;
+  const miss = ctx.cacheMissTokens ?? 0;
+  return formatRate(hit, hit + miss);
 }
 
-function formatMoney(amount?: number, currency?: string): string {
-  const symbol = currencySymbol(currency);
-  if (typeof amount !== "number" || amount <= 0) return `${symbol}0.0000`;
-  return `${symbol}${amount < 1 ? amount.toFixed(4) : amount.toFixed(2)}`;
+function rateValueClass(rate: string | null): string {
+  if (rate === null) return "stat__value--empty";
+  const pct = Number.parseFloat(rate);
+  if (!Number.isFinite(pct)) return "";
+  if (pct >= 80) return "statusbar__rate-value--good";
+  if (pct >= 50) return "statusbar__rate-value--notice";
+  return "statusbar__rate-value--critical";
+}
+
+function formatTokenCount(tokens?: number): string {
+  if (typeof tokens !== "number" || tokens <= 0) return "-";
+  return tokens.toLocaleString();
+}
+
+function formatTurnCount(turns: number | undefined, t: Translator): string {
+  if (typeof turns !== "number" || turns < 0) return "-";
+  return t(turns === 1 ? "history.turnOne" : "history.turnOther", { n: turns });
+}
+
+const STATUS_SOURCE_ORDER = ["executor", "planner", "subagent", "compaction", "classifier", "title"];
+
+function sourceLabel(source: string, t: Translator): string {
+  switch (source) {
+    case "executor": return t("context.sourceExecutor");
+    case "planner": return t("context.sourcePlanner");
+    case "subagent": return t("context.sourceSubagent");
+    case "compaction": return t("context.sourceCompaction");
+    case "classifier": return t("context.sourceClassifier");
+    case "title": return t("context.sourceTitle");
+    default: return source;
+  }
+}
+
+function sourceRows(sources?: Record<string, UsageSourceStats>): Array<{ source: string; stats: UsageSourceStats }> {
+  return Object.entries(sources ?? {})
+    .filter(([, stats]) =>
+      (stats.requestCount ?? 0) > 0 ||
+      (stats.promptTokens ?? 0) > 0 ||
+      (stats.completionTokens ?? 0) > 0 ||
+      (stats.cacheHitTokens ?? 0) > 0 ||
+      (stats.cacheMissTokens ?? 0) > 0
+    )
+    .sort(([a], [b]) => {
+      const ia = STATUS_SOURCE_ORDER.indexOf(a);
+      const ib = STATUS_SOURCE_ORDER.indexOf(b);
+      if (ia >= 0 || ib >= 0) return (ia >= 0 ? ia : STATUS_SOURCE_ORDER.length) - (ib >= 0 ? ib : STATUS_SOURCE_ORDER.length);
+      return a.localeCompare(b);
+    })
+    .map(([source, stats]) => ({ source, stats }));
+}
+
+function sourceCacheTooltip(t: Translator, title: string, context: ContextInfo): ReactNode {
+  const rows = sourceRows(context.sources);
+  if (rows.length === 0) return title;
+  return (
+    <span className="statusbar__tooltip-stack">
+      <span>{title}</span>
+      {rows.map(({ source, stats }) => {
+        const denom = stats.cacheHitTokens + stats.cacheMissTokens;
+        const rate = denom > 0 ? `${formatRate(stats.cacheHitTokens, denom)}%` : t("context.cacheNotReported");
+        return (
+          <span key={source}>
+            {sourceLabel(source, t)}: {rate} · {t("context.sourceInput")} {formatTokenCount(stats.promptTokens)}
+            {" · "}{t("context.sourceOutput")} {formatTokenCount(stats.completionTokens)}
+            {" · "}{t("context.sourceRequests", { count: stats.requestCount ?? 0 })}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+function MetricLabel({ style, icon, label }: { style: StatusBarLabelStyle; icon: ReactNode; label: string }) {
+  return (
+    <span className={`stat__label stat__label--${style}`} aria-hidden={style === "icon" ? "true" : undefined}>
+      {style === "icon" ? icon : label}
+    </span>
+  );
+}
+
+function compactPath(path?: string, fallback?: string): string {
+  const value = (path || fallback || "").trim();
+  if (!value) return "";
+  const normalized = value.replace(/\\/g, "/");
+  const homeMatch = normalized.match(/^~\/?(.+)?$/);
+  const parts = (homeMatch ? homeMatch[1] ?? "" : normalized).split("/").filter(Boolean);
+  if (parts.length === 0) return normalized;
+  if (parts.length === 1) return parts[0];
+  return `…/${parts.slice(-2).join("/")}`;
+}
+
+function workspaceTooltip(t: Translator, displayPath: string, workspacePath?: string, gitBranch?: string) {
+  const workspace = (workspacePath || displayPath).trim();
+  const branch = (gitBranch || "").trim();
+  if (branch) {
+    return (
+      <span className="statusbar__tooltip-stack">
+        {workspace && <span>{t("status.workspaceTitle")}: {workspace}</span>}
+        {branch && <span>{t("status.gitBranchTitle")}: {branch}</span>}
+      </span>
+    );
+  }
+  return `${t("status.workspaceTitle")}: ${workspace}`;
 }
 
 export function StatusBar({
   context,
   usage,
   balance,
-  jobs,
   running,
-  mode,
+  sessionTurns,
+  sessionTokens,
+  turnTokens,
+  turnCost,
   cost,
   currency,
+  modelLabel,
+  labelStyle = "text",
+  items,
+  workspacePath,
+  workspaceName,
+  gitBranch,
 }: {
   context: ContextInfo;
   usage?: WireUsage;
   balance?: BalanceInfo;
-  jobs?: JobView[];
   running: boolean;
-  mode: Mode;
+  sessionTurns?: number;
+  sessionTokens?: number;
+  turnTokens?: number;
+  turnCost?: number;
   cost?: number;
   currency?: string;
+  modelLabel?: string;
+  labelStyle?: StatusBarLabelStyle;
+  items?: readonly string[];
+  workspacePath?: string;
+  workspaceName?: string;
+  gitBranch?: string;
 }) {
-  const { t } = useI18n();
+  const { locale, t } = useI18n();
   const pct = context.window ? Math.min(100, Math.round((context.used / context.window) * 100)) : null;
   const compactPct = context.compactRatio ? Math.round(context.compactRatio * 100) : null;
+  const compactNear = pct !== null && compactPct !== null && pct >= Math.max(0, compactPct - 10);
+  const compactReached = pct !== null && compactPct !== null && pct >= compactPct;
   const nowPct = nowRate(usage);
-  const avgPct = avgRate(usage);
-  const jobsList = jobs ?? [];
-  const costLabel = formatMoney(cost, currency);
-
+  const avgPct = avgRate(usage) ?? contextAvgRate(context);
+  const turnCostLabel = formatMoneyLocalized(turnCost, currency, { locale });
+  const costLabel = formatMoneyLocalized(cost, currency, { locale });
+  const displayWorkspacePath = (workspacePath || workspaceName || "").trim();
+  const workspaceLabel = compactPath(displayWorkspacePath, workspaceName);
+  const branchLabel = (gitBranch || "").trim();
+  const workspaceTitle = displayWorkspacePath ? workspaceTooltip(t, displayWorkspacePath, workspacePath, branchLabel) : "";
+  const turnLabel = formatTurnCount(sessionTurns, t);
+  const tokenLabel = formatTokenCount(sessionTokens);
+  const turnTokenLabel = formatTokenCount(turnTokens);
+  const balanceLabel = balance?.available && balance.display ? balance.display : "-";
+  const metricLabelStyle = labelStyle === "text" ? "text" : "icon";
+  const visibleItems = normalizeStatusBarItems(items);
+  const cacheTooltip = sourceCacheTooltip(t, t("status.cacheTitle"), context);
+  const avgCacheTooltip = sourceCacheTooltip(t, t("status.cacheAvgTitle"), context);
+  const itemRenderers: Record<StatusBarItemId, ReactNode> = {
+    model: (
+      <Tooltip label={t("status.modelTitle")}>
+        <span className="stat stat--model">
+          <span className={`statusbar__dot ${running ? "statusbar__dot--busy" : ""}`} />
+          {modelLabel && <span className="statusbar__model">{modelLabel}</span>}
+        </span>
+      </Tooltip>
+    ),
+    workspace: workspaceLabel ? (
+      <Tooltip label={workspaceTitle} className="statusbar__metric statusbar__metric--workspace">
+        <span className="stat statusbar__workspace">
+          <span className="stat__label stat__label--icon" aria-hidden="true"><Folder size={12} /></span>
+          <b>{workspaceLabel}</b>
+        </span>
+      </Tooltip>
+    ) : null,
+    git_branch: branchLabel ? (
+      <Tooltip label={`${t("status.gitBranchTitle")}: ${branchLabel}`} className="statusbar__metric statusbar__metric--branch">
+        <span className="stat statusbar__branch">
+          <span className="stat__label stat__label--icon" aria-hidden="true"><GitBranch size={12} /></span>
+          <b>{branchLabel}</b>
+        </span>
+      </Tooltip>
+    ) : null,
+    cache: (
+      <Tooltip label={cacheTooltip} className="statusbar__metric statusbar__metric--cache">
+        <span className="stat statusbar__cache">
+          <MetricLabel style={metricLabelStyle} icon={<Percent size={12} />} label={t("status.cacheLabel")} />
+          <b className={rateValueClass(nowPct) || undefined}>{nowPct !== null ? `${nowPct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    cache_avg: (
+      <Tooltip label={avgCacheTooltip} className="statusbar__metric statusbar__metric--avg">
+        <span className="stat statusbar__avg">
+          <MetricLabel style={metricLabelStyle} icon={<Activity size={12} />} label={t("status.cacheAvgLabel")} />
+          <b className={rateValueClass(avgPct) || undefined}>{avgPct !== null ? `${avgPct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    session_tokens: (
+      <Tooltip label={t("status.sessionTokensTitle")} className="statusbar__metric statusbar__metric--tokens">
+        <span className="stat statusbar__tokens">
+          <MetricLabel style={metricLabelStyle} icon={<Database size={12} />} label={t("status.sessionTokensLabel")} />
+          <b className={tokenLabel === "-" ? "stat__value--empty" : undefined}>{tokenLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    turn_tokens: (
+      <Tooltip label={t("status.turnTokensTitle")} className="statusbar__metric statusbar__metric--turn-tokens">
+        <span className="stat statusbar__turn-tokens">
+          <MetricLabel style={metricLabelStyle} icon={<Zap size={12} />} label={t("status.turnTokensLabel")} />
+          <b className={turnTokenLabel === "-" ? "stat__value--empty" : undefined}>{turnTokenLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    turn_cost: (
+      <Tooltip label={t("status.turnCostTitle")} className="statusbar__metric statusbar__metric--turn-cost">
+        <span className="stat statusbar__turn-cost">
+          <MetricLabel style={metricLabelStyle} icon={<CircleDollarSign size={12} />} label={t("status.turnCostLabel")} />
+          <b>{turnCostLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    session_turns: (
+      <Tooltip label={t("status.sessionTurnsTitle")} className="statusbar__metric statusbar__metric--turns">
+        <span className="stat statusbar__turns">
+          <MetricLabel style={metricLabelStyle} icon={<RefreshCw size={12} />} label={t("status.sessionTurnsLabel")} />
+          <b className={turnLabel === "-" ? "stat__value--empty" : undefined}>{turnLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    context: (
+      <Tooltip label={t("status.ctxTitle")} className="statusbar__metric statusbar__metric--ctx">
+        <span className="stat statusbar__ctx">
+          <MetricLabel style={metricLabelStyle} icon={<CircleGauge size={12} />} label={t("status.ctxLabel")} />
+          <b className={pct === null ? "stat__value--empty" : undefined}>{pct !== null ? `${pct}%` : "-"}</b>
+        </span>
+      </Tooltip>
+    ),
+    compact: (
+      <Tooltip label={t("status.compactTitle")} className="statusbar__metric statusbar__metric--compact">
+        <span className="stat statusbar__compact">
+          <MetricLabel style={metricLabelStyle} icon={<Layers size={12} />} label={t("status.compactLabel")} />
+          <b
+            className={[
+              compactPct === null ? "stat__value--empty" : undefined,
+              compactReached ? "statusbar__compact-value--critical" : compactNear ? "statusbar__compact-value--warn" : undefined,
+            ].filter(Boolean).join(" ") || undefined}
+          >
+            {compactPct !== null ? `${compactPct}%` : "-"}
+          </b>
+        </span>
+      </Tooltip>
+    ),
+    cost: (
+      <Tooltip label={t("status.spendTitle")} className="statusbar__metric statusbar__metric--cost">
+        <span className="stat statusbar__cost">
+          <MetricLabel style={metricLabelStyle} icon={<CircleDollarSign size={12} />} label={t("status.costLabel")} />
+          <b>{costLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+    balance: (
+      <Tooltip label={t("status.balanceTitle")} className="statusbar__metric statusbar__metric--balance">
+        <span className="stat stat--balance statusbar__balance">
+          <MetricLabel style={metricLabelStyle} icon={<Wallet size={12} />} label={t("status.balanceLabel")} />
+          <b className={balanceLabel === "-" ? "stat__value--empty" : undefined}>{balanceLabel}</b>
+        </span>
+      </Tooltip>
+    ),
+  };
+  const renderedItems = visibleItems
+    .map((id) => ({ id, node: itemRenderers[id] }))
+    .filter(({ node }) => node !== null && node !== undefined && node !== false);
   return (
-    <div className="statusbar">
-      <span className={`statusbar__dot ${running ? "statusbar__dot--busy" : ""}`} />
-      <span className="statusbar__item statusbar__ctx">{pct !== null ? t("status.ctx", { pct }) : t("status.ctxUnknown")}</span>
-      <span className="statusbar__sep">·</span>
-      <span className="statusbar__item statusbar__compact">{compactPct !== null ? t("status.compact", { pct: compactPct }) : t("status.compactUnknown")}</span>
-      <span className="statusbar__sep">·</span>
-      <span className="statusbar__item statusbar__cache">{t("status.cache", { pct: nowPct ?? "-" })}</span>
-      <span className="statusbar__sep">·</span>
-      <span className="statusbar__item statusbar__avg">{t("status.cacheAvg", { pct: avgPct ?? "-" })}</span>
-      <span className="statusbar__sep">·</span>
-      <Tooltip label={t("status.spendTitle")}>
-        <span className="statusbar__item statusbar__cost">
-          {t("status.cost", { amount: costLabel })}
-        </span>
-      </Tooltip>
-      <span className="statusbar__sep">·</span>
-      <JobsChip jobs={jobsList} />
-      <span className="statusbar__sep">·</span>
-      <Tooltip label={t("status.balanceTitle")}>
-        <span className="statusbar__item statusbar__balance">
-          {t("status.balance", { amount: balance?.available && balance.display ? balance.display : "-" })}
-        </span>
-      </Tooltip>
-      <span className="statusbar__spacer" />
-      {mode === "plan" && <span className="statusbar__plan">{t("status.plan")}</span>}
+    <div className={`statusbar statusbar--${metricLabelStyle}`}>
+      <div className="statusbar__group statusbar__group--items">
+        {renderedItems.map(({ id, node }) => (
+          <span className="statusbar__item" data-statusbar-item={id} key={id}>
+            {node}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }

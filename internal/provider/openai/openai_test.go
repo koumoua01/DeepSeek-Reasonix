@@ -125,6 +125,106 @@ func TestStreamAuthError(t *testing.T) {
 	}
 }
 
+func TestStreamUsesConfiguredChatURL(t *testing.T) {
+	var sawRequest bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawRequest = true
+		if r.URL.Path != "/proxy/v1/chat/completions" {
+			t.Errorf("path = %s, want /proxy/v1/chat/completions", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if r.Header.Get("Authorization") != "Bearer k" {
+			http.Error(w, "bad key", http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "custom",
+		BaseURL: srv.URL + "/base",
+		Model:   "model-a",
+		APIKey:  "k",
+		Extra:   map[string]any{"chat_url": srv.URL + "/proxy/v1/chat/completions"},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	var got strings.Builder
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+		if chunk.Type == provider.ChunkText {
+			got.WriteString(chunk.Text)
+		}
+	}
+	if !sawRequest {
+		t.Fatal("server did not receive request")
+	}
+	if got.String() != "ok" {
+		t.Fatalf("streamed text = %q, want ok", got.String())
+	}
+}
+
+func TestStreamSendsCustomHeaders(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer real-key" {
+			http.Error(w, "authorization was not preserved", http.StatusUnauthorized)
+			return
+		}
+		if r.Header.Get("HTTP-Referer") != "https://app.example" || r.Header.Get("X-Title") != "Reasonix" {
+			http.Error(w, "custom headers missing", http.StatusForbidden)
+			return
+		}
+		if r.Header.Get("Accept") != "text/event-stream" {
+			http.Error(w, "reserved Accept header was overwritten", http.StatusBadRequest)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	p, err := New(provider.Config{
+		Name:    "custom",
+		BaseURL: srv.URL,
+		Model:   "model-a",
+		APIKey:  "real-key",
+		Extra: map[string]any{"headers": map[string]string{
+			"Authorization": "Bearer wrong",
+			"Accept":        "application/json",
+			"HTTP-Referer":  "https://app.example",
+			"X-Title":       "Reasonix",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	ch, err := p.Stream(context.Background(), provider.Request{
+		Messages: []provider.Message{{Role: provider.RoleUser, Content: "hi"}},
+	})
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	for chunk := range ch {
+		if chunk.Type == provider.ChunkError {
+			t.Fatalf("stream error: %v", chunk.Err)
+		}
+	}
+}
+
 // TestBuildRequestAlwaysSerializesContent guards the DeepSeek 400 regression:
 // DeepSeek rejects a message missing the `content` field, so every message must
 // serialize one. A pure tool_calls assistant turn carries null (OpenAI-spec,
@@ -289,8 +389,8 @@ func TestNormaliseUsageMiMoShape(t *testing.T) {
 // back in the outgoing request. DeepSeek otherwise counts it as paid prompt
 // input (~500 tok/turn on a reasoner chain). The session keeps it for
 // display/archive; the wire request must not carry it.
-func TestBuildRequestDropsReasoningContent(t *testing.T) {
-	c := &client{model: "deepseek-reasoner"}
+func TestBuildRequestDropsReasoningOnPlainAssistantTurn(t *testing.T) {
+	c := &client{model: "deepseek-reasoner", deepseek: true}
 	req := c.buildRequest(provider.Request{
 		Messages: []provider.Message{
 			{Role: provider.RoleUser, Content: "explain"},
@@ -303,14 +403,63 @@ func TestBuildRequestDropsReasoningContent(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 	if strings.Contains(string(b), "reasoning_content") {
-		t.Errorf("outgoing request must not carry a reasoning_content field: %s", b)
+		t.Errorf("a no-tool-calls assistant turn must not carry reasoning_content: %s", b)
 	}
 	if strings.Contains(string(b), "SECRET-CHAIN-OF-THOUGHT") {
 		t.Errorf("the assistant chain-of-thought leaked into the request: %s", b)
 	}
-	// The visible answer must survive — we only drop reasoning, not content.
 	if !strings.Contains(string(b), "the answer") {
 		t.Errorf("assistant content was dropped along with reasoning: %s", b)
+	}
+}
+
+func TestBuildRequestDropsMemoryCitations(t *testing.T) {
+	c := &client{model: "deepseek-chat", deepseek: true}
+	req := c.buildRequest(provider.Request{
+		Messages: []provider.Message{
+			{Role: provider.RoleUser, Content: "continue"},
+			{Role: provider.RoleUser, Content: "edited prompt", Edited: true, Original: "original prompt"},
+			{Role: provider.RoleAssistant, Content: "done", MemoryCitations: []provider.MemoryCitation{{
+				ID: "mem-1", Source: "MEMORY.md", LineStart: 116, LineEnd: 123, Note: "workflow",
+			}}},
+		},
+	})
+	b, err := json.Marshal(req.Messages)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(b), "memoryCitations") || strings.Contains(string(b), "MEMORY.md") {
+		t.Fatalf("local memory citations leaked into OpenAI-compatible request: %s", b)
+	}
+	if strings.Contains(string(b), "original prompt") || strings.Contains(string(b), `"edited"`) || strings.Contains(string(b), `"original"`) {
+		t.Fatalf("local edit metadata leaked into OpenAI-compatible request: %s", b)
+	}
+	if !strings.Contains(string(b), "done") {
+		t.Fatalf("assistant content was dropped with local metadata: %s", b)
+	}
+}
+
+// DeepSeek thinking mode 400s a tool_calls turn whose reasoning_content was
+// dropped on a cache-miss replay, so it must be round-tripped — but only on the
+// turn that carries tool calls, and only for the DeepSeek protocol.
+func TestBuildRequestRoundTripsReasoningOnDeepSeekToolCalls(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "count the go files"},
+		{
+			Role:             provider.RoleAssistant,
+			ReasoningContent: "CHAIN-OF-THOUGHT",
+			ToolCalls:        []provider.ToolCall{{ID: "c1", Name: "bash", Arguments: `{"command":"ls"}`}},
+		},
+		{Role: provider.RoleTool, Content: "14", ToolCallID: "c1", Name: "bash"},
+	}
+	deepseek, _ := json.Marshal((&client{model: "deepseek-v4", deepseek: true}).buildRequest(provider.Request{Messages: msgs}).Messages)
+	if !strings.Contains(string(deepseek), "reasoning_content") || !strings.Contains(string(deepseek), "CHAIN-OF-THOUGHT") {
+		t.Errorf("DeepSeek tool_calls turn must round-trip reasoning_content: %s", deepseek)
+	}
+
+	other, _ := json.Marshal((&client{model: "mimo-v2"}).buildRequest(provider.Request{Messages: msgs}).Messages)
+	if strings.Contains(string(other), "CHAIN-OF-THOUGHT") {
+		t.Errorf("non-DeepSeek backends must not re-upload reasoning_content: %s", other)
 	}
 }
 
@@ -507,8 +656,10 @@ func TestBuildRequestPreservesEmptyIDToolResults(t *testing.T) {
 	})
 	var toolContents []string
 	for _, m := range req.Messages {
-		if m.Role == string(provider.RoleTool) && m.Content != nil {
-			toolContents = append(toolContents, *m.Content)
+		if m.Role == string(provider.RoleTool) {
+			if s, ok := m.Content.(string); ok {
+				toolContents = append(toolContents, s)
+			}
 		}
 	}
 	if len(toolContents) != 2 {
@@ -586,5 +737,62 @@ func TestBuildRequestContentNullForAssistantToolCalls(t *testing.T) {
 	}
 	if !strings.Contains(s, `"parameters":{"type":"object"}`) {
 		t.Errorf("no-param tool should serialize a valid empty-object schema: %s", s)
+	}
+}
+
+func TestBuildRequestOmitsResponseOnlyToolCallIndex(t *testing.T) {
+	c := &client{name: "x", model: "m", baseURL: "https://api.example.com/v1"}
+	req := provider.Request{
+		Messages: []provider.Message{{
+			Role: provider.RoleAssistant,
+			ToolCalls: []provider.ToolCall{{
+				ID:        "call_1",
+				Name:      "bash",
+				Arguments: `{"cmd":"ls"}`,
+			}},
+		}},
+	}
+	body, err := json.Marshal(c.buildRequest(req))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	s := string(body)
+	if !strings.Contains(s, `"tool_calls"`) {
+		t.Fatalf("request body missing tool call: %s", s)
+	}
+	if strings.Contains(s, `"index"`) {
+		t.Fatalf("request body contains response-only tool_call index: %s", s)
+	}
+}
+
+func TestBuildRequestOmitsEmptyToolDescriptionAndParameters(t *testing.T) {
+	c := &client{name: "x", model: "m", baseURL: "https://api.example.com/v1"}
+	req := provider.Request{
+		Tools: []provider.ToolSchema{{Name: "noargs"}},
+	}
+	body, err := json.Marshal(c.buildRequest(req))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Tools []struct {
+			Function map[string]json.RawMessage `json:"function"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal request: %v\n%s", err, body)
+	}
+	if len(wire.Tools) != 1 {
+		t.Fatalf("tools = %d, want 1: %s", len(wire.Tools), body)
+	}
+	fn := wire.Tools[0].Function
+	if string(fn["name"]) != `"noargs"` {
+		t.Fatalf("function name = %s, want noargs", fn["name"])
+	}
+	if _, ok := fn["description"]; ok {
+		t.Fatalf("empty description should be omitted: %s", body)
+	}
+	if _, ok := fn["parameters"]; ok {
+		t.Fatalf("nil parameters should be omitted: %s", body)
 	}
 }

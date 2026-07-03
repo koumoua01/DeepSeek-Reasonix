@@ -2,11 +2,14 @@ package hook
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
+
+	"reasonix/internal/pluginpkg"
 )
 
 func writeSettings(t *testing.T, dir, json string) {
@@ -16,6 +19,16 @@ func writeSettings(t *testing.T, dir, json string) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(d, SettingsFilename), []byte(json), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func writeHookTestFile(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -40,6 +53,121 @@ func TestLoadTrustGating(t *testing.T) {
 	}
 	if got[0].Scope != ScopeProject {
 		t.Errorf("project hooks should sort first, got %s", got[0].Scope)
+	}
+}
+
+func TestLoadPermissionRequestHook(t *testing.T) {
+	home := t.TempDir()
+	writeSettings(t, home, `{"hooks":{"PermissionRequest":[{"match":"bash","command":"notify"}]}}`)
+
+	got := Load(LoadOptions{HomeDir: home})
+	if len(got) != 1 {
+		t.Fatalf("hooks count = %d, want 1", len(got))
+	}
+	if got[0].Event != PermissionRequest || got[0].Match != "bash" || got[0].Command != "notify" {
+		t.Fatalf("loaded hook = %+v, want PermissionRequest/bash/notify", got[0])
+	}
+}
+
+func TestLoadIncludesPluginSessionStartHook(t *testing.T) {
+	home := t.TempDir()
+	reasonixHome := filepath.Join(home, ".reasonix")
+	root := filepath.Join(reasonixHome, "plugins", "superpowers")
+	writeSettings(t, home, `{"hooks":{"PostToolUse":[{"command":"echo global"}]}}`)
+	writeHookTestFile(t, filepath.Join(root, pluginpkg.CodexManifest), `{
+  "name": "superpowers",
+  "version": "6.1.0",
+  "skills": "./skills/"
+}`)
+	writeHookTestFile(t, filepath.Join(root, "hooks", "session-start-codex"), "#!/usr/bin/env bash\necho ok\n")
+	if err := pluginpkg.Upsert(reasonixHome, pluginpkg.InstalledPlugin{
+		Name:         "superpowers",
+		Root:         "plugins/superpowers",
+		Version:      "6.1.0",
+		ManifestKind: "codex",
+		Enabled:      true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	got := Load(LoadOptions{HomeDir: home, ProjectRoot: "/workspace", Trusted: true})
+	if len(got) != 2 {
+		t.Fatalf("hooks = %+v, want plugin + global", got)
+	}
+	if got[0].Scope != ScopePlugin || got[0].Event != SessionStart {
+		t.Fatalf("first hook = %+v, want plugin SessionStart", got[0])
+	}
+	if got[0].Env["REASONIX_PLUGIN_NAME"] != "superpowers" || got[0].Env["REASONIX_WORKSPACE_ROOT"] != "/workspace" {
+		t.Fatalf("plugin env = %#v", got[0].Env)
+	}
+	if got[1].Scope != ScopeGlobal {
+		t.Fatalf("second hook = %+v, want global", got[1])
+	}
+}
+
+func TestReasonixHomeOverridesGlobalHookPaths(t *testing.T) {
+	home := t.TempDir()
+	reasonixHome := filepath.Join(t.TempDir(), "rx-home")
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("REASONIX_HOME", reasonixHome)
+	if err := os.MkdirAll(reasonixHome, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(reasonixHome, SettingsFilename), []byte(`{"hooks":{"PostToolUse":[{"command":"echo rx"}]}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	writeSettings(t, home, `{"hooks":{"PostToolUse":[{"command":"echo old"}]}}`)
+
+	if got := GlobalSettingsPath(""); got != filepath.Join(reasonixHome, SettingsFilename) {
+		t.Fatalf("GlobalSettingsPath = %q, want Reasonix home", got)
+	}
+	if got := TrustPath(""); got != filepath.Join(reasonixHome, TrustFilename) {
+		t.Fatalf("TrustPath = %q, want Reasonix home", got)
+	}
+	hooks := Load(LoadOptions{})
+	if len(hooks) != 1 || hooks[0].Command != "echo rx" {
+		t.Fatalf("Load hooks = %+v, want Reasonix home hook only", hooks)
+	}
+}
+
+func TestReasonixHomeFallsBackToLegacyGlobalHooksAndTrust(t *testing.T) {
+	home := t.TempDir()
+	reasonixHome := filepath.Join(t.TempDir(), "rx-home")
+	proj := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("REASONIX_HOME", reasonixHome)
+	writeSettings(t, home, `{"hooks":{"PostToolUse":[{"command":"echo old"}]}}`)
+
+	hooks := Load(LoadOptions{})
+	if len(hooks) != 1 || hooks[0].Command != "echo old" {
+		t.Fatalf("Load hooks = %+v, want legacy global hook", hooks)
+	}
+	if hooks[0].Source != filepath.Join(home, SettingsDirname, SettingsFilename) {
+		t.Fatalf("legacy hook source = %q", hooks[0].Source)
+	}
+
+	absProj, err := filepath.Abs(proj)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := json.Marshal(trustFile{Projects: map[string]bool{absProj: true}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacyTrust := filepath.Join(home, SettingsDirname, TrustFilename)
+	if err := os.WriteFile(legacyTrust, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !IsTrusted(proj, "") {
+		t.Fatal("legacy trust should be honored when new trust.json is absent")
+	}
+	if err := Trust(proj, ""); err != nil {
+		t.Fatalf("Trust: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(reasonixHome, TrustFilename)); err != nil {
+		t.Fatalf("Trust should write current Reasonix home trust file: %v", err)
 	}
 }
 
@@ -81,6 +209,18 @@ func TestMatchesTool(t *testing.T) {
 	if MatchesTool(pre("["), "bash") {
 		t.Error("malformed regex should not fire")
 	}
+	perm := func(match string) ResolvedHook {
+		return ResolvedHook{HookConfig: HookConfig{Match: match}, Event: PermissionRequest}
+	}
+	if !MatchesTool(perm("bash"), "bash") {
+		t.Error(`PermissionRequest "bash" should match "bash"`)
+	}
+	if MatchesTool(perm("bash"), "read_file") {
+		t.Error(`PermissionRequest "bash" must not match "read_file"`)
+	}
+	if MatchesTool(perm("["), "bash") {
+		t.Error("malformed PermissionRequest regex should not fire")
+	}
 	// Non-tool events always match regardless of the match field.
 	prompt := ResolvedHook{HookConfig: HookConfig{Match: "bash"}, Event: UserPromptSubmit}
 	if !MatchesTool(prompt, "") {
@@ -98,8 +238,10 @@ func TestDecideOutcome(t *testing.T) {
 		{"pass", PreToolUse, SpawnResult{ExitCode: 0}, DecisionPass},
 		{"block-exit2", PreToolUse, SpawnResult{ExitCode: 2}, DecisionBlock},
 		{"exit2-nonblocking-warns", PostToolUse, SpawnResult{ExitCode: 2}, DecisionWarn},
+		{"permission-exit2-warns", PermissionRequest, SpawnResult{ExitCode: 2}, DecisionWarn},
 		{"other-nonzero-warns", PreToolUse, SpawnResult{ExitCode: 1}, DecisionWarn},
 		{"timeout-blocking", UserPromptSubmit, SpawnResult{TimedOut: true}, DecisionBlock},
+		{"permission-timeout-warns", PermissionRequest, SpawnResult{TimedOut: true}, DecisionWarn},
 		{"timeout-nonblocking", Stop, SpawnResult{TimedOut: true}, DecisionWarn},
 		{"spawn-error", PreToolUse, SpawnResult{SpawnErr: os.ErrNotExist}, DecisionError},
 	}
@@ -107,6 +249,46 @@ func TestDecideOutcome(t *testing.T) {
 		if got := decideOutcome(c.event, c.r); got != c.want {
 			t.Errorf("%s: decideOutcome = %s, want %s", c.name, got, c.want)
 		}
+	}
+}
+
+func TestParseOutputSessionStartJSONAdditionalContext(t *testing.T) {
+	out, warnings := ParseOutput(SessionStart, `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Load conventions."}}`)
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+	if out.AdditionalContext != "Load conventions." {
+		t.Fatalf("AdditionalContext = %q, want context", out.AdditionalContext)
+	}
+}
+
+func TestParseOutputSessionStartPlainText(t *testing.T) {
+	out, warnings := ParseOutput(SessionStart, "  Load workspace notes.  ")
+	if len(warnings) != 0 {
+		t.Fatalf("warnings = %v, want none", warnings)
+	}
+	if out.AdditionalContext != "Load workspace notes." {
+		t.Fatalf("AdditionalContext = %q, want plain text", out.AdditionalContext)
+	}
+}
+
+func TestParseOutputRejectsMismatchedEvent(t *testing.T) {
+	out, warnings := ParseOutput(SessionStart, `{"hookSpecificOutput":{"hookEventName":"Stop","additionalContext":"wrong"}}`)
+	if out.AdditionalContext != "" {
+		t.Fatalf("AdditionalContext = %q, want empty", out.AdditionalContext)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want one warning", warnings)
+	}
+}
+
+func TestParseOutputInvalidJSONWarns(t *testing.T) {
+	out, warnings := ParseOutput(SessionStart, `{"hookSpecificOutput":`)
+	if out.AdditionalContext != "" {
+		t.Fatalf("AdditionalContext = %q, want empty", out.AdditionalContext)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %v, want one warning", warnings)
 	}
 }
 
@@ -143,6 +325,23 @@ func TestRunFiltersByEventAndTool(t *testing.T) {
 	Run(context.Background(), Payload{Event: PreToolUse, ToolName: "bash"}, hooks, spawner)
 	if len(ran) != 1 || ran[0] != "a" {
 		t.Errorf("only the matching PreToolUse hook should run, got %v", ran)
+	}
+}
+
+func TestRunFiltersPermissionRequestByTool(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "a", Match: "bash"}, Event: PermissionRequest},
+		{HookConfig: HookConfig{Command: "b", Match: "read_file"}, Event: PermissionRequest},
+		{HookConfig: HookConfig{Command: "c"}, Event: Notification},
+	}
+	var ran []string
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		ran = append(ran, in.Command)
+		return SpawnResult{ExitCode: 0}
+	}
+	Run(context.Background(), Payload{Event: PermissionRequest, ToolName: "bash"}, hooks, spawner)
+	if len(ran) != 1 || ran[0] != "a" {
+		t.Errorf("only the matching PermissionRequest hook should run, got %v", ran)
 	}
 }
 

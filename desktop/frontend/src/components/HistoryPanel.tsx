@@ -2,12 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { Archive, Pencil, Search, Trash2, RotateCcw } from "lucide-react";
 import { t, useT } from "../lib/i18n";
-import { sessionActivityTime } from "../lib/session";
+import { historySessionDisplayTitle, sessionActivityTime } from "../lib/session";
 import type { HistoryMessage, SessionMeta } from "../lib/types";
 import { historyMessagesToItems, type Item } from "../lib/useController";
-import { Tooltip } from "./Tooltip";
 import { Transcript } from "./Transcript";
 import { ContextMenu, contextMenuPointFromEvent, type ContextMenuItem, type ContextMenuPoint } from "./ContextMenu";
+import { useDeferredClose } from "../lib/useMountTransition";
+import { ModalCloseButton } from "./ModalCloseButton";
 
 type HistoryScopeFilter = "all" | "project" | "global";
 type HistoryStatusFilter = "all" | "current" | "open";
@@ -43,6 +44,8 @@ export function HistoryPanel({
 }) {
   const tr = useT();
   const isTrash = kind === "trash";
+  // Play the modal exit animation, then let the parent unmount us.
+  const { status, requestClose } = useDeferredClose(onClose, 240);
   const [editing, setEditing] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [query, setQuery] = useState("");
@@ -80,7 +83,7 @@ export function HistoryPanel({
       setEditing(null);
       setPreview({
         path: s.path,
-        title: sessionDisplayTitle(s, tr("history.emptySession")),
+        title: historySessionDisplayTitle(s, tr("history.emptySession")),
         meta: sessionMetaLine(s, tr, isTrash),
         messages: [],
         loading: true,
@@ -175,7 +178,6 @@ export function HistoryPanel({
   }, [filteredSessions, loadPreview, preview]);
 
   const previewItems = useMemo(() => previewMessagesToItems(preview?.messages ?? []), [preview?.messages]);
-  const showPreview = preview !== null;
   const selectedSession = useMemo(
     () => (preview ? filteredSessions.find((s) => s.path === preview.path) ?? null : null),
     [filteredSessions, preview],
@@ -341,9 +343,10 @@ export function HistoryPanel({
   };
 
   return (
-    <div className="management-modal-backdrop history-modal-backdrop" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+    <div className="management-modal-backdrop history-modal-backdrop" data-state={status} onClick={(e) => { if (e.target === e.currentTarget) requestClose(); }}>
       <section
-        className={`management-modal history-modal${showPreview || running ? " history-modal--wide" : ""}`}
+        className="management-modal history-modal"
+        data-state={status}
         aria-label={tr(isTrash ? "history.trashTitle" : "history.title")}
         onClick={(e) => e.stopPropagation()}
       >
@@ -362,11 +365,7 @@ export function HistoryPanel({
               {tr(actionConfirmClearTrash ? "history.confirmClearTrash" : "history.clearTrash")}
             </button>
           )}
-          <Tooltip label={tr("common.close")}>
-            <button className="chip" onClick={onClose}>
-              ✕
-            </button>
-          </Tooltip>
+          <ModalCloseButton label={tr("common.close")} onClick={requestClose} />
         </div>
       </header>
 
@@ -428,7 +427,10 @@ export function HistoryPanel({
             ) : (
               groups.map((g) => (
                 <section className="mem-section" key={g.label}>
-                  <div className="mem-section__title">{g.label}</div>
+                  <div className="mem-section__title hist-group__title">
+                    <span>{g.label}</span>
+                    <span className="hist-group__count">{g.items.length}</span>
+                  </div>
                   {g.items.map((s) => {
                     const selected = preview?.path === s.path;
                     return (
@@ -462,24 +464,21 @@ export function HistoryPanel({
                               if (!isTrash && !running) onResume(s);
                             }}
                           >
-                            <div className="hist-item__preview">{sessionDisplayTitle(s, tr("history.emptySession"))}</div>
+                            <div className="hist-item__preview">{historySessionDisplayTitle(s, tr("history.emptySession"))}</div>
                             <div className="hist-item__meta">
+                              {!isTrash && isChannelSession(s) && <span className="hist-item__badge hist-item__badge--open">{tr("history.channel")}</span>}
+                              {!isTrash && s.current && <span className="hist-item__badge hist-item__badge--current">{tr("history.current")}</span>}
+                              {!isTrash && !s.current && s.open && <span className="hist-item__badge hist-item__badge--open">{tr("history.open")}</span>}
+                              {isTrash && <span className="hist-item__badge hist-item__badge--deleted">{tr("history.deleted")}</span>}
                               {sessionLocation(s, tr) && <span className="hist-item__scope">{sessionLocation(s, tr)}</span>}
-                              {!isTrash && s.current && <span className="hist-item__badge">{tr("history.current")}</span>}
-                              {!isTrash && !s.current && s.open && <span className="hist-item__badge">{tr("history.open")}</span>}
-                              <span>{tr(s.turns === 1 ? "history.turnOne" : "history.turnOther", { n: s.turns })}</span>
-                              <span>·</span>
-                              <span>{timeLabel(isTrash ? s.deletedAt || sessionActivityTime(s) : sessionActivityTime(s))}</span>
-                              {isTrash && s.deletedAt && (
-                                <>
-                                  <span>·</span>
-                                  <span>{tr("history.deleted")}</span>
-                                </>
-                              )}
+                              <span className="hist-item__metaspacer" />
+                              <span className="hist-item__stat">{tr(s.turns === 1 ? "history.turnOne" : "history.turnOther", { n: s.turns })}</span>
+                              <span className="hist-item__dot">·</span>
+                              <span className="hist-item__stat">{timeLabel(isTrash ? s.deletedAt || sessionActivityTime(s) : sessionActivityTime(s))}</span>
                               {!isTrash && running && (
                                 <>
-                                  <span>·</span>
-                                  <span>{tr("history.preview")}</span>
+                                  <span className="hist-item__dot">·</span>
+                                  <span className="hist-item__stat">{tr("history.preview")}</span>
                                 </>
                               )}
                             </div>
@@ -600,8 +599,14 @@ function sessionScope(s: SessionMeta): "project" | "global" {
   return s.scope === "project" ? "project" : "global";
 }
 
+function isChannelSession(s: SessionMeta): boolean {
+  return s.kind === "channel" || s.sessionSource === "auto";
+}
+
 function sessionLocation(s: SessionMeta, tr: ReturnType<typeof useT>): string {
-  if (s.topicTitle) return s.topicTitle;
+  if (isChannelSession(s)) {
+    return [s.channelLabel || s.channel || tr("history.channel"), s.remoteId].filter(Boolean).join(" · ");
+  }
   if (s.workspaceRoot) {
     const parts = s.workspaceRoot.split(/[\\/]/).filter(Boolean);
     return parts[parts.length - 1] || s.workspaceRoot;
@@ -609,14 +614,11 @@ function sessionLocation(s: SessionMeta, tr: ReturnType<typeof useT>): string {
   return sessionScope(s) === "project" ? tr("history.filterProject") : tr("history.filterGlobal");
 }
 
-function sessionDisplayTitle(s: SessionMeta, fallback: string): string {
-  return s.title || s.preview || fallback;
-}
-
 function sessionMetaLine(s: SessionMeta, tr: ReturnType<typeof useT>, isTrash = false): string {
   const time = timeLabel(isTrash ? s.deletedAt || sessionActivityTime(s) : sessionActivityTime(s));
   const suffix = isTrash && s.deletedAt ? ` · ${tr("history.deleted")}` : "";
-  return `${tr(s.turns === 1 ? "history.turnOne" : "history.turnOther", { n: s.turns })} · ${time}${suffix}`;
+  const prefix = isChannelSession(s) ? `${tr("history.channelReadOnly")} · ` : "";
+  return `${prefix}${tr(s.turns === 1 ? "history.turnOne" : "history.turnOther", { n: s.turns })} · ${time}${suffix}`;
 }
 
 function previewMessagesToItems(messages: HistoryMessage[]): Item[] {
@@ -636,15 +638,20 @@ function HistoryFilterSelect({
 }) {
   const visibleOptions = options.filter((option) => option.id === "all" || option.id === value || option.count > 0);
   return (
-    <label className="history-filter-select">
-      <span>{label}</span>
-      <select value={value} onChange={(event) => onChange(event.target.value)}>
-        {visibleOptions.map((option) => (
-          <option key={option.id} value={option.id} disabled={option.id !== "all" && option.count === 0}>
-            {option.label} ({option.count})
-          </option>
-        ))}
-      </select>
-    </label>
+    <div className="history-filter" role="group" aria-label={label}>
+      {visibleOptions.map((option) => (
+        <button
+          key={option.id}
+          type="button"
+          className={`history-filter__pill${value === option.id ? " history-filter__pill--on" : ""}`}
+          aria-pressed={value === option.id}
+          disabled={option.id !== "all" && option.count === 0}
+          onClick={() => onChange(option.id)}
+        >
+          {option.label}
+          <span className="history-filter__count">{option.count}</span>
+        </button>
+      ))}
+    </div>
   );
 }

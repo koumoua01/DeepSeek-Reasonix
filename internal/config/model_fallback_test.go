@@ -7,14 +7,12 @@ import (
 
 func testModelFallbackConfig(t *testing.T) *Config {
 	t.Helper()
-	t.Setenv("REASONIX_TEST_KEY", "sk-test")
-	t.Setenv("REASONIX_TEST_EMPTY", "")
 
 	c := Default()
 	c.DefaultModel = "prov-a"
 	c.Providers = []ProviderEntry{
-		{Name: "prov-a", Kind: "openai", BaseURL: "https://a.example.com", Model: "model-a1", Models: []string{"model-a1", "model-a2"}, APIKeyEnv: "REASONIX_TEST_KEY"},
-		{Name: "prov-b", Kind: "openai", BaseURL: "https://b.example.com", Model: "model-b1", Models: []string{"model-b1", "model-b2"}, APIKeyEnv: "REASONIX_TEST_KEY"},
+		{Name: "prov-a", Kind: "openai", BaseURL: "https://a.example.com", Model: "model-a1", Models: []string{"model-a1", "model-a2"}, APIKeyEnv: "REASONIX_TEST_KEY", resolvedAPIKey: "sk-test"},
+		{Name: "prov-b", Kind: "openai", BaseURL: "https://b.example.com", Model: "model-b1", Models: []string{"model-b1", "model-b2"}, APIKeyEnv: "REASONIX_TEST_KEY", resolvedAPIKey: "sk-test"},
 		{Name: "prov-nokey", Kind: "openai", BaseURL: "https://nk.example.com", Model: "model-nk", APIKeyEnv: "REASONIX_TEST_EMPTY"},
 	}
 	return c
@@ -58,6 +56,7 @@ func TestResolveModelWithFallbackSkipsKeylessProvider(t *testing.T) {
 	// configured provider, rather than booting a tab onto a provider with no API
 	// key (which just fails on first use).
 	c.Providers[0].APIKeyEnv = "REASONIX_TEST_EMPTY"
+	c.Providers[0].resolvedAPIKey = ""
 
 	got, fallback, ok := c.ResolveModelWithFallback("")
 	if !ok || !fallback {
@@ -65,6 +64,46 @@ func TestResolveModelWithFallbackSkipsKeylessProvider(t *testing.T) {
 	}
 	if got != "prov-b/model-b1" {
 		t.Errorf("fallback = %q, want prov-b/model-b1 (prov-a is keyless and must be skipped)", got)
+	}
+}
+
+// TestResolveModelWithFallbackHonorsDefaultModel verifies that when the ref is
+// stale or empty, the function tries c.DefaultModel before iterating providers
+// in order. Without this, the first provider (deepseek, by default) always wins
+// even when the user has configured a different default_model (#3801).
+func TestResolveModelWithFallbackHonorsDefaultModel(t *testing.T) {
+	c := testModelFallbackConfig(t)
+	// Set DefaultModel to prov-b (not the first provider). An empty/stale ref
+	// should fall back to prov-b, not prov-a.
+	c.DefaultModel = "prov-b"
+
+	// Empty ref → must use DefaultModel = prov-b
+	got, fallback, ok := c.ResolveModelWithFallback("")
+	if !ok || !fallback {
+		t.Fatalf("ResolveModelWithFallback(\"\") = (%q, %v, %v), want fallback to prov-b", got, fallback, ok)
+	}
+	if got != "prov-b/model-b1" {
+		t.Errorf("empty ref fallback = %q, want prov-b/model-b1 (DefaultModel)", got)
+	}
+
+	// Stale ref → same: must use DefaultModel
+	got, fallback, ok = c.ResolveModelWithFallback("deleted/model")
+	if !ok || !fallback {
+		t.Fatalf("ResolveModelWithFallback(\"deleted/model\") = (%q, %v, %v), want fallback", got, fallback, ok)
+	}
+	if got != "prov-b/model-b1" {
+		t.Errorf("stale ref fallback = %q, want prov-b/model-b1 (DefaultModel)", got)
+	}
+
+	// DefaultModel pointing to a keyless provider must be skipped
+	c.Providers[1].APIKeyEnv = "REASONIX_TEST_EMPTY" // prov-b, the DefaultModel
+	c.Providers[1].resolvedAPIKey = ""
+	got, fallback, ok = c.ResolveModelWithFallback("stale/ref")
+	if !ok || !fallback {
+		t.Fatalf("keyless DefaultModel fallback = (%q, %v, %v), want next configured", got, fallback, ok)
+	}
+	if got != "prov-a/model-a1" {
+		t.Errorf("keyless DefaultModel fallback = %q, want prov-a/model-a1 (only configured left)", got)
 	}
 }
 
@@ -124,6 +163,7 @@ func TestRemoveProviderBlocksDefaultWithoutFallback(t *testing.T) {
 	c := testModelFallbackConfig(t)
 	c.DefaultModel = "prov-a/model-a1"
 	c.Providers[1].APIKeyEnv = "REASONIX_TEST_EMPTY"
+	c.Providers[1].resolvedAPIKey = ""
 
 	err := c.RemoveProvider("prov-a")
 	if err == nil {
@@ -144,6 +184,7 @@ func TestRemoveProviderClearsOptionalRefsWithoutFallback(t *testing.T) {
 	c.Agent.SubagentModel = "prov-a"
 	c.Agent.SubagentModels = map[string]string{"review": "prov-a/model-a2"}
 	c.Providers[1].APIKeyEnv = "REASONIX_TEST_EMPTY"
+	c.Providers[1].resolvedAPIKey = ""
 
 	if err := c.RemoveProvider("prov-a"); err != nil {
 		t.Fatalf("RemoveProvider: %v", err)

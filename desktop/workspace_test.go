@@ -1,17 +1,22 @@
 package main
 
 import (
+	"encoding/json"
 	"mime"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"reasonix/internal/checkpoint"
+	"reasonix/internal/config"
+	"reasonix/internal/control"
 )
 
 // --- workspaceStatePath ---
@@ -64,6 +69,188 @@ func TestSaveWorkspaceOnlyRemembersLastWorkspace(t *testing.T) {
 	}
 }
 
+func TestDesktopMCPMigrationRootsIncludesLegacyWorkspaces(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	active := t.TempDir()
+	legacy := t.TempDir()
+	tabRoot := t.TempDir()
+	projectRoot := t.TempDir()
+
+	saveWorkspace(active)
+	if err := os.MkdirAll(filepath.Dir(workspaceListPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal([]string{legacy, active, legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workspaceListPath(), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: projectRoot}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := desktopMCPMigrationRoots(desktopTabsFile{
+		Tabs: []desktopTabEntry{{Scope: "project", WorkspaceRoot: tabRoot}},
+	})
+	want := []string{
+		normalizeProjectRoot(active),
+		normalizeProjectRoot(legacy),
+		normalizeProjectRoot(tabRoot),
+		normalizeProjectRoot(projectRoot),
+	}
+	if len(roots) != len(want) {
+		t.Fatalf("roots len = %d, want %d: %+v", len(roots), len(want), roots)
+	}
+	for i, root := range want {
+		if roots[i] != root {
+			t.Fatalf("roots[%d] = %q, want %q; roots=%+v", i, roots[i], root, roots)
+		}
+	}
+}
+
+func TestRecoverLegacyProjectSidebarRootsPreservesUpgradeProjects(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	existing := t.TempDir()
+	active := t.TempDir()
+	legacy := t.TempDir()
+	tabRoot := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: existing, Title: "Existing"}}}); err != nil {
+		t.Fatal(err)
+	}
+	saveWorkspace(active)
+	if err := os.MkdirAll(filepath.Dir(workspaceListPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal([]string{legacy, active, missing, legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workspaceListPath(), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tabs := desktopTabsFile{
+		Tabs: []desktopTabEntry{
+			{Scope: "project", WorkspaceRoot: tabRoot},
+			{Scope: "project", WorkspaceRoot: missing},
+			{Scope: "global"},
+		},
+	}
+	changed, err := recoverLegacyProjectSidebarRoots(tabs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("recoverLegacyProjectSidebarRoots should add missing legacy projects")
+	}
+
+	projects := loadProjectsFile().Projects
+	want := []string{
+		normalizeProjectRoot(existing),
+		normalizeProjectRoot(active),
+		normalizeProjectRoot(legacy),
+		normalizeProjectRoot(tabRoot),
+	}
+	if len(projects) != len(want) {
+		t.Fatalf("project count = %d, want %d: %+v", len(projects), len(want), projects)
+	}
+	for i, root := range want {
+		if projects[i].Root != root {
+			t.Fatalf("projects[%d].Root = %q, want %q; projects=%+v", i, projects[i].Root, root, projects)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(desktopConfigDir(), legacyProjectSidebarRecoveryMarker)); err != nil {
+		t.Fatalf("recovery marker was not written: %v", err)
+	}
+
+	if err := removeProject(legacy); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = recoverLegacyProjectSidebarRoots(tabs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("recovery should be one-shot after the marker is written")
+	}
+	for _, project := range loadProjectsFile().Projects {
+		if project.Root == normalizeProjectRoot(legacy) {
+			t.Fatalf("removed legacy project was restored after marker: %+v", loadProjectsFile().Projects)
+		}
+		if project.Root == normalizeProjectRoot(missing) {
+			t.Fatalf("missing legacy project should not be restored: %+v", loadProjectsFile().Projects)
+		}
+	}
+}
+
+func TestProjectFileUpdatesSerializeReadModifyWrite(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	active := t.TempDir()
+	added := t.TempDir()
+
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: active, Title: "Active"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	updateErr := make(chan error, 1)
+	go func() {
+		updateErr <- updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+			close(entered)
+			<-release
+			for i, project := range f.Projects {
+				if project.Root == normalizeProjectRoot(active) {
+					f.Projects[i].Title = "Active edited"
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+	}()
+	<-entered
+
+	addErr := make(chan error, 1)
+	go func() {
+		addErr <- addProject(added, "Added")
+	}()
+	select {
+	case err := <-addErr:
+		t.Fatalf("addProject completed while another project update was in progress: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(release)
+	if err := <-updateErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-addErr; err != nil {
+		t.Fatal(err)
+	}
+
+	projects := loadProjectsFile().Projects
+	if len(projects) != 2 {
+		t.Fatalf("project count = %d, want 2: %+v", len(projects), projects)
+	}
+	if projects[0].Root != normalizeProjectRoot(active) || projects[0].Title != "Active edited" {
+		t.Fatalf("active project was not preserved with edited title: %+v", projects)
+	}
+	if projects[1].Root != normalizeProjectRoot(added) || projects[1].Title != "Added" {
+		t.Fatalf("concurrent project add was lost: %+v", projects)
+	}
+
+	if err := addProject(active, ""); err != nil {
+		t.Fatal(err)
+	}
+	projects = loadProjectsFile().Projects
+	if len(projects) != 2 || projects[1].Root != normalizeProjectRoot(added) {
+		t.Fatalf("no-op addProject overwrote the added project: %+v", projects)
+	}
+}
+
 func TestDialogDefaultDirectoryFallsBackFromMissingWorkspace(t *testing.T) {
 	parent := t.TempDir()
 	missing := filepath.Join(parent, "deleted", "project")
@@ -82,6 +269,50 @@ func TestDialogDefaultDirectoryUsesFileParent(t *testing.T) {
 
 	if got := dialogDefaultDirectory(file); got != dir {
 		t.Fatalf("dialogDefaultDirectory(file) = %q, want %q", got, dir)
+	}
+}
+
+func TestDesktopSessionDirIsScopedByWorkspace(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("USERPROFILE", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+
+	rootA := filepath.Join(t.TempDir(), "project-a")
+	rootB := filepath.Join(t.TempDir(), "project-b")
+	if err := os.MkdirAll(rootA, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(rootB, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	dirA := desktopSessionDir(rootA)
+	dirB := desktopSessionDir(rootB)
+	if dirA == "" || dirB == "" {
+		t.Fatalf("desktop session dirs should resolve: A=%q B=%q", dirA, dirB)
+	}
+	if dirA == dirB {
+		t.Fatalf("different workspaces must not share a desktop session dir: %q", dirA)
+	}
+	if dirA == config.SessionDir() || dirB == config.SessionDir() {
+		t.Fatalf("desktop workspace sessions should not use the global CLI session dir: A=%q B=%q global=%q", dirA, dirB, config.SessionDir())
+	}
+	wantPrefix := filepath.Join(config.MemoryUserDir(), "projects") + string(filepath.Separator)
+	if !strings.HasPrefix(dirA, wantPrefix) || filepath.Base(dirA) != "sessions" {
+		t.Fatalf("workspace session dir should live under the project state tree, got %q", dirA)
+	}
+}
+
+func BenchmarkDesktopSessionDir(b *testing.B) {
+	root := filepath.Join(b.TempDir(), "project")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		if desktopSessionDir(root) == "" {
+			b.Fatal("empty session dir")
+		}
 	}
 }
 
@@ -265,14 +496,21 @@ func TestMediaTokenHandlerEscapedFilename(t *testing.T) {
 	}
 
 	name := `weird "file" name.png`
+	rawURLChars := []string{" ", `"`}
+	if runtime.GOOS == "windows" {
+		name = "weird #file name.png"
+		rawURLChars = []string{" ", "#"}
+	}
 	if err := os.WriteFile(name, []byte("png"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	app := NewApp()
 	preview := app.ReadFile(name)
-	if strings.Contains(preview.URL, " ") || strings.Contains(preview.URL, `"`) {
-		t.Fatalf("media URL should path-escape filename, got %q", preview.URL)
+	for _, raw := range rawURLChars {
+		if strings.Contains(preview.URL, raw) {
+			t.Fatalf("media URL should path-escape %q in filename, got %q", raw, preview.URL)
+		}
 	}
 
 	handler := app.workspaceMediaMiddleware()(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -682,12 +920,63 @@ func TestWorkspaceChangesNonGitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if got.GitAvailable {
 		t.Fatal("non-git directory should mark git unavailable")
 	}
 	if len(got.Files) != 0 {
 		t.Fatalf("files = %+v, want none", got.Files)
+	}
+}
+
+func TestWorkspaceChangesUsesRequestedTabCheckpoints(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDir := t.TempDir()
+	sessionA := filepath.Join(sessionDir, "a.jsonl")
+	sessionB := filepath.Join(sessionDir, "b.jsonl")
+	content := "old"
+	now := time.Now()
+
+	for _, tc := range []struct {
+		session string
+		path    string
+		prompt  string
+	}{
+		{sessionA, "a.txt", "edit a"},
+		{sessionB, "b.txt", "edit b"},
+	} {
+		ckptDir := strings.TrimSuffix(tc.session, ".jsonl") + ".ckpt"
+		if err := os.MkdirAll(ckptDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seedCheckpoint(t, ckptDir, checkpoint.Checkpoint{
+			Turn:   0,
+			Time:   now,
+			Prompt: tc.prompt,
+			Files:  []checkpoint.FileSnap{{Path: tc.path, Content: &content}},
+		})
+	}
+
+	ctrlA := control.New(control.Options{SessionDir: sessionDir, SessionPath: sessionA, Label: "a"})
+	ctrlB := control.New(control.Options{SessionDir: sessionDir, SessionPath: sessionB, Label: "b"})
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"a": {ID: "a", Scope: "project", WorkspaceRoot: workspace, Ctrl: ctrlA, Ready: true},
+			"b": {ID: "b", Scope: "project", WorkspaceRoot: workspace, Ctrl: ctrlB, Ready: true},
+		},
+		activeTabID: "a",
+	}
+
+	got := app.WorkspaceChanges("b")
+	byPath := map[string]WorkspaceChangeView{}
+	for _, file := range got.Files {
+		byPath[file.Path] = file
+	}
+	if _, ok := byPath["a.txt"]; ok {
+		t.Fatalf("requested tab b included active tab a changes: %+v", got.Files)
+	}
+	if byPath["b.txt"].LatestPrompt != "edit b" {
+		t.Fatalf("requested tab b changes = %+v, want b.txt from tab b", got.Files)
 	}
 }
 
@@ -715,7 +1004,7 @@ func TestWorkspaceChangesGitStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -766,7 +1055,7 @@ func TestWorkspaceChangesGitStatusFromRepoSubdirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -807,7 +1096,7 @@ func TestWorkspaceChangesUntrackedDirectoryListsFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	byPath := map[string]WorkspaceChangeView{}
 	for _, file := range got.Files {
 		byPath[file.Path] = file
@@ -842,7 +1131,7 @@ func TestWorkspaceChangesGitBranchDetachedHead(t *testing.T) {
 	short := gitOutput(t, "rev-parse", "--short", "HEAD")
 	runGit(t, "checkout", "--detach", "HEAD")
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -880,7 +1169,7 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	runGit(t, "commit", "-m", "init file2")
 
 	app := &App{}
-	history, err := app.WorkspaceGitHistory("")
+	history, err := app.WorkspaceGitHistory("", "")
 	if err != nil {
 		t.Fatalf("WorkspaceGitHistory err = %v", err)
 	}
@@ -895,7 +1184,7 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	}
 
 	// Test history for specific file
-	history, err = app.WorkspaceGitHistory("file1.txt")
+	history, err = app.WorkspaceGitHistory("", "file1.txt")
 	if err != nil {
 		t.Fatalf("WorkspaceGitHistory err = %v", err)
 	}
@@ -904,6 +1193,52 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	}
 	if history[0].Message != "init file1" {
 		t.Errorf("expected commit message 'init file1', got %q", history[0].Message)
+	}
+}
+
+func TestWorkspaceGitHistoryUsesRequestedTabWorkspace(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	makeRepo := func(name, message string) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(dir); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, "init")
+		runGit(t, "config", "user.email", "test@example.com")
+		runGit(t, "config", "user.name", "Test User")
+		if err := os.WriteFile("file.txt", []byte(message+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, "add", "file.txt")
+		runGit(t, "commit", "-m", message)
+		return dir
+	}
+
+	repoA := makeRepo("a", "repo a commit")
+	repoB := makeRepo("b", "repo b commit")
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"a": {ID: "a", Scope: "project", WorkspaceRoot: repoA, Ready: true},
+			"b": {ID: "b", Scope: "project", WorkspaceRoot: repoB, Ready: true},
+		},
+		activeTabID: "a",
+	}
+
+	history, err := app.WorkspaceGitHistory("b", "")
+	if err != nil {
+		t.Fatalf("WorkspaceGitHistory err = %v", err)
+	}
+	if len(history) != 1 || history[0].Message != "repo b commit" {
+		t.Fatalf("history for requested tab = %+v, want repo b commit", history)
 	}
 }
 
@@ -940,7 +1275,7 @@ func TestWorkspaceGitCommitDetail(t *testing.T) {
 	app := &App{}
 
 	// Test project level detail
-	detail, err := app.WorkspaceGitCommitDetail(hash, "")
+	detail, err := app.WorkspaceGitCommitDetail("", hash, "")
 	if err != nil {
 		t.Fatalf("WorkspaceGitCommitDetail err = %v", err)
 	}
@@ -952,7 +1287,7 @@ func TestWorkspaceGitCommitDetail(t *testing.T) {
 	}
 
 	// Test file level detail
-	detail, err = app.WorkspaceGitCommitDetail(hash, "file1.txt")
+	detail, err = app.WorkspaceGitCommitDetail("", hash, "file1.txt")
 	if err != nil {
 		t.Fatalf("WorkspaceGitCommitDetail err = %v", err)
 	}
