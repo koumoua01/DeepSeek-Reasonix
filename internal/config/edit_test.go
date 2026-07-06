@@ -538,17 +538,18 @@ func TestSetReasoningLanguage(t *testing.T) {
 func TestNormalizeEffortDeepSeek(t *testing.T) {
 	e := &ProviderEntry{Name: "deepseek", Kind: "openai", BaseURL: "https://api.deepseek.com", Model: "deepseek-v4"}
 	cap := EffortCapabilityForEntry(e)
-	if !cap.Supported || len(cap.Levels) != 3 || cap.Levels[0] != "auto" || cap.Levels[1] != "high" || cap.Levels[2] != "max" {
-		t.Fatalf("DeepSeek levels = %+v, want auto/high/max", cap)
+	if !cap.Supported || len(cap.Levels) != 4 || cap.Levels[0] != "auto" || cap.Levels[1] != "disabled" || cap.Levels[2] != "high" || cap.Levels[3] != "max" {
+		t.Fatalf("DeepSeek levels = %+v, want auto/disabled/high/max", cap)
 	}
-	for in, want := range map[string]string{"auto": "", "high": "high", "max": "max", "low": "high", "medium": "high", "xhigh": "max"} {
+	for in, want := range map[string]string{"auto": "", "disabled": "disabled", "high": "high", "max": "max", "low": "high", "medium": "high", "xhigh": "max"} {
 		got, err := NormalizeEffort(e, in)
 		if err != nil || got != want {
 			t.Fatalf("NormalizeEffort(%q) = %q/%v, want %q/nil", in, got, err, want)
 		}
 	}
-	if _, err := NormalizeEffort(e, "off"); err == nil {
-		t.Fatal("DeepSeek /effort must reject off")
+	// "off" is the retired DeepSeek "no thinking" spelling — now maps to disabled.
+	if got, err := NormalizeEffort(e, "off"); err != nil || got != "disabled" {
+		t.Fatalf("NormalizeEffort(\"off\") = %q/%v, want \"disabled\"/nil", got, err)
 	}
 }
 
@@ -685,6 +686,50 @@ func TestEffectiveVisionUsesPerModelVisionList(t *testing.T) {
 	textOnly.Vision = true
 	if !EffectiveVision(textOnly) {
 		t.Fatalf("provider-level vision=true should still enable every selected model")
+	}
+}
+
+func TestResolveModelAppliesModelOverrides(t *testing.T) {
+	visionOff := false
+	c := &Config{Providers: []ProviderEntry{{
+		Name:              "gateway",
+		Kind:              "openai",
+		BaseURL:           "https://proxy.example.com/v1",
+		Models:            []string{"deepseek-v4-flash", "plain-chat"},
+		Default:           "plain-chat",
+		ReasoningProtocol: ReasoningProtocolOpenAI,
+		SupportedEfforts:  []string{"low", "medium", "high"},
+		ModelOverrides: map[string]ProviderModelOverride{
+			"deepseek-v4-flash": {
+				ReasoningProtocol: ReasoningProtocolDeepSeek,
+				SupportedEfforts:  []string{"high", "max"},
+				DefaultEffort:     "max",
+				Vision:            &visionOff,
+			},
+		},
+	}}}
+
+	deepseek, ok := c.ResolveModel("gateway/deepseek-v4-flash")
+	if !ok {
+		t.Fatal("ResolveModel did not find gateway/deepseek-v4-flash")
+	}
+	if protocol := ReasoningProtocolForEntry(deepseek); protocol != ReasoningProtocolDeepSeek {
+		t.Fatalf("deepseek protocol = %q, want deepseek", protocol)
+	}
+	cap := EffortCapabilityForEntry(deepseek)
+	if cap.Default != "max" || !containsString(cap.Levels, "max") || containsString(cap.Levels, "low") {
+		t.Fatalf("deepseek effort capability = %+v, want high|max default max", cap)
+	}
+	if EffectiveVision(deepseek) {
+		t.Fatalf("vision override false should disable image input")
+	}
+
+	plain, ok := c.ResolveModel("gateway/plain-chat")
+	if !ok {
+		t.Fatal("ResolveModel did not find gateway/plain-chat")
+	}
+	if protocol := ReasoningProtocolForEntry(plain); protocol != ReasoningProtocolOpenAI {
+		t.Fatalf("plain protocol = %q, want provider-level openai", protocol)
 	}
 }
 
@@ -1489,7 +1534,7 @@ func TestEffortCapabilityUsesKnownModelRegistry(t *testing.T) {
 	if !cap.Supported {
 		t.Fatalf("deepseek model behind proxy should expose effort, got %+v", cap)
 	}
-	wantLevels := []string{"auto", "high", "max"}
+	wantLevels := []string{"auto", "disabled", "high", "max"}
 	if len(cap.Levels) != len(wantLevels) {
 		t.Fatalf("levels = %v, want %v", cap.Levels, wantLevels)
 	}

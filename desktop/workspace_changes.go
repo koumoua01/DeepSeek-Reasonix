@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"reasonix/internal/control"
@@ -25,6 +26,18 @@ type workspaceChangeAccumulator struct {
 	hasSession bool
 	hasGit     bool
 }
+
+const workspaceGitBranchCacheTTL = 2 * time.Second
+
+type workspaceGitBranchCacheEntry struct {
+	branch  string
+	expires time.Time
+}
+
+var workspaceGitBranchCache = struct {
+	sync.Mutex
+	entries map[string]workspaceGitBranchCacheEntry
+}{entries: map[string]workspaceGitBranchCacheEntry{}}
 
 func (a *App) WorkspaceChanges(tabID string) WorkspaceChangesView {
 	out := WorkspaceChangesView{Files: []WorkspaceChangeView{}, GitAvailable: true}
@@ -149,6 +162,12 @@ func workspaceGitCommand(ctx context.Context, args ...string) *exec.Cmd {
 	return cmd
 }
 
+func workspaceGitOutputWithTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return workspaceGitCommand(ctx, args...).Output()
+}
+
 func workspaceGitStatus(base string) ([]gitStatusEntry, error) {
 	cmd := workspaceGit("-C", base, "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	raw, err := cmd.Output()
@@ -225,15 +244,40 @@ func workspaceRelPathFromGitStatus(repoRoot, base, path string) string {
 	return normalizeWorkspaceRelPath(base, path)
 }
 
+// workspaceGitBranchForMeta is the cached variant used by high-frequency UI
+// metadata refreshes. Workflows that need an immediate git read, such as
+// WorkspaceChanges, should call workspaceGitBranch directly.
+func workspaceGitBranchForMeta(base string) string {
+	key := filepath.Clean(base)
+	now := time.Now()
+	workspaceGitBranchCache.Lock()
+	if cached, ok := workspaceGitBranchCache.entries[key]; ok && now.Before(cached.expires) {
+		workspaceGitBranchCache.Unlock()
+		return cached.branch
+	}
+	workspaceGitBranchCache.Unlock()
+
+	branch := workspaceGitBranch(base)
+
+	storeNow := time.Now()
+	workspaceGitBranchCache.Lock()
+	if len(workspaceGitBranchCache.entries) > 256 {
+		for k, cached := range workspaceGitBranchCache.entries {
+			if storeNow.After(cached.expires) {
+				delete(workspaceGitBranchCache.entries, k)
+			}
+		}
+	}
+	workspaceGitBranchCache.entries[key] = workspaceGitBranchCacheEntry{branch: branch, expires: storeNow.Add(workspaceGitBranchCacheTTL)}
+	workspaceGitBranchCache.Unlock()
+	return branch
+}
+
 // workspaceGitBranch returns the current git branch name for the repo rooted
 // at base, or an empty string when base is not inside a git repository or when
 // git is unavailable.
 func workspaceGitBranch(base string) string {
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	cmd := workspaceGitCommand(ctx, "-C", base, "branch", "--show-current")
-	raw, err := cmd.Output()
+	raw, err := workspaceGitOutputWithTimeout(2*time.Second, "-C", base, "branch", "--show-current")
 	if err != nil {
 		return ""
 	}
@@ -241,8 +285,7 @@ func workspaceGitBranch(base string) string {
 		return branch
 	}
 
-	headCmd := workspaceGitCommand(ctx, "-C", base, "rev-parse", "--short", "HEAD")
-	raw, err = headCmd.Output()
+	raw, err = workspaceGitOutputWithTimeout(2*time.Second, "-C", base, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return ""
 	}

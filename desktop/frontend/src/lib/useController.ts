@@ -168,6 +168,7 @@ type RuntimeMetaSnapshot = {
   running: boolean;
   pendingPrompt?: boolean;
   backgroundJobs?: number;
+  cancelRequested?: boolean;
   cancellable?: boolean;
 };
 
@@ -353,6 +354,18 @@ type Action =
   | { type: "clearApproval" }
   | { type: "clearAsk" }
   | { type: "reset" };
+
+function backendStatusFromRuntimeMeta(meta: RuntimeMetaSnapshot): Extract<Action, { type: "backend_status" }> {
+  const foregroundRunning = foregroundRunningFromRuntimeMeta(meta);
+  return {
+    type: "backend_status",
+    running: foregroundRunning,
+    pendingPrompt: Boolean(meta.pendingPrompt),
+    backgroundJobs: meta.backgroundJobs ?? 0,
+    cancelRequested: Boolean(meta.cancelRequested),
+    cancellable: foregroundRunning,
+  };
+}
 
 // ---- reducer helpers (unchanged logic) ----
 
@@ -940,6 +953,27 @@ function errorMessage(err: unknown): string {
   return String(err || "");
 }
 
+export function effortSwitchNoticeText(err: unknown): string {
+  const msg = errorMessage(err).trim() || "unknown error";
+  const lower = msg.toLowerCase();
+  if (lower.includes("finish or cancel") && lower.includes("before changing effort")) {
+    return t("status.effortSwitchBusy");
+  }
+  if (lower.includes("already open in another reasonix window") || lower.includes("session lease held")) {
+    return t("status.effortSwitchLeaseHeld");
+  }
+  if (lower.includes("workspace is still starting")) {
+    return t("status.effortSwitchStarting");
+  }
+  if (lower.startsWith("workspace failed to start")) {
+    return t("status.effortSwitchStartupFailed", { err: msg });
+  }
+  if (lower.includes("changed while switching effort") || (lower.includes("tab ") && lower.includes("not found"))) {
+    return t("status.effortSwitchRetry");
+  }
+  return t("status.effortSwitchFailed", { err: msg });
+}
+
 async function refreshMetaForTab(tabId: string, dispatchTo: (tabId: string, action: Action) => void): Promise<void> {
   try {
     dispatchTo(tabId, { type: "meta", meta: await app.MetaForTab(tabId) });
@@ -1060,23 +1094,31 @@ export function useController() {
       if (reset && sessionLoadCurrent(tabId, seq)) dispatchTo(tabId, { type: "reset" });
 
       const stillCurrent = () => sessionLoadCurrent(tabId, seq);
+      const requiresVisibleTab = reason === "startup" || reason === "switch-tab" || reason === "open-topic";
+      const stillVisible = () => !requiresVisibleTab || activeTabIdRef.current === tabId;
       const noteFailure = (label: string, err: unknown) => {
         addBreadcrumb("tab.hydrate", `${label} failed ${tabId}: ${errorMessage(err)}`);
       };
 
-      const historyStartedAt = Date.now();
+      const loadTimed = async <T,>(label: string, load: () => Promise<T>): Promise<T | undefined> => {
+        const startedAt = Date.now();
+        addBreadcrumb("tab.hydrate", `${label} start ${reason} ${tabId}`);
+        try {
+          const value = await load();
+          addBreadcrumb("tab.hydrate", `${label} done ${reason} ${tabId} ms=${Date.now() - startedAt}`);
+          return value;
+        } catch (err) {
+          noteFailure(label, err);
+          return undefined;
+        }
+      };
 
-      // Phase 1: dispatch fast metadata immediately so the transcript can render
-      // without waiting for slower ancillary calls (e.g. BalanceForTab network).
-      const [meta, historyPage] = await Promise.all([
-        app.MetaForTab(tabId).catch((err) => { noteFailure("meta", err); return undefined; }),
-        skipHistory
-          ? Promise.resolve(undefined)
-          : app.HistoryPageForTab(tabId, 0, HISTORY_PAGE_TURNS).catch((err) => { noteFailure("history", err); return undefined; }),
-      ]);
+      const historyStartedAt = Date.now();
+      const historyPage = skipHistory
+        ? undefined
+        : await loadTimed("history", () => app.HistoryPageForTab(tabId, 0, HISTORY_PAGE_TURNS));
 
       if (!stillCurrent()) return;
-      if (meta !== undefined) dispatchTo(tabId, { type: "meta", meta });
       if (!skipHistory && historyPage !== undefined) {
         const messages = asArray(historyPage.messages);
         dispatchTo(tabId, { type: "history_page", page: historyPage, mode: "replace" });
@@ -1107,21 +1149,20 @@ export function useController() {
       // in a loading state.
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       if (!stillCurrent()) return;
-      if (activeTabIdRef.current !== tabId && (reason === "startup" || reason === "switch-tab" || reason === "open-topic")) {
+      if (!stillVisible()) {
         addBreadcrumb("tab.hydrate", `ancillary skipped inactive ${reason} ${tabId}`);
         return;
       }
+      const meta = await loadTimed("meta", () => app.MetaForTab(tabId));
+      if (!stillCurrent()) return;
+      if (!stillVisible()) {
+        addBreadcrumb("tab.hydrate", `meta ignored inactive ${reason} ${tabId}`);
+        return;
+      }
+      if (meta !== undefined) dispatchTo(tabId, { type: "meta", meta });
       const ancillaryStartedAt = Date.now();
       const loadAncillary = async <T,>(label: string, load: () => Promise<T>): Promise<T | undefined> => {
-        const startedAt = Date.now();
-        try {
-          const value = await load();
-          addBreadcrumb("tab.hydrate", `ancillary ${label} ${reason} ${tabId} ms=${Date.now() - startedAt}`);
-          return value;
-        } catch (err) {
-          noteFailure(label, err);
-          return undefined;
-        }
+        return loadTimed(`ancillary ${label}`, load);
       };
       const [effort, jobs, context] = await Promise.all([
         loadAncillary("effort", () => app.EffortForTab(tabId)),
@@ -1129,22 +1170,30 @@ export function useController() {
         loadAncillary("context", () => app.ContextUsageForTab(tabId)),
       ]);
       if (!stillCurrent()) return;
+      if (!stillVisible()) {
+        addBreadcrumb("tab.hydrate", `ancillary ignored inactive ${reason} ${tabId}`);
+        return;
+      }
       if (effort !== undefined) dispatchTo(tabId, { type: "effort", effort });
       if (jobs !== undefined) dispatchTo(tabId, { type: "jobs", jobs: asArray(jobs) });
       if (context !== undefined) dispatchTo(tabId, { type: "context", context });
       await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
       if (!stillCurrent()) return;
-      if (activeTabIdRef.current !== tabId && (reason === "startup" || reason === "switch-tab" || reason === "open-topic")) {
+      if (!stillVisible()) {
         addBreadcrumb("tab.hydrate", `checkpoints skipped inactive ${reason} ${tabId}`);
         return;
       }
       const checkpoints = await loadAncillary("checkpoints", () => app.CheckpointsForTab(tabId));
       if (!stillCurrent()) return;
+      if (!stillVisible()) {
+        addBreadcrumb("tab.hydrate", `checkpoints ignored inactive ${reason} ${tabId}`);
+        return;
+      }
       if (checkpoints !== undefined) dispatchTo(tabId, { type: "checkpoints", checkpoints: asArray(checkpoints) });
       addBreadcrumb("tab.hydrate", `ancillary ${reason} ${tabId} ms=${Date.now() - ancillaryStartedAt}`);
       app.BalanceForTab(tabId)
         .then((balance) => {
-          if (sessionLoadCurrent(tabId, seq)) dispatchTo(tabId, { type: "balance", balance });
+          if (sessionLoadCurrent(tabId, seq) && stillVisible()) dispatchTo(tabId, { type: "balance", balance });
         })
         .catch((err) => { noteFailure("balance", err); });
     })();
@@ -1192,6 +1241,22 @@ export function useController() {
     return tabs.find((tab) => tab.active) ?? tabs[0];
   }, []);
 
+  const dispatchRuntimeStatusForTab = useCallback((tabId: string, tab: RuntimeMetaSnapshot) => {
+    const foregroundRunning = foregroundRunningFromRuntimeMeta(tab);
+    dispatchTo(tabId, {
+      type: "backend_status",
+      running: foregroundRunning,
+      pendingPrompt: Boolean(tab.pendingPrompt),
+      backgroundJobs: tab.backgroundJobs ?? 0,
+      cancelRequested: Boolean(tab.cancelRequested),
+      cancellable: foregroundRunning,
+    });
+    // backend_status reconciliation can clear a live prompt from frontend state.
+    // If the backend is still blocked, ask it to replay the approval/ask event.
+    if (tab.pendingPrompt) replayPendingPromptsForActiveTab(tabId);
+    return foregroundRunning;
+  }, [dispatchTo]);
+
   const waitForTabReady = useCallback(async (tabId: string): Promise<void> => {
     for (let attempt = 0; attempt < 60; attempt += 1) {
       const tabs = asArray(await app.ListTabs().catch(() => [] as TabMeta[]));
@@ -1216,12 +1281,14 @@ export function useController() {
     confirmBackendActiveTab(active.id);
     dispatchTo(active.id, { type: "optimistic_meta", meta: metaFromTab(active, statesRef.current.get(active.id)?.meta) });
     const preserveCachedHistory = options.preserveCachedHistory ?? !reset;
+    if (!reset) dispatchRuntimeStatusForTab(active.id, active);
     await loadSessionDataForTab(active.id, reset, "startup", {
       preserveCachedHistory,
       sessionPath: active.sessionPath,
     });
+    if (reset) dispatchRuntimeStatusForTab(active.id, active);
     return active.id;
-  }, [activeTabFromBackend, confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [activeTabFromBackend, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab]);
 
   const reconcileTabRuntime = useCallback(async (
     tabId: string,
@@ -1233,19 +1300,8 @@ export function useController() {
     if (!tab) return undefined;
     const local = statesRef.current.get(tabId);
     const needsInitialLoad = !local?.meta;
-    const foregroundRunning = foregroundRunningFromRuntimeMeta(tab);
+    const foregroundRunning = dispatchRuntimeStatusForTab(tabId, tab);
     const missedTurnDone = Boolean(local?.running && !foregroundRunning);
-    dispatchTo(tabId, {
-      type: "backend_status",
-      running: foregroundRunning,
-      pendingPrompt: Boolean(tab.pendingPrompt),
-      backgroundJobs: tab.backgroundJobs ?? 0,
-      cancelRequested: Boolean(tab.cancelRequested),
-      cancellable: foregroundRunning,
-    });
-    // backend_status reconciliation can clear a live prompt from frontend state.
-    // If the backend is still blocked, ask it to replay the approval/ask event.
-    if (tab.pendingPrompt) replayPendingPromptsForActiveTab(tabId);
     if (hydrateSessionData && (needsInitialLoad || missedTurnDone)) {
       await loadSessionDataForTab(tabId, missedTurnDone, "startup");
       return tabs;
@@ -1259,7 +1315,7 @@ export function useController() {
     if (effort) dispatchTo(tabId, { type: "effort", effort });
     if (balance) dispatchTo(tabId, { type: "balance", balance });
     return tabs;
-  }, [dispatchTo, loadSessionDataForTab]);
+  }, [dispatchRuntimeStatusForTab, loadSessionDataForTab]);
 
   const clearCancelReconcileTimer = useCallback((tabId: string) => {
     const timer = cancelReconcileTimers.current.get(tabId);
@@ -1422,9 +1478,10 @@ export function useController() {
       setActiveTabId(active.id);
       activeTabIdRef.current = active.id;
       confirmBackendActiveTab(active.id);
+      dispatchRuntimeStatusForTab(active.id, active);
       return sendToTab(active.id, displayText, submitText);
     });
-  }, [activeTabFromBackend, activeTabId, confirmBackendActiveTab, sendToTab]);
+  }, [activeTabFromBackend, activeTabId, confirmBackendActiveTab, dispatchRuntimeStatusForTab, sendToTab]);
 
   const runShell = useCallback(async (command: string) => {
     if (!activeTabId) throw new Error("workspace is still starting");
@@ -1688,7 +1745,12 @@ export function useController() {
 
   const setEffort = useCallback(async (level: string) => {
     if (!activeTabId) return;
-    await app.SetEffortForTab(activeTabId, level).catch(() => {});
+    try {
+      await app.SetEffortForTab(activeTabId, level);
+    } catch (err) {
+      dispatchTo(activeTabId, { type: "local_notice", level: "warn", text: effortSwitchNoticeText(err) });
+      return;
+    }
     try {
       dispatchTo(activeTabId, { type: "meta", meta: await app.MetaForTab(activeTabId) });
       dispatchTo(activeTabId, { type: "context", context: await app.ContextUsageForTab(activeTabId) });
@@ -1731,11 +1793,13 @@ export function useController() {
           setActiveTabId(tab.id);
           activeTabIdRef.current = tab.id;
           confirmBackendActiveTab(tab.id);
+          dispatchRuntimeStatusForTab(tab.id, tab);
           // The fork's controller builds in a background goroutine: an immediate
           // load reads empty history, and the ready-event fallback can still
           // target the source tab, leaving the fork blank (#3742).
           await waitForTabReady(tab.id);
           await loadSessionDataForTab(tab.id, true);
+          await reconcileTabRuntime(tab.id, { hydrateSessionData: false });
         } else {
           await syncActiveTabFromBackend(true);
         }
@@ -1758,7 +1822,7 @@ export function useController() {
     } finally {
       dispatchTo(sourceTabId, { type: "message_action_done" });
     }
-  }, [activeTabId, confirmBackendActiveTab, dispatchTo, loadSessionDataForTab, syncActiveTabFromBackend, waitForBackendActiveTab, waitForTabReady]);
+  }, [activeTabId, confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime, syncActiveTabFromBackend, waitForBackendActiveTab, waitForTabReady]);
 
   // Tab management: switch preserves per-tab state; open creates it.
   const switchTab = useCallback(async (tabId: string, optimisticTab?: TabMeta): Promise<TabMeta[] | undefined> => {
@@ -1772,11 +1836,25 @@ export function useController() {
     dispatchTo(tabId, { type: "backend_activation_start" });
     if (optimisticTab) {
       dispatchTo(tabId, { type: "optimistic_meta", meta: metaFromTab(optimisticTab, statesRef.current.get(tabId)?.meta) });
+      const optimisticStatus = backendStatusFromRuntimeMeta(optimisticTab);
+      if (optimisticStatus.running) dispatchTo(tabId, optimisticStatus);
     }
     dispatchTo(tabId, { type: "hydrate_start", reason: "switch-tab" });
     addBreadcrumb("tab.switch", `active-rendered ${tabId} ms=${Date.now() - startedAt}`);
     const backendActivation = app.SetActiveTab(tabId)
-      .then(() => {
+      .then(async () => {
+        if (activeTabIdRef.current !== tabId) {
+          const currentTabId = activeTabIdRef.current;
+          if (currentTabId) {
+            await app.SetActiveTab(currentTabId).then(() => {
+              if (activeTabIdRef.current === currentTabId) confirmBackendActiveTab(currentTabId);
+            }).catch((err) => {
+              addBreadcrumb("tab.switch", `set-active-stale-reassert-failed ${currentTabId}: ${errorMessage(err)}`);
+            });
+          }
+          addBreadcrumb("tab.switch", `set-active-stale ${tabId} current=${currentTabId ?? ""} ms=${Date.now() - startedAt}`);
+          return false;
+        }
         confirmBackendActiveTab(tabId);
         addBreadcrumb("tab.switch", `set-active-done ${tabId} ms=${Date.now() - startedAt}`);
         return true;
@@ -1820,13 +1898,16 @@ export function useController() {
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    const load = loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
     });
+    if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
+    else void load;
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   const openGlobalTab = useCallback(async (topicId: string): Promise<TabMeta> => {
     const meta = await app.OpenGlobalTab(topicId);
@@ -1838,13 +1919,16 @@ export function useController() {
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    const load = loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
     });
+    if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
+    else void load;
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   const openTopicSession = useCallback(async (scope: string, workspaceRoot: string, topicId: string, sessionPath: string): Promise<TabMeta> => {
     const meta = await app.OpenTopicSession(scope, workspaceRoot, topicId, sessionPath);
@@ -1856,13 +1940,16 @@ export function useController() {
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    const load = loadSessionDataForTab(meta.id, isNewTab, "open-topic", {
       placeholderItems: isNewTab ? prevItems : undefined,
       preserveCachedHistory,
       sessionPath: meta.sessionPath,
     });
+    if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
+    else void load;
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   const activateTopic = useCallback(async (scope: string, workspaceRoot: string, topicId: string, sessionPath = ""): Promise<TabMeta> => {
     const meta = await app.ActivateTopic(scope, workspaceRoot, topicId, sessionPath);
@@ -1876,21 +1963,28 @@ export function useController() {
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, true, "open-topic", { placeholderItems: prevItems });
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    void loadSessionDataForTab(meta.id, true, "open-topic", { placeholderItems: prevItems })
+      .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
+      .catch(() => {});
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   // Ensure a blank tab exists for the given scope — reuses an existing one
   // or creates a new tab, then loads its session data.
   const ensureBlankTab = useCallback(async (scope: string, workspaceRoot: string): Promise<TabMeta> => {
     const meta = await app.EnsureBlankTab(scope, workspaceRoot);
+    const isNewTab = !statesRef.current.has(meta.id);
     setActiveTabId(meta.id);
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, !statesRef.current.has(meta.id), "open-topic");
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    const load = loadSessionDataForTab(meta.id, isNewTab, "open-topic");
+    if (isNewTab) void load.then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false })).catch(() => {});
+    else void load;
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   const ensureBlankSurface = useCallback(async (scope: string, workspaceRoot: string): Promise<TabMeta> => {
     const meta = await app.EnsureBlankSurface(scope, workspaceRoot);
@@ -1901,9 +1995,12 @@ export function useController() {
     activeTabIdRef.current = meta.id;
     confirmBackendActiveTab(meta.id);
     dispatchTo(meta.id, { type: "optimistic_meta", meta: metaFromTab(meta, statesRef.current.get(meta.id)?.meta) });
-    void loadSessionDataForTab(meta.id, true, "open-topic");
+    dispatchRuntimeStatusForTab(meta.id, meta);
+    void loadSessionDataForTab(meta.id, true, "open-topic")
+      .then(() => reconcileTabRuntime(meta.id, { hydrateSessionData: false }))
+      .catch(() => {});
     return meta;
-  }, [confirmBackendActiveTab, dispatchTo, loadSessionDataForTab]);
+  }, [confirmBackendActiveTab, dispatchRuntimeStatusForTab, dispatchTo, loadSessionDataForTab, reconcileTabRuntime]);
 
   const closeTab = useCallback(async (tabId: string) => {
     try {
