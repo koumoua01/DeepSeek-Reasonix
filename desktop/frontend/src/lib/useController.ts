@@ -244,6 +244,8 @@ export function sameMeta(a?: Meta, b?: Meta): boolean {
 
 const STALE_TURN_RECONCILE_MS = 30_000;
 const CANCEL_RECONCILE_DELAYS_MS = [0, 100, 300, 1_000] as const;
+const STARTUP_READY_META_RECONCILE_MS = 250;
+const STARTUP_READY_META_RECONCILE_ATTEMPTS = 60;
 
 export function shouldReconcileStaleTurn(
   state: Pick<State, "running" | "turnActive"> | undefined,
@@ -1062,10 +1064,39 @@ function recoveryNoticeDedupeKey(text: string): string {
   return "";
 }
 
+function quietTranscriptNoticeKey(text: string): string {
+  const recovery = recoveryNoticeDedupeKey(text);
+  if (recovery) return recovery;
+
+  const msg = text.trim();
+  if (/^guardian enabled · model=.+$/i.test(msg)) {
+    return "startup:guardian-enabled";
+  }
+  if (/^\d+ MCP server\(s\) failed to start: .+ \u2014 run \/mcp for details$/i.test(msg)) {
+    return "startup:mcp-failures";
+  }
+  const directMCPFailure = /^mcp\s+([A-Za-z0-9._-]+):\s+.+$/i.exec(msg);
+  if (directMCPFailure) {
+    const name = directMCPFailure[1].toLowerCase();
+    if (!["add", "auth", "config", "connect", "import", "mode", "remove"].includes(name)) {
+      return "startup:mcp-failure";
+    }
+  }
+  if (/^plugin ".+" has been slow \d+ startups in a row \(last \d+ms, budget \d+ms\); demoting to background startup this session$/i.test(msg)) {
+    return "startup:plugin-demote";
+  }
+  if (/^.+ applied: session refreshed after the lease was released$/i.test(msg)) {
+    return "settings:deferred-refresh-applied";
+  }
+  return "";
+}
+
 function appendNoticeItem(items: Item[], seq: number, id: string, level: "info" | "warn", rawText: string): { items: Item[]; seq: number } {
+  if (quietTranscriptNoticeKey(rawText)) {
+    return { items, seq };
+  }
   const text = localizedBackendNoticeText(rawText);
-  const key = recoveryNoticeDedupeKey(rawText) || recoveryNoticeDedupeKey(text);
-  if (key && items.some((item) => item.kind === "notice" && recoveryNoticeDedupeKey(item.text) === key)) {
+  if (quietTranscriptNoticeKey(text)) {
     return { items, seq };
   }
   return { items: [...items, { kind: "notice", id, level, text }], seq: seq + 1 };
@@ -1139,6 +1170,16 @@ async function refreshMetaForTab(tabId: string, dispatchTo: (tabId: string, acti
   }
 }
 
+async function refreshMetaOnlyForTab(tabId: string, dispatchTo: (tabId: string, action: Action) => void): Promise<Meta | undefined> {
+  try {
+    const meta = await app.MetaForTab(tabId);
+    dispatchTo(tabId, { type: "meta", meta });
+    return meta;
+  } catch {
+    return undefined;
+  }
+}
+
 export function replayPendingPromptsForActiveTab(activeTabId: string | undefined, replay: () => Promise<void> = () => app.ReplayPendingPrompts()): void {
   if (!activeTabId) return;
   void replay().catch(() => {});
@@ -1160,6 +1201,8 @@ export function useController() {
   const stateRef = useRef(activeState);
   const backendActiveTabIdRef = useRef<string | undefined>(undefined);
   const backendActivationPromises = useRef(new Map<string, Promise<boolean>>());
+  const readyMetaReconcileSeq = useRef(0);
+  const readyMetaReconcileActive = useRef<{ tabId: string; seq: number } | undefined>(undefined);
   activeTabIdRef.current = activeTabId;
   stateRef.current = activeState;
 
@@ -1568,6 +1611,51 @@ export function useController() {
       offReady();
     };
   }, [dispatchTo, loadSessionDataForTab, refreshCheckpoints, syncActiveTabFromBackend]);
+
+  // If the startup ready event is missed, keep the composer lock in sync with
+  // the active tab's backend metadata without kicking off tab activation work.
+  useEffect(() => {
+    const tabId = activeTabId;
+    const meta = activeState.meta;
+    if (!tabId || !meta || meta.ready || meta.startupErr || activeState.backendActivationPending) {
+      readyMetaReconcileSeq.current += 1;
+      readyMetaReconcileActive.current = undefined;
+      return;
+    }
+
+    let cancelled = false;
+    let timer: number | undefined;
+    const seq = readyMetaReconcileSeq.current + 1;
+    readyMetaReconcileSeq.current = seq;
+    readyMetaReconcileActive.current = { tabId, seq };
+
+    const stillCurrent = () => {
+      const active = readyMetaReconcileActive.current;
+      return !cancelled && active?.tabId === tabId && active.seq === seq && activeTabIdRef.current === tabId;
+    };
+
+    const schedule = (attempt: number) => {
+      timer = window.setTimeout(() => {
+        void tick(attempt);
+      }, STARTUP_READY_META_RECONCILE_MS);
+    };
+
+    const tick = async (attempt: number) => {
+      if (!stillCurrent()) return;
+      const current = statesRef.current.get(tabId);
+      if (!current?.meta || current.meta.ready || current.meta.startupErr || current.backendActivationPending) return;
+      const nextMeta = await refreshMetaOnlyForTab(tabId, dispatchTo);
+      if (!stillCurrent()) return;
+      if (nextMeta?.ready || nextMeta?.startupErr || attempt + 1 >= STARTUP_READY_META_RECONCILE_ATTEMPTS) return;
+      schedule(attempt + 1);
+    };
+
+    schedule(0);
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [activeTabId, activeState.meta?.ready, activeState.meta?.startupErr, activeState.backendActivationPending, dispatchTo]);
 
   // Stale-turn watchdog: if the frontend thinks the agent is running but the
   // turn stream has gone quiet, reconcile with the backend. This catches cases
