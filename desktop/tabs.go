@@ -866,7 +866,7 @@ func (t *WorkspaceTab) recordPlannerDisplayEvent(e event.Event) {
 			if e.Level == event.LevelWarn {
 				level = "warn"
 			}
-			t.plannerDisplay = append(t.plannerDisplay, HistoryMessage{Role: "notice", Level: level, Content: e.Text})
+			t.plannerDisplay = append(t.plannerDisplay, HistoryMessage{Role: "notice", Level: level, Content: e.Text, Detail: e.Detail})
 		}
 	}
 }
@@ -2142,13 +2142,17 @@ func (a *App) indexedBlankTopicIDLocked(scope, workspaceRoot string) string {
 			continue
 		}
 		hasSession := false
+		leaseHeld := false
 		for _, index := range sessionIndexes {
 			if topicSessionIndexHasContentTopic(index, topicID) {
 				hasSession = true
 				break
 			}
+			if topicSessionIndexHasForeignLeaseTopic(index, topicID) {
+				leaseHeld = true
+			}
 		}
-		if hasSession {
+		if hasSession || leaseHeld {
 			continue
 		}
 		return topicID
@@ -5390,6 +5394,9 @@ func migrateLegacySessionsIntoGlobalTopics(dir string) []string {
 	// unmarked so the next render retries instead of the gate hiding it forever.
 	deferred := false
 	for _, info := range infos {
+		if sessionOrderInfoIsAutomaticRecovery(info) {
+			continue
+		}
 		if strings.TrimSpace(info.TopicID) != "" {
 			continue
 		}
@@ -5567,6 +5574,9 @@ func repairIndexedSessionTopics(dir string) []string {
 	sourcesChanged := false
 	deferred := false
 	for _, info := range infos {
+		if sessionOrderInfoIsAutomaticRecovery(info) {
+			continue
+		}
 		topicID := strings.TrimSpace(info.TopicID)
 		if topicID == "" {
 			continue
@@ -5661,6 +5671,37 @@ func indexedSessionTopicTitle(sessionTitles map[string]string, info agent.Sessio
 		return title
 	}
 	return topicTitleFromText(info.Preview)
+}
+
+func sessionOrderInfoIsAutomaticRecovery(info agent.SessionOrderInfo) bool {
+	return info.Recovered ||
+		strings.TrimSpace(info.RecoveryDigest) != "" ||
+		isAutomaticRecoverySessionPath(info.Path)
+}
+
+func sessionInfoIsAutomaticRecovery(info agent.SessionInfo) bool {
+	return info.Recovered ||
+		strings.TrimSpace(info.RecoveryDigest) != "" ||
+		isAutomaticRecoverySessionPath(info.Path)
+}
+
+func isAutomaticRecoverySessionPath(path string) bool {
+	id := agent.BranchID(path)
+	idx := strings.LastIndex(id, "-recovery-")
+	if idx <= 0 {
+		return false
+	}
+	suffix := id[idx+len("-recovery-"):]
+	if len(suffix) != 16 {
+		return false
+	}
+	for _, r := range suffix {
+		if (r >= '0' && r <= '9') || (r >= 'a' && r <= 'f') || (r >= 'A' && r <= 'F') {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 func legacyMigrationTargetForDir(dir string) (scope, workspaceRoot, topicTitleRoot string, ok bool) {
@@ -6547,6 +6588,7 @@ func (a *App) ListProjectTree() []ProjectNode {
 		}
 		seenRuntimePaths[sessionPath] = true
 		info := sessionInfos[sessionPath]
+		recovered := sessionInfoIsAutomaticRecovery(info) || isAutomaticRecoverySessionPath(sessionPath)
 		label := runtimeSessionTreeLabel(tab, info, sessionTitles[sessionPath])
 		status := activityStatusForTab(tab)
 		runtimeStatus := control.RuntimeStatus{}
@@ -6563,7 +6605,7 @@ func (a *App) ListProjectTree() []ProjectNode {
 			open:             open,
 			running:          running,
 			status:           status,
-			recovered:        info.Recovered,
+			recovered:        recovered,
 			recoveryReason:   info.RecoveryReason,
 			recoveryDigest:   info.RecoveryDigest,
 			recoveryParentID: string(info.ParentID),
@@ -7807,7 +7849,7 @@ func mergeSessionInfos(dir string, infos []agent.SessionInfo, titles map[string]
 		key := topicSummaryKey(info.Scope, info.WorkspaceRoot, info.TopicID)
 		summary := topicSummaries[key]
 		lastActivityAt := info.LastActivityAt.UnixMilli()
-		if info.Recovered {
+		if sessionInfoIsAutomaticRecovery(info) {
 			// A conflict copy duplicates its original, so its turns would
 			// double-count — but its activity is real: once a tab adopts the
 			// copy as its live transcript, all new work lands here, and
@@ -7946,6 +7988,25 @@ func topicSessionIndexHasContentTopic(index topicSessionDirIndex, topicID string
 	matches := index.byTopic[strings.TrimSpace(topicID)]
 	for _, match := range matches {
 		if sessionFileHasConversationContent(match.path) {
+			return true
+		}
+	}
+	return false
+}
+
+// topicSessionIndexHasForeignLeaseTopic reports whether any session file
+// indexed under topicID is currently lease-held by a runtime other than this
+// process. A blank topic can still be lease-held — its session lease keeper
+// keeps a leftover blank tab's lease alive across a hide-to-tray close, and a
+// stale-but-live holder blocks a genuinely new session from ever settling on
+// this path. Reusing it anyway would make the "new" tab collide with that
+// holder: every lease-gated switch (effort/model/token mode) would fail as if
+// a foreign window owned it, and creating another "new" conversation would
+// keep re-picking the same stuck topic (#6028, #6109).
+func topicSessionIndexHasForeignLeaseTopic(index topicSessionDirIndex, topicID string) bool {
+	matches := index.byTopic[strings.TrimSpace(topicID)]
+	for _, match := range matches {
+		if agent.SessionLeaseHeldByOtherRuntime(match.path) {
 			return true
 		}
 	}
