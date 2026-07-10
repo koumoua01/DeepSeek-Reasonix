@@ -245,6 +245,143 @@ console.log("capabilities panel MCP actions");
   dom.window.close();
 }
 
+{
+  const dom = installDom();
+  const rootEl = document.getElementById("root");
+  if (!rootEl) throw new Error("missing root");
+  const root = createRoot(rootEl);
+  const meta: Meta = { label: "test", ready: true, eventChannel: "managed-mcp-channel", cwd: "/tmp/reasonix-test", workspaceRoot: "/tmp/reasonix-test" };
+  const tabs: TabMeta[] = [{
+    id: "tab-managed-mcp",
+    scope: "project",
+    workspaceRoot: "/tmp/reasonix-test",
+    workspaceName: "reasonix-test",
+    topicId: "topic-managed-mcp",
+    topicTitle: "Managed MCP",
+    label: "Managed MCP",
+    ready: true,
+    running: false,
+    mode: "normal",
+    toolApprovalMode: "auto",
+    active: true,
+    cwd: "/tmp/reasonix-test",
+  }];
+  const servers: ServerView[] = [{
+    name: "helper",
+    transport: "http",
+    status: "connected",
+    configured: true,
+    managedByPlugin: "superpowers",
+    authConfigured: true,
+    autoStart: true,
+    tools: 1,
+    prompts: 0,
+    resources: 0,
+    toolList: [{ name: "echo", description: "Echo input", readOnlyHint: true }],
+  }];
+  window.go = {
+    main: {
+      App: {
+        Meta: async () => meta,
+        ListTabs: async () => tabs,
+        MCPServers: async () => servers,
+      } as Partial<AppBindings> as AppBindings,
+    },
+  };
+
+  await act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(MCPServersSettingsPage)));
+    await flush();
+  });
+  await waitFor("plugin-managed MCP row", () => Boolean(document.querySelector(".cap-row__name")?.textContent?.includes("helper")));
+  ok(document.body.textContent?.includes("Managed by plugin superpowers") ?? false, "plugin-managed MCP identifies its owner");
+
+  const disclosure = document.querySelector<HTMLButtonElement>(".cap-disclosure");
+  if (!disclosure) throw new Error("missing plugin-managed MCP disclosure");
+  await act(async () => {
+    disclosure.click();
+    await flush();
+  });
+  ok(!findButton("Remove server"), "plugin-managed MCP hides the misleading remove action");
+  ok(!findButton("Edit config"), "plugin-managed MCP hides direct config editing");
+  ok(!findButton("Clear auth"), "plugin-managed MCP hides auth persistence actions");
+  ok(!findButton("Pre-trust read-only (1)"), "plugin-managed MCP hides bulk trust persistence actions");
+
+  const viewTools = findButton("View tools");
+  if (!viewTools) throw new Error("missing managed MCP View tools button");
+  await act(async () => {
+    viewTools.click();
+    await flush();
+  });
+  ok(!findButton("Pre-trust"), "plugin-managed MCP hides per-tool trust persistence actions");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+{
+  const dom = installDom();
+  const rootEl = document.getElementById("root");
+  if (!rootEl) throw new Error("missing root");
+  const root = createRoot(rootEl);
+  const meta: Meta = { label: "test", ready: true, eventChannel: "runtime-mcp-channel", cwd: "/tmp/reasonix-test", workspaceRoot: "/tmp/reasonix-test" };
+  const tabs: TabMeta[] = [{
+    id: "tab-runtime-mcp",
+    scope: "project",
+    workspaceRoot: "/tmp/reasonix-test",
+    workspaceName: "reasonix-test",
+    topicId: "topic-runtime-mcp",
+    topicTitle: "Runtime MCP",
+    label: "Runtime MCP",
+    ready: true,
+    running: false,
+    mode: "normal",
+    toolApprovalMode: "auto",
+    active: true,
+    cwd: "/tmp/reasonix-test",
+  }];
+  const servers: ServerView[] = [{
+    name: "runtime-only",
+    transport: "stdio",
+    status: "failed",
+    configured: false,
+    autoStart: false,
+    tools: 0,
+    prompts: 0,
+    resources: 0,
+    error: "command not found",
+  }];
+  window.go = {
+    main: {
+      App: {
+        Meta: async () => meta,
+        ListTabs: async () => tabs,
+        MCPServers: async () => servers,
+      } as Partial<AppBindings> as AppBindings,
+    },
+  };
+
+  await act(async () => {
+    root.render(React.createElement(LocaleProvider, null, React.createElement(MCPServersSettingsPage)));
+    await flush();
+  });
+  await waitFor("runtime-only failure details", () => Boolean(findButton("View details")));
+  const showDetails = findButton("View details");
+  if (!showDetails) throw new Error("missing runtime-only failure details button");
+  await act(async () => {
+    showDetails.click();
+    await flush();
+  });
+  ok(!findButton("Remove server"), "runtime-only MCP failure hides an action the backend cannot persist");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
 console.log("capabilities panel plugin actions");
 
 {
@@ -320,6 +457,9 @@ console.log("capabilities panel plugin actions");
             skills: 3,
             hooks: 1,
             mcpServers: 1,
+            skillDetails: [{ name: "plan", description: "Plan work before implementation.", invocation: "/plan", runAs: "inline" }],
+            hookDetails: [{ event: "SessionStart", contextFile: "CLAUDE.md", description: "Load startup context." }],
+            mcpServerDetails: [{ name: "context", transport: "stdio", command: "node server.js" }],
           };
           plugins = plugins.filter((plugin) => plugin.name !== next.name).concat(next);
           return JSON.stringify({ ok: true, status: "done", actions: [{ action: "install_plugin_package", name: next.name, status: "done" }] });
@@ -410,6 +550,10 @@ console.log("capabilities panel plugin actions");
     await flush();
   });
   await waitFor("plugin update action", () => Boolean(findButton("Update")));
+  ok(document.body.textContent?.includes("How to use") ?? false, "expanded plugin details explain how to use the plugin");
+  ok(document.body.textContent?.includes("/plan") ?? false, "expanded plugin details list exported skill invocations");
+  ok(document.body.textContent?.includes("SessionStart") ?? false, "expanded plugin details list exported hooks");
+  ok(document.body.textContent?.includes("context") ?? false, "expanded plugin details list exported MCP servers");
 
   const update = findButton("Update");
   if (!update) throw new Error("missing plugin update button");

@@ -14,7 +14,7 @@ Hooks 让 Reasonix 在会话、用户输入、工具调用、模型返回、压�
 
 1. 打开桌面端“设置 -> Hooks”。
 2. 选择范围：
-   - “全局”：保存到 `~/.reasonix/settings.json`，始终加载。
+   - “全局”：保存到 `<Reasonix home>/settings.json`，始终加载；Windows 默认是 `%APPDATA%\reasonix\settings.json`，macOS/Linux 默认是 `~/.reasonix/settings.json`。
    - “项目”：保存到当前工作区的 `.reasonix/settings.json`，必须点击“信任此工作区”后才会加载。
 3. 在 JSON 配置框里编辑 `hooks`。
 4. 保存后，重启桌面端，让新配置进入会话。`/new` 只开启新对话，不会重新读取 hooks 配置。
@@ -45,10 +45,10 @@ Hooks 让 Reasonix 在会话、用户输入、工具调用、模型返回、压�
 
 | 范围 | 文件 | 是否需要信任 | 加载顺序 |
 | --- | --- | --- | --- |
-| 全局 | `~/.reasonix/settings.json` | 不需要 | 项目 hooks 之后 |
+| 全局 | `<Reasonix home>/settings.json` | 不需要 | 项目 hooks 之后 |
 | 项目 | `<workspace>/.reasonix/settings.json` | 需要 | 全局 hooks 之前 |
 
-项目 hooks 的信任状态不写在项目文件里，而是写在用户自己的 `~/.reasonix/trust.json`。这样克隆来的仓库不能靠提交 `.reasonix/settings.json` 自动执行命令。
+项目 hooks 的信任状态不写在项目文件里，而是写在用户自己的 `<Reasonix home>/trust.json`。这样克隆来的仓库不能靠提交 `.reasonix/settings.json` 自动执行命令。
 
 同一个事件下，项目 hooks 先运行，全局 hooks 后运行；同一范围内按数组顺序运行。阻塞型事件遇到第一个阻塞 hook 后，会停止继续执行后面的 hook。
 
@@ -195,7 +195,7 @@ stdout 和 stderr 会被捕获、去掉首尾空白，并限制单路输出最�
 }
 ```
 
-这适合把插件或工作流的 bootstrap 说明带入会话。比如 Superpowers 不需要内置到 Reasonix；可以让它自己的 `hooks/session-start-codex` 在 `SessionStart` 输出 `additionalContext`，Reasonix 会在下一轮把这段说明注入模型上下文。Reasonix 默认允许 `max_subagent_depth = 2`，因此 Superpowers 的父会话或第一层 workflow subagent 可以再派发 reviewer/implementer subagent；第二层不会继续获得递归委派工具。若要恢复旧的单层边界，设 `agent.max_subagent_depth = 1`。这会改变子代理可见工具面，可能影响子代理请求的 prompt cache，但不会把 Superpowers 写进 Reasonix 的稳定 system prompt。
+这适合把插件或工作流的 bootstrap 说明带入会话。比如 Superpowers 不需要内置到 Reasonix；可以让它自己的 `hooks/session-start-codex` 在 `SessionStart` 输出 `additionalContext`，或让插件根目录 `CLAUDE.md` 被插件包兼容层直接作为 `SessionStart` 上下文读取，Reasonix 会在下一轮把这段说明注入模型上下文。插件包兼容层也会读取 `.claude/settings.json` 里的 command hooks，并按同名事件映射到 Reasonix hooks。Reasonix 默认允许 `max_subagent_depth = 2`，因此 Superpowers 的父会话或第一层 workflow subagent 可以再派发 reviewer/implementer subagent；第二层不会继续获得递归委派工具。若要恢复旧的单层边界，设 `agent.max_subagent_depth = 1`。这会改变子代理可见工具面，可能影响子代理请求的 prompt cache，但不会把 Superpowers 写进 Reasonix 的稳定 system prompt。
 
 ## 示例：阻止危险 bash 命令
 

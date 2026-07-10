@@ -4,7 +4,7 @@ import { asArray } from "../lib/array";
 import { app, openExternal } from "../lib/bridge";
 import { useT } from "../lib/i18n";
 import { mcpServerLifecycleActions, mcpServerRetryableFromAvailableList } from "../lib/mcpServerLifecycle";
-import type { CapabilitiesView, MCPServerInput, PluginInstallOptions, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
+import type { CapabilitiesView, MCPServerInput, PluginHookView, PluginInstallOptions, PluginMCPServerView, PluginSkillView, PluginView, ServerView, SkillRootSkillView, SkillRootView, SkillsSettingsView, SkillView, TabMeta } from "../lib/types";
 import { InlineConfirmButton } from "./InlineConfirmButton";
 import { ResizableDrawer } from "./ResizableDrawer";
 import { Tooltip } from "./Tooltip";
@@ -820,7 +820,7 @@ function FailedServersNotice({
                 <button className="btn btn--small" onClick={() => onToggle(s.name)} aria-expanded={open}>
                   {open ? t("common.collapse") : t("caps.showLog")}
                 </button>
-                {!s.builtIn && (
+                {!s.builtIn && !s.managedByPlugin && s.configured && (
                   <InlineConfirmButton
                     label={t("caps.remove")}
                     confirmLabel={t("caps.confirmRemove")}
@@ -905,6 +905,9 @@ function ServerRow({
           ? t("caps.disabledAutoStart")
           : t("caps.disabled")
         : t("caps.counts", { tools: s.tools, prompts: s.prompts, resources: s.resources });
+  if (s.managedByPlugin) {
+    sub = `${sub} · ${t("caps.managedByPlugin", { plugin: s.managedByPlugin })}`;
+  }
   if (s.authStatus === "possible" && s.status !== "failed") {
     sub = `${sub} · ${t("caps.authPossibleShort")}`;
   }
@@ -1019,16 +1022,17 @@ function ServerDetails({
 }) {
   const t = useT();
   const command = serverCommand(s);
-  const canEditConfig = s.configured && !s.builtIn;
+  const canMutateConfig = s.configured && !s.builtIn && !s.managedByPlugin;
+  const canEditConfig = canMutateConfig;
   const lifecycle = mcpServerLifecycleActions(s);
   const canConnectNow = lifecycle.canConnectNow;
   const canReconnect = lifecycle.canReconnect;
   const canShowTools = s.status === "connected" && ((s.tools ?? 0) > 0 || (tools?.length ?? 0) > 0);
-  const showClearAuth = canClearAuth(s);
+  const showClearAuth = canMutateConfig && canClearAuth(s);
   const authLabel = serverAuthLabel(s, t);
   const trustedReadOnlyTools = s.trustedReadOnlyTools ?? [];
   const trustedReadOnlyToolNames = new Set(trustedReadOnlyTools);
-  const canTrustTool = s.configured && !s.builtIn;
+  const canTrustTool = canMutateConfig;
   const reportedReadOnlyToolNames = (tools ?? []).filter((tool) => tool.readOnlyHint).map((tool) => tool.name);
   const bulkTrustToolNames = reportedReadOnlyToolNames.filter((name) => !trustedReadOnlyToolNames.has(name));
   if (editing && canEditConfig) {
@@ -1401,7 +1405,7 @@ function failureGroupLabel(kind: FailureKind, count: number, t: ReturnType<typeo
 }
 
 function canBulkRemoveFailure(server: ServerView): boolean {
-  if (server.builtIn || !server.configured) return false;
+  if (server.builtIn || server.managedByPlugin || !server.configured) return false;
   const kind = failureKind(server);
   return kind === "missing-command" || kind === "command-unavailable";
 }
@@ -1436,7 +1440,7 @@ function shouldOpenAuth(s: ServerView): boolean {
 }
 
 function canClearAuth(s: ServerView): boolean {
-  if (!s.configured || s.builtIn) return false;
+  if (!s.configured || s.builtIn || s.managedByPlugin) return false;
   return Boolean(s.authConfigured || s.authStatus === "required" || s.authStatus === "possible" || isRemoteTransport(s.transport));
 }
 
@@ -1992,6 +1996,7 @@ function PluginRow({
 						)}
 					</div>
 					{plugin.description && <div className="cap-plugin-description">{plugin.description}</div>}
+					<PluginUsageDetails plugin={plugin} />
 					{diagnostic?.error && <div className="cap-source__warning">{diagnostic.error}</div>}
 					{warnings.map((warning, idx) => (
 						<div className="cap-source__warning" key={`${plugin.name}-warning-${idx}`}>{warning}</div>
@@ -2018,6 +2023,97 @@ function PluginRow({
 	);
 }
 
+function PluginUsageDetails({ plugin }: { plugin: PluginView }) {
+	const t = useT();
+	const skills = asArray(plugin.skillDetails);
+	const hooks = asArray(plugin.hookDetails);
+	const mcps = asArray(plugin.mcpServerDetails);
+	const hasDetails = skills.length > 0 || hooks.length > 0 || mcps.length > 0;
+	return (
+		<div className="cap-plugin-usage">
+			<div className="cap-plugin-usage__title">{t("caps.pluginUsageTitle")}</div>
+			<div className="cap-plugin-usage__hint">
+				{plugin.enabled ? t("caps.pluginUsageEnabledHint") : t("caps.pluginUsageDisabledHint")}
+			</div>
+			{hasDetails ? (
+				<div className="cap-plugin-capabilities">
+					{skills.length > 0 && <PluginSkillList skills={skills} />}
+					{hooks.length > 0 && <PluginHookList hooks={hooks} />}
+					{mcps.length > 0 && <PluginMCPList servers={mcps} />}
+				</div>
+			) : (
+				<div className="cap-plugin-usage__empty">{t("caps.pluginNoCapabilityDetails")}</div>
+			)}
+		</div>
+	);
+}
+
+function PluginSkillList({ skills }: { skills: PluginSkillView[] }) {
+	const t = useT();
+	return (
+		<div className="cap-plugin-capability">
+			<div className="cap-plugin-capability__head">{t("caps.pluginSkillsTitle")}</div>
+			<div className="cap-plugin-capability__hint">{t("caps.pluginSkillsHint")}</div>
+			<div className="cap-plugin-capability__list">
+				{skills.map((skill) => (
+					<div className="cap-plugin-capability__item" key={`${skill.name}-${skill.path || skill.invocation || ""}`}>
+						<div className="cap-plugin-capability__line">
+							<span className="cap-plugin-capability__name">{skill.invocation || `/${skill.name}`}</span>
+							{skill.runAs && <span className="cap-source-badge">{skill.runAs}</span>}
+						</div>
+						<div className="cap-plugin-capability__desc">{skill.description || t("caps.pluginNoDescription")}</div>
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
+
+function PluginHookList({ hooks }: { hooks: PluginHookView[] }) {
+	const t = useT();
+	return (
+		<div className="cap-plugin-capability">
+			<div className="cap-plugin-capability__head">{t("caps.pluginHooksTitle")}</div>
+			<div className="cap-plugin-capability__hint">{t("caps.pluginHooksHint")}</div>
+			<div className="cap-plugin-capability__list">
+				{hooks.map((hook, idx) => {
+					const target = hook.command || hook.contextFile || t("caps.pluginHookNoTarget");
+					return (
+						<div className="cap-plugin-capability__item" key={`${hook.event}-${hook.match || "*"}-${target}-${idx}`}>
+							<div className="cap-plugin-capability__line">
+								<span className="cap-plugin-capability__name">{hook.event}</span>
+								<span className="cap-source-badge">{hook.match || "*"}</span>
+							</div>
+							<div className="cap-plugin-capability__desc">{hook.description || target}</div>
+						</div>
+					);
+				})}
+			</div>
+		</div>
+	);
+}
+
+function PluginMCPList({ servers }: { servers: PluginMCPServerView[] }) {
+	const t = useT();
+	return (
+		<div className="cap-plugin-capability">
+			<div className="cap-plugin-capability__head">{t("caps.pluginMCPTitle")}</div>
+			<div className="cap-plugin-capability__hint">{t("caps.pluginMCPHint")}</div>
+			<div className="cap-plugin-capability__list">
+				{servers.map((server) => (
+					<div className="cap-plugin-capability__item" key={server.name}>
+						<div className="cap-plugin-capability__line">
+							<span className="cap-plugin-capability__name">{server.name}</span>
+							{server.transport && <span className="cap-source-badge">{server.transport}</span>}
+						</div>
+						<div className="cap-plugin-capability__desc">{server.command || server.url || t("caps.pluginMCPNoTarget")}</div>
+					</div>
+				))}
+			</div>
+		</div>
+	);
+}
+
 function normalizePluginViews(plugins: PluginView[] | null | undefined): PluginView[] {
 	return sortPluginsForDisplay(asArray(plugins).map(normalizePluginView));
 }
@@ -2031,6 +2127,9 @@ function normalizePluginView(plugin: PluginView): PluginView {
 		skills: Number.isFinite(plugin.skills) ? plugin.skills : 0,
 		hooks: Number.isFinite(plugin.hooks) ? plugin.hooks : 0,
 		mcpServers: Number.isFinite(plugin.mcpServers) ? plugin.mcpServers : 0,
+		skillDetails: asArray(plugin.skillDetails),
+		hookDetails: asArray(plugin.hookDetails),
+		mcpServerDetails: asArray(plugin.mcpServerDetails),
 		warnings: asArray(plugin.warnings),
 	};
 }
@@ -2106,6 +2205,7 @@ function pluginPlanActionLabel(action: PluginInstallPlanAction, t: ReturnType<ty
 
 function pluginPlanNotice(plan: PluginInstallPlanView, t: ReturnType<typeof useT>): string {
 	if (plan.error) return plan.error;
+	if (plan.status === "done" || plan.status === "applied" || plan.status === "complete") return t("caps.pluginPlanInstalled");
 	return plan.status ? t("caps.pluginPlanStatus", { status: plan.status }) : t("caps.pluginPlanComplete");
 }
 

@@ -19,6 +19,7 @@ import (
 
 	"reasonix/internal/fileref"
 	"reasonix/internal/proc"
+	"reasonix/internal/secrets"
 )
 
 // maxFileRefBytes caps how much of an @-referenced file is injected into a
@@ -644,6 +645,13 @@ func FileRefLine(line string) (string, bool) {
 	return "@" + p, true
 }
 
+// SlashCodeCommentLine reports whether a slash-prefixed line is ordinary source
+// text rather than a Reasonix slash command.
+func SlashCodeCommentLine(line string) bool {
+	trimmed := strings.TrimSpace(line)
+	return strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "/*")
+}
+
 // SlashPathLineRef reports whether a slash-prefixed line starts with a local file
 // path, including common compiler-location suffixes like ":12" or ":12:34".
 // It returns an @reference for the file so diagnostics that begin with an
@@ -1117,6 +1125,7 @@ func runPDFTextCommand(name string, args []string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), pdfExtractTimeout)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Env = secrets.ProcessEnv()
 	setShellKillTree(cmd)
 	cmd.WaitDelay = pdfExtractWaitDelay
 	proc.HideWindow(cmd)
