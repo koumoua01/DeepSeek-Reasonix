@@ -62,6 +62,29 @@ func TestRegistryRemovePrefix(t *testing.T) {
 	}
 }
 
+func TestRegistrySuspendPrefixBlocksLateAddsUntilResume(t *testing.T) {
+	r := NewRegistry()
+	r.Add(stubTool{name: "bash"})
+	r.Add(stubTool{name: "mcp__fs__connect"})
+
+	if got := r.SuspendPrefix("mcp__fs__"); got != 1 {
+		t.Fatalf("SuspendPrefix returned %d, want 1", got)
+	}
+	r.Add(stubTool{name: "mcp__fs__read"})
+	if _, ok := r.Get("mcp__fs__read"); ok {
+		t.Fatalf("suspended prefix accepted a late tool add; names=%v", r.Names())
+	}
+	if _, ok := r.Get("bash"); !ok {
+		t.Fatal("suspending an MCP prefix removed unrelated tools")
+	}
+
+	r.ResumePrefix("mcp__fs__")
+	r.Add(stubTool{name: "mcp__fs__read"})
+	if _, ok := r.Get("mcp__fs__read"); !ok {
+		t.Fatalf("resumed prefix did not accept tool add; names=%v", r.Names())
+	}
+}
+
 // TestRegistrySchemasSorted proves Schemas() emits tool definitions in
 // deterministic alphabetical order regardless of insertion order, so a logically
 // identical tool set produces a stable provider-facing request prefix (prompt
@@ -116,7 +139,7 @@ func TestRegistrySchemasStableAndCanonical(t *testing.T) {
 	if schemas[0].Name != "alpha" || schemas[1].Name != "zeta" {
 		t.Fatalf("Schemas order = %q, %q; want alpha, zeta", schemas[0].Name, schemas[1].Name)
 	}
-	if got, want := string(schemas[0].Parameters), `{"required":["x","y"],"type":"object"}`; got != want {
+	if got, want := string(schemas[0].Parameters), `{"properties":{},"required":["x","y"],"type":"object"}`; got != want {
 		t.Fatalf("alpha schema = %s, want %s", got, want)
 	}
 	if got, want := string(schemas[1].Parameters), `{"properties":{"a":{"type":"string"},"b":{"type":"string"}},"required":["a","b"],"type":"object"}`; got != want {

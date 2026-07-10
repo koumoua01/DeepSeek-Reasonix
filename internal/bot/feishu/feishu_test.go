@@ -44,8 +44,8 @@ func TestVerificationTokenValidRequiresConfiguredToken(t *testing.T) {
 	}
 
 	a.cfg.VerificationToken = ""
-	if !a.verificationTokenValid("") {
-		t.Fatal("empty configured verification token should preserve unauthenticated mode")
+	if a.verificationTokenValid("") {
+		t.Fatal("unconfigured verification token should deny all callers")
 	}
 }
 
@@ -225,6 +225,61 @@ func TestHandleCardActionDoesNotTrustCardRequesterAsOperator(t *testing.T) {
 	}
 }
 
+func TestHandleMessageTreatsTopicGroupAsGroup(t *testing.T) {
+	a := &adapter{
+		cfg:    config.FeishuBotConfig{RequireMention: true},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msgCh:  make(chan bot.InboundMessage, 1),
+	}
+	a.handleMessage(feishuMsgEvent{
+		MessageID: "msg-topic",
+		ChatID:    "chat-topic",
+		ChatType:  "topic_group",
+		MsgType:   "text",
+		Content:   `{"text":"hello"}`,
+		Sender: feishuSender{SenderID: struct {
+			UserID  string `json:"user_id"`
+			OpenID  string `json:"open_id"`
+			UnionID string `json:"union_id"`
+		}{OpenID: "open-user"}},
+		Mentions: []feishuMention{{Key: "@_user_1"}},
+	})
+
+	msg := <-a.msgCh
+	if msg.ChatType != bot.ChatGroup {
+		t.Fatalf("chat type = %q, want group", msg.ChatType)
+	}
+	if msg.ChatID != "chat-topic" || msg.UserID != "open-user" {
+		t.Fatalf("message = %+v, want topic group routing", msg)
+	}
+}
+
+func TestHandleMessageRequiresMentionInTopicGroup(t *testing.T) {
+	a := &adapter{
+		cfg:    config.FeishuBotConfig{RequireMention: true},
+		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		msgCh:  make(chan bot.InboundMessage, 1),
+	}
+	a.handleMessage(feishuMsgEvent{
+		MessageID: "msg-topic",
+		ChatID:    "chat-topic",
+		ChatType:  "topic_group",
+		MsgType:   "text",
+		Content:   `{"text":"hello"}`,
+		Sender: feishuSender{SenderID: struct {
+			UserID  string `json:"user_id"`
+			OpenID  string `json:"open_id"`
+			UnionID string `json:"union_id"`
+		}{OpenID: "open-user"}},
+	})
+
+	select {
+	case msg := <-a.msgCh:
+		t.Fatalf("message without mention was queued: %+v", msg)
+	default:
+	}
+}
+
 func TestWebSocketDispatcherHandlesCardActionTrigger(t *testing.T) {
 	a := &adapter{
 		logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -292,30 +347,30 @@ func TestWebSocketDispatcherHandlesCardActionTrigger(t *testing.T) {
 	}
 }
 
-func TestFeishuMarkdownPostContent(t *testing.T) {
-	content, err := feishuMarkdownPostContent("hello [docs](https://example.com)")
+func TestBuildMarkdownCard(t *testing.T) {
+	content, err := buildMarkdownCard("hello [docs](https://example.com)")
 	if err != nil {
-		t.Fatalf("feishuMarkdownPostContent: %v", err)
+		t.Fatalf("buildMarkdownCard: %v", err)
 	}
 	var payload struct {
-		ZhCn struct {
-			Content [][]struct {
-				Tag  string `json:"tag"`
-				Text string `json:"text"`
-				Href string `json:"href"`
-			} `json:"content"`
-		} `json:"zh_cn"`
+		Schema string `json:"schema"`
+		Body   struct {
+			Elements []struct {
+				Tag     string `json:"tag"`
+				Content string `json:"content"`
+			} `json:"elements"`
+		} `json:"body"`
 	}
 	if err := json.Unmarshal([]byte(content), &payload); err != nil {
-		t.Fatalf("post content should be valid json: %v", err)
+		t.Fatalf("card content should be valid json: %v", err)
 	}
-	if len(payload.ZhCn.Content) != 1 || len(payload.ZhCn.Content[0]) != 2 {
-		t.Fatalf("content blocks = %#v, want one paragraph with text and link", payload.ZhCn.Content)
+	if payload.Schema != "2.0" {
+		t.Fatalf("schema = %q, want 2.0", payload.Schema)
 	}
-	if payload.ZhCn.Content[0][0].Tag != "text" || payload.ZhCn.Content[0][0].Text != "hello " {
-		t.Fatalf("first element = %#v, want text hello", payload.ZhCn.Content[0][0])
+	if len(payload.Body.Elements) != 1 || payload.Body.Elements[0].Tag != "markdown" {
+		t.Fatalf("elements = %#v, want one markdown element", payload.Body.Elements)
 	}
-	if payload.ZhCn.Content[0][1].Tag != "a" || payload.ZhCn.Content[0][1].Text != "docs" || payload.ZhCn.Content[0][1].Href != "https://example.com" {
-		t.Fatalf("second element = %#v, want link", payload.ZhCn.Content[0][1])
+	if payload.Body.Elements[0].Content != "hello [docs](https://example.com)" {
+		t.Fatalf("content = %q, want original markdown", payload.Body.Elements[0].Content)
 	}
 }

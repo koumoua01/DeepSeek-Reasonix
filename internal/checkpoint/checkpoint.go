@@ -17,7 +17,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -86,7 +85,7 @@ func (s *Store) load() {
 		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
 			continue
 		}
-		b, err := os.ReadFile(filepath.Join(s.dir, e.Name()))
+		b, err := fileenc.ReadFileUTF8(filepath.Join(s.dir, e.Name()))
 		if err != nil {
 			continue
 		}
@@ -227,6 +226,43 @@ func (s *Store) all() []*Checkpoint {
 	return cps
 }
 
+// TruncateFrom discards checkpoints at or after fromTurn. Conversation rewind
+// removes those future turns from the transcript, so their file snapshots must
+// not remain visible or collide with newly-created checkpoints that reuse the
+// same turn numbers after the rewrite.
+func (s *Store) TruncateFrom(fromTurn int) {
+	s.mu.Lock()
+	done := s.done[:0]
+	deleteTurns := map[int]bool{}
+	for _, c := range s.done {
+		if c.Turn >= fromTurn {
+			deleteTurns[c.Turn] = true
+			continue
+		}
+		done = append(done, c)
+	}
+	for i := len(done); i < len(s.done); i++ {
+		s.done[i] = nil
+	}
+	s.done = done
+	if s.cur != nil && s.cur.Turn >= fromTurn {
+		deleteTurns[s.cur.Turn] = true
+		s.cur = nil
+		s.seen = map[string]bool{}
+	}
+	dir := s.dir
+	s.mu.Unlock()
+
+	if dir == "" || len(deleteTurns) == 0 {
+		return
+	}
+	for turn := range deleteTurns {
+		if err := os.Remove(filepath.Join(dir, fmt.Sprintf("turn-%d.json", turn))); err != nil && !os.IsNotExist(err) {
+			slog.Warn("checkpoint: truncate failed", "turn", turn, "err", err)
+		}
+	}
+}
+
 // RestoreCode reverts the workspace to its state at the start of turn `fromTurn`:
 // for every file touched in turn fromTurn or later, it writes back that file's
 // earliest recorded content (or deletes it when the earliest snapshot was nil).
@@ -305,7 +341,8 @@ func safePath(root, p string) (string, error) {
 	abs = filepath.Clean(abs)
 	if root != "" {
 		r := filepath.Clean(root)
-		if abs != r && !strings.HasPrefix(abs, r+string(os.PathSeparator)) {
+		rel, err := filepath.Rel(r, abs)
+		if err != nil || !filepath.IsLocal(rel) {
 			return "", fmt.Errorf("checkpoint path %q escapes workspace %q", p, root)
 		}
 	}

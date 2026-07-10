@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"runtime/debug"
 
 	"reasonix/internal/config"
@@ -20,7 +19,7 @@ import (
 const pendingCrashFile = "crash-pending.json"
 
 func pendingCrashPath() string {
-	return filepath.Join(filepath.Dir(config.UserConfigPath()), pendingCrashFile)
+	return filepath.Join(config.MemoryUserDir(), pendingCrashFile)
 }
 
 // recoverToPending records a panicking goroutine to the pending-crash file and
@@ -36,26 +35,50 @@ func (a *App) recoverToPending(site string) {
 }
 
 func writePendingCrash(site string, r any, stack []byte) {
-	msg := scrubUserPaths(fmt.Sprintf("[go panic] %s: %v\n\n%s", site, r, stack))
-	if len(msg) > maxCrashDetailBytes {
-		msg = msg[:maxCrashDetailBytes]
-	}
-	body, err := json.Marshal(crashReport{
-		Kind:    "crash",
-		Version: version,
-		OS:      runtime.GOOS,
-		Arch:    runtime.GOARCH,
-		Message: msg,
-		Device:  collectDeviceInfo(),
-	})
+	stackText := string(stack)
+	msg := sanitizeCrashText(fmt.Sprintf("[go panic] %s: %v\n\n%s", site, r, stackText), maxCrashDetailBytes)
+	report := baseCrashReport("crash")
+	report.SchemaVersion = 2
+	report.Source = "go"
+	report.Label = sanitizeCrashField(site, 64)
+	report.ErrorType = sanitizeCrashField(fmt.Sprintf("%T", r), 128)
+	report.ErrorMessage = sanitizeCrashText(fmt.Sprint(r), maxCrashFieldBytes)
+	report.Stack = sanitizeCrashText(stackText, maxCrashStackBytes)
+	report.TopFrame = topFrameFromStack(report.Stack)
+	report.Message = msg
+	_ = writePendingReport(report, true)
+}
+
+func writePendingReport(report crashReport, overwrite bool) bool {
+	body, err := json.Marshal(report)
 	if err != nil {
-		return
+		return false
 	}
 	path := pendingCrashPath()
 	if os.MkdirAll(filepath.Dir(path), 0o755) != nil {
-		return
+		return false
 	}
-	_ = os.WriteFile(path, body, 0o644)
+	if overwrite {
+		return os.WriteFile(path, body, 0o644) == nil
+	}
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	n, err := f.Write(body)
+	if err != nil || n != len(body) {
+		_ = os.Remove(path)
+		return false
+	}
+	return true
+}
+
+func (a *App) goSafe(site string, fn func()) {
+	go func() {
+		defer a.recoverToPending(site)
+		fn()
+	}()
 }
 
 // flushPendingCrash drains a Go panic captured on a prior run and POSTs it, then
@@ -66,7 +89,7 @@ func (a *App) flushPendingCrash() {
 		return
 	}
 	path := pendingCrashPath()
-	body, err := os.ReadFile(path)
+	body, err := readFileUTF8(path)
 	if err != nil {
 		return
 	}

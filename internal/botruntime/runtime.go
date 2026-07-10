@@ -2,6 +2,7 @@ package botruntime
 
 import (
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -12,8 +13,6 @@ import (
 	"reasonix/internal/bot/weixin"
 	"reasonix/internal/config"
 )
-
-var rememberPersistMu sync.Mutex
 
 // EnabledPlatforms resolves the requested channel list against the saved config.
 // "lark" is a domain alias for the Feishu adapter platform.
@@ -160,13 +159,130 @@ func ConnectionChannelConfigs(connections []config.BotConnectionConfig, includeM
 		}
 		if includeWorkspaceRoot {
 			channel.WorkspaceRoot = strings.TrimSpace(conn.WorkspaceRoot)
+			channel.SessionMappings = botSessionMappings(conn.SessionMappings)
 		}
 		if value := normalizeToolApprovalMode(conn.ToolApprovalMode); value != "" {
 			channel.ToolApprovalMode = value
 		}
-		if channel.Model != "" || channel.WorkspaceRoot != "" || channel.ToolApprovalMode != "" {
+		if channel.Model != "" || channel.WorkspaceRoot != "" || channel.ToolApprovalMode != "" || len(channel.SessionMappings) > 0 {
 			out[id] = channel
 		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func ConnectionAccessConfigs(cfg *config.Config) map[string]bot.AccessConfig {
+	if cfg == nil {
+		return nil
+	}
+	out := make(map[string]bot.AccessConfig)
+	if BotAccessActive(cfg.Bot.QQ.Access) {
+		out[string(bot.PlatformQQ)] = botAccessConfig(cfg.Bot.QQ.Access)
+	}
+	for _, conn := range cfg.Bot.Connections {
+		if !conn.Enabled {
+			continue
+		}
+		id := ConnectionRuntimeID(conn)
+		if id == "" || !BotAccessActive(conn.Access) {
+			continue
+		}
+		out[id] = botAccessConfig(conn.Access)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func BotAccessActive(access config.BotAccessConfig) bool {
+	return access.Enabled ||
+		access.AllowAll ||
+		access.PairingEnabled ||
+		len(access.Users) > 0 ||
+		len(access.Groups) > 0 ||
+		len(access.Approvers) > 0 ||
+		len(access.Admins) > 0
+}
+
+func botAccessConfig(access config.BotAccessConfig) bot.AccessConfig {
+	return bot.AccessConfig{
+		Enabled:        access.Enabled,
+		AllowAll:       access.AllowAll,
+		PairingEnabled: access.PairingEnabled,
+		Users:          trimStringSlice(access.Users),
+		Groups:         trimStringSlice(access.Groups),
+		Approvers:      trimStringSlice(access.Approvers),
+		Admins:         trimStringSlice(access.Admins),
+	}
+}
+
+func trimStringSlice(values []string) []string {
+	if len(values) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func botSessionMappings(mappings []config.BotConnectionSessionMapping) []bot.SessionMapping {
+	if len(mappings) == 0 {
+		return nil
+	}
+	out := make([]bot.SessionMapping, 0, len(mappings))
+	for _, mapping := range mappings {
+		out = append(out, bot.SessionMapping{
+			RemoteID:      strings.TrimSpace(mapping.RemoteID),
+			SessionID:     strings.TrimSpace(mapping.SessionID),
+			SessionSource: strings.TrimSpace(mapping.SessionSource),
+			ChatType:      strings.TrimSpace(mapping.ChatType),
+			UserID:        strings.TrimSpace(mapping.UserID),
+			ThreadID:      strings.TrimSpace(mapping.ThreadID),
+			Scope:         strings.TrimSpace(mapping.Scope),
+			WorkspaceRoot: strings.TrimSpace(mapping.WorkspaceRoot),
+			UpdatedAt:     strings.TrimSpace(mapping.UpdatedAt),
+		})
+	}
+	return out
+}
+
+func RouteConfigs(routes []config.BotRouteConfig, includeModel bool, includeWorkspaceRoot bool) []bot.RouteConfig {
+	if len(routes) == 0 {
+		return nil
+	}
+	out := make([]bot.RouteConfig, 0, len(routes))
+	for _, route := range routes {
+		var channel bot.ChannelConfig
+		if includeModel {
+			channel.Model = strings.TrimSpace(route.Model)
+		}
+		if includeWorkspaceRoot {
+			channel.WorkspaceRoot = strings.TrimSpace(route.WorkspaceRoot)
+		}
+		if value := normalizeToolApprovalMode(route.ToolApprovalMode); value != "" {
+			channel.ToolApprovalMode = value
+		}
+		if channel.Model == "" && channel.WorkspaceRoot == "" && channel.ToolApprovalMode == "" {
+			continue
+		}
+		out = append(out, bot.RouteConfig{
+			ConnectionID: strings.TrimSpace(route.ConnectionID),
+			Platform:     bot.Platform(strings.TrimSpace(route.Platform)),
+			ChatType:     bot.ChatType(strings.TrimSpace(route.ChatType)),
+			ChatID:       strings.TrimSpace(route.ChatID),
+			UserID:       strings.TrimSpace(route.UserID),
+			ThreadID:     strings.TrimSpace(route.ThreadID),
+			Channel:      channel,
+		})
 	}
 	if len(out) == 0 {
 		return nil
@@ -273,7 +389,28 @@ func ModelName(cfg *config.Config, override string) string {
 }
 
 func AllowlistUserCount(a config.BotAllowlist) int {
-	return len(a.QQUsers) + len(a.FeishuUsers) + len(a.WeixinUsers)
+	return len(a.QQUsers) + len(a.FeishuUsers) + len(a.WeixinUsers) +
+		len(a.QQApprovers) + len(a.FeishuApprovers) + len(a.WeixinApprovers) +
+		len(a.QQAdmins) + len(a.FeishuAdmins) + len(a.WeixinAdmins)
+}
+
+func BotAccessUserCount(access config.BotAccessConfig) int {
+	return len(access.Users) + len(access.Groups) + len(access.Approvers) + len(access.Admins)
+}
+
+func BotConfigHasAccessControl(bc config.BotConfig) bool {
+	if bc.Allowlist.AllowAll || bc.Pairing.Enabled || (bc.Allowlist.Enabled && AllowlistUserCount(bc.Allowlist) > 0) {
+		return true
+	}
+	if BotAccessActive(bc.QQ.Access) {
+		return true
+	}
+	for _, conn := range bc.Connections {
+		if conn.Enabled && BotAccessActive(conn.Access) {
+			return true
+		}
+	}
+	return false
 }
 
 func NewRemoteRememberer(logger *slog.Logger) func(bot.InboundMessage) {
@@ -306,15 +443,82 @@ func NewRemoteRememberer(logger *slog.Logger) func(bot.InboundMessage) {
 	}
 }
 
+func NewSessionRememberer(logger *slog.Logger) func(bot.InboundMessage, string) error {
+	return NewSessionRemembererWithWorkspace(logger, "")
+}
+
+func NewSessionRemembererWithWorkspace(logger *slog.Logger, workspaceRoot string) func(bot.InboundMessage, string) error {
+	return func(msg bot.InboundMessage, sessionID string) error {
+		if err := RememberInboundSessionWorkspace(msg, sessionID, workspaceRoot); err != nil {
+			if logger != nil {
+				logger.Warn("remember bot session failed", "platform", msg.Platform, "err", err)
+			}
+			return err
+		}
+		return nil
+	}
+}
+
 func RememberInbound(msg bot.InboundMessage) error {
+	return rememberInbound(msg, "", "")
+}
+
+func RememberInboundSession(msg bot.InboundMessage, sessionID string) error {
+	return RememberInboundSessionWorkspace(msg, sessionID, "")
+}
+
+func RememberInboundSessionWorkspace(msg bot.InboundMessage, sessionID string, workspaceRoot string) error {
+	return rememberInbound(msg, strings.TrimSpace(sessionID), strings.TrimSpace(workspaceRoot))
+}
+
+func ForgetAutoSessionMappingsForPath(sessionPath string) error {
+	target := normalizedBotSessionPath(sessionPath)
+	if target == "" {
+		return nil
+	}
+	userPath := config.UserConfigPath()
+	if strings.TrimSpace(userPath) == "" {
+		return nil
+	}
+	unlock := config.LockUserConfigEdits()
+	defer unlock()
+
+	cfg := config.LoadForEdit(userPath)
+	now := time.Now().UTC().Format(time.RFC3339)
+	changed := false
+	for i := range cfg.Bot.Connections {
+		conn := &cfg.Bot.Connections[i]
+		next := conn.SessionMappings[:0]
+		removed := false
+		for _, mapping := range conn.SessionMappings {
+			if strings.TrimSpace(mapping.SessionSource) == "auto" && normalizedBotSessionPath(mapping.SessionID) == target {
+				removed = true
+				continue
+			}
+			next = append(next, mapping)
+		}
+		if !removed {
+			continue
+		}
+		conn.SessionMappings = next
+		conn.UpdatedAt = now
+		changed = true
+	}
+	if !changed {
+		return nil
+	}
+	return cfg.SaveTo(userPath)
+}
+
+func rememberInbound(msg bot.InboundMessage, sessionID string, actualWorkspaceRoot string) error {
 	userPath := config.UserConfigPath()
 	platform := msg.Platform
 	remoteID := strings.TrimSpace(msg.ChatID)
 	if userPath == "" || remoteID == "" {
 		return nil
 	}
-	rememberPersistMu.Lock()
-	defer rememberPersistMu.Unlock()
+	unlock := config.LockUserConfigEdits()
+	defer unlock()
 
 	cfg := config.LoadForEdit(userPath)
 	now := time.Now().UTC().Format(time.RFC3339)
@@ -324,14 +528,27 @@ func RememberInbound(msg bot.InboundMessage) error {
 		if strings.TrimSpace(conn.Provider) != string(platform) || !conn.Enabled || !connectionMatchesInbound(*conn, msg) {
 			continue
 		}
-		exists := false
-		for _, mapping := range conn.SessionMappings {
-			if strings.TrimSpace(mapping.RemoteID) == remoteID {
-				exists = true
+		mappingIndex := -1
+		for j := range conn.SessionMappings {
+			if botSessionMappingMatches(conn.SessionMappings[j], msg) {
+				mappingIndex = j
 				break
 			}
 		}
-		if exists {
+		if mappingIndex >= 0 {
+			if sessionID == "" {
+				continue
+			}
+			mapping := &conn.SessionMappings[mappingIndex]
+			current := strings.TrimSpace(mapping.SessionID)
+			if current == sessionID || botSessionMappingHasExplicitTarget(*mapping) {
+				continue
+			}
+			mapping.SessionID = sessionID
+			mapping.SessionSource = "auto"
+			mapping.UpdatedAt = now
+			conn.UpdatedAt = now
+			changed = true
 			continue
 		}
 		scope := "global"
@@ -339,10 +556,18 @@ func RememberInbound(msg bot.InboundMessage) error {
 		if strings.TrimSpace(conn.WorkspaceRoot) != "" {
 			scope = "project"
 			workspaceRoot = strings.TrimSpace(conn.WorkspaceRoot)
+		} else if actualWorkspaceRoot != "" {
+			scope = "project"
+			workspaceRoot = actualWorkspaceRoot
 		}
+		chatType, userID, threadID := botSessionMappingIdentity(msg)
 		conn.SessionMappings = append(conn.SessionMappings, config.BotConnectionSessionMapping{
 			RemoteID:      remoteID,
-			SessionID:     "",
+			SessionID:     sessionID,
+			SessionSource: botSessionSource(sessionID),
+			ChatType:      chatType,
+			UserID:        userID,
+			ThreadID:      threadID,
 			Scope:         scope,
 			WorkspaceRoot: workspaceRoot,
 			UpdatedAt:     now,
@@ -357,6 +582,71 @@ func RememberInbound(msg bot.InboundMessage) error {
 		return nil
 	}
 	return cfg.SaveTo(userPath)
+}
+
+func botSessionMappingMatches(mapping config.BotConnectionSessionMapping, msg bot.InboundMessage) bool {
+	if strings.TrimSpace(mapping.RemoteID) != strings.TrimSpace(msg.ChatID) {
+		return false
+	}
+	chatType, userID, threadID := botSessionMappingIdentity(msg)
+	mappingChatType := strings.TrimSpace(mapping.ChatType)
+	if mappingChatType == "" {
+		return chatType == ""
+	}
+	if mappingChatType != chatType {
+		return false
+	}
+	if strings.TrimSpace(mapping.UserID) != userID {
+		return false
+	}
+	return strings.TrimSpace(mapping.ThreadID) == threadID
+}
+
+func botSessionMappingIdentity(msg bot.InboundMessage) (chatType string, userID string, threadID string) {
+	switch msg.ChatType {
+	case bot.ChatGroup, bot.ChatGuild:
+		chatType = string(msg.ChatType)
+		userID = strings.TrimSpace(msg.UserID)
+	case bot.ChatThread:
+		chatType = string(msg.ChatType)
+		threadID = strings.TrimSpace(msg.ThreadID)
+		if threadID == "" {
+			threadID = strings.TrimSpace(msg.ChatID)
+		}
+	}
+	return chatType, userID, threadID
+}
+
+func botSessionMappingHasExplicitTarget(mapping config.BotConnectionSessionMapping) bool {
+	sessionID := strings.TrimSpace(mapping.SessionID)
+	if sessionID == "" || strings.TrimSpace(mapping.SessionSource) == "auto" {
+		return false
+	}
+	return true
+}
+
+func botSessionSource(sessionID string) string {
+	if strings.TrimSpace(sessionID) == "" {
+		return ""
+	}
+	return "auto"
+}
+
+func normalizedBotSessionPath(sessionID string) string {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return ""
+	}
+	if strings.HasPrefix(strings.ToLower(sessionID), "path:") {
+		sessionID = strings.TrimSpace(sessionID[5:])
+	}
+	if sessionID == "" {
+		return ""
+	}
+	if !(strings.HasSuffix(sessionID, ".jsonl") || strings.Contains(sessionID, "/") || strings.Contains(sessionID, `\`) || strings.HasPrefix(sessionID, "~")) {
+		return ""
+	}
+	return filepath.Clean(sessionID)
 }
 
 func connectionMatchesInbound(conn config.BotConnectionConfig, msg bot.InboundMessage) bool {

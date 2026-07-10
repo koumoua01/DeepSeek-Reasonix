@@ -42,7 +42,7 @@ func runTool(t *testing.T, tl tool.Tool, m map[string]any) string {
 }
 
 func TestBuiltinsRegistered(t *testing.T) {
-	want := []string{"bash", "edit_file", "glob", "grep", "ls", "multi_edit", "read_file", "web_fetch", "write_file"}
+	want := []string{"bash", "code_index", "edit_file", "glob", "grep", "ls", "move_file", "multi_edit", "read_file", "web_fetch", "write_file"}
 	for _, name := range want {
 		if _, ok := tool.LookupBuiltin(name); !ok {
 			t.Errorf("built-in %q not registered", name)
@@ -57,8 +57,8 @@ func TestBuiltinsRegistered(t *testing.T) {
 // many invocations are pure reads — args aren't introspected.
 func TestBuiltinReadOnlyClassification(t *testing.T) {
 	readOnly := map[string]bool{
-		"read_file": true, "ls": true, "glob": true, "grep": true, "web_fetch": true,
-		"write_file": false, "edit_file": false, "multi_edit": false, "bash": false,
+		"read_file": true, "ls": true, "glob": true, "grep": true, "code_index": true, "web_fetch": true,
+		"write_file": false, "edit_file": false, "multi_edit": false, "move_file": false, "bash": false,
 	}
 	for name, want := range readOnly {
 		tl, ok := tool.LookupBuiltin(name)
@@ -192,6 +192,8 @@ func TestEditFile(t *testing.T) {
 	args := argsJSON(t, map[string]any{"path": f, "old_string": "x", "new_string": "y"})
 	if _, err := (editFile{}).Execute(context.Background(), args); err == nil {
 		t.Fatal("expected not-unique error")
+	} else if !strings.Contains(err.Error(), "repeated separator lines") {
+		t.Fatalf("not-unique error should steer away from weak anchors, got: %v", err)
 	}
 	if b, _ := os.ReadFile(f); string(b) != "x x x" {
 		t.Fatalf("file modified despite error: %q", b)
@@ -281,6 +283,55 @@ func TestWebFetchHTML(t *testing.T) {
 	for _, leak := range []string{"<script", "alert(", "<style", "<h1>", "&amp;"} {
 		if strings.Contains(out, leak) {
 			t.Errorf("leaked raw HTML/script %q", leak)
+		}
+	}
+}
+
+func TestWebFetchHTMLTokenizerHandlesAttributesAndEntities(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body><p title="1 > 0">Tom&#39;s &nbsp; docs</p><script>visible = false</script><p>Next</p></body></html>`))
+	}))
+	defer srv.Close()
+
+	out := runTool(t, webFetch{}, map[string]any{"url": srv.URL})
+	for _, want := range []string{"Tom's docs", "Next"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "visible = false") || strings.Contains(out, "title=") || strings.Contains(out, "&#39;") {
+		t.Fatalf("HTML tokenizer leaked markup/script/entity:\n%s", out)
+	}
+}
+
+func TestWebFetchHTMLStructuredText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><head><title>Doc title</title></head><body>
+<h1>Main</h1>
+<p>Read the <a href="/guide?a=1&amp;b=2">guide</a>.</p>
+<ul><li>First</li><li>Second</li></ul>
+<pre>go test ./...
+line two</pre>
+<table><tr><th>Name</th><th>Value</th></tr><tr><td>A</td><td>42</td></tr></table>
+</body></html>`))
+	}))
+	defer srv.Close()
+
+	out := runTool(t, webFetch{}, map[string]any{"url": srv.URL})
+	for _, want := range []string{
+		"# Doc title",
+		"# Main",
+		"guide (/guide?a=1&b=2)",
+		"- First",
+		"- Second",
+		"```\ngo test ./...\nline two\n```",
+		"Name | Value",
+		"A | 42",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("structured HTML output missing %q:\n%s", want, out)
 		}
 	}
 }
@@ -385,6 +436,21 @@ func TestGlobForwardSlashPattern(t *testing.T) {
 	out := runTool(t, globTool{}, map[string]any{"pattern": "**/*.txt"})
 	if !strings.Contains(out, "top.txt") || !strings.Contains(out, "nested.txt") {
 		t.Errorf("forward-slash recursive pattern should match every .txt:\n%s", out)
+	}
+}
+
+func TestGlobRecursiveDoublestarBracePattern(t *testing.T) {
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "a.go"), []byte("go"), 0o644)
+	os.WriteFile(filepath.Join(dir, "b.txt"), []byte("txt"), 0o644)
+	os.WriteFile(filepath.Join(dir, "c.md"), []byte("md"), 0o644)
+
+	out := runTool(t, globTool{}, map[string]any{"pattern": filepath.Join(dir, "**", "*.{go,txt}")})
+	if !strings.Contains(out, "a.go") || !strings.Contains(out, "b.txt") {
+		t.Fatalf("brace pattern should match go and txt:\n%s", out)
+	}
+	if strings.Contains(out, "c.md") {
+		t.Fatalf("brace pattern should not match markdown:\n%s", out)
 	}
 }
 

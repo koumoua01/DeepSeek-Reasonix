@@ -4,12 +4,15 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode"
+
+	"reasonix/internal/shellparse"
 )
 
 // NormalizePluginCommandLine repairs the common MCP copy/paste mistake where a
 // tutorial's full command line is placed in command while args is left empty.
-// Valid commands that are just paths with spaces are left untouched unless they
-// are quoted or start with a known MCP runner such as npx/uvx/node.
+// Valid commands that are just paths with spaces are left untouched when they
+// look path-like; ordinary custom commands such as "custom-mcp --stdio" still
+// split so the executable and arguments survive GUI/legacy normalization.
 func NormalizePluginCommandLine(e PluginEntry) (PluginEntry, bool) {
 	if pluginEntryTransport(e) != "stdio" || len(e.Args) > 0 {
 		e.Command = strings.TrimSpace(e.Command)
@@ -56,7 +59,11 @@ func shouldSplitPluginCommand(original, first string) bool {
 	if strings.HasPrefix(trimmed, `"`) || strings.HasPrefix(trimmed, `'`) {
 		return true
 	}
-	return knownMCPCommandRunner(first)
+	return knownMCPCommandRunner(first) || !hasPathSeparator(first)
+}
+
+func hasPathSeparator(s string) bool {
+	return strings.ContainsAny(s, `/\`)
 }
 
 func knownMCPCommandRunner(command string) bool {
@@ -81,40 +88,22 @@ func commandBase(command string) string {
 }
 
 func splitPluginCommandLine(s string) ([]string, bool) {
-	var parts []string
-	var b strings.Builder
-	var quote rune
-	inToken := false
-	flush := func() {
-		if !inToken {
-			return
-		}
-		parts = append(parts, b.String())
-		b.Reset()
-		inToken = false
-	}
-	for _, r := range s {
-		if quote == 0 && unicode.IsSpace(r) {
-			flush()
-			continue
-		}
-		if r == '"' || r == '\'' {
-			switch quote {
-			case 0:
-				quote = r
-				inToken = true
-				continue
-			case r:
-				quote = 0
-				continue
-			}
-		}
-		inToken = true
-		b.WriteRune(r)
-	}
-	if quote != 0 {
+	if preservesUnquotedWindowsPath(s) {
 		return nil, false
 	}
-	flush()
-	return parts, true
+	fields, malformed := shellparse.StaticFields(s)
+	if malformed != "" {
+		return nil, false
+	}
+	return fields, true
+}
+
+func preservesUnquotedWindowsPath(s string) bool {
+	trimmed := strings.TrimLeftFunc(s, unicode.IsSpace)
+	if strings.HasPrefix(trimmed, `"`) || strings.HasPrefix(trimmed, `'`) {
+		return false
+	}
+	first, _, _ := strings.Cut(trimmed, " ")
+	first, _, _ = strings.Cut(first, "\t")
+	return strings.Contains(first, `\`) && strings.ContainsAny(trimmed, " \t\r\n")
 }

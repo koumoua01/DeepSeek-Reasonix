@@ -10,8 +10,10 @@ export type ContextMenuItem =
       key: string;
       icon?: ReactNode;
       label: ReactNode;
+      shortcut?: string;
       disabled?: boolean;
       danger?: boolean;
+      variant?: "section";
       onSelect: () => void;
     }
   | {
@@ -44,6 +46,7 @@ export function ContextMenu({
   point,
   items,
   onClose,
+  className,
   minWidth = 180,
   ariaLabel = "Context menu",
 }: {
@@ -51,6 +54,7 @@ export function ContextMenu({
   point: ContextMenuPoint | null;
   items: ContextMenuItem[];
   onClose: () => void;
+  className?: string;
   minWidth?: number;
   ariaLabel?: string;
 }) {
@@ -93,7 +97,7 @@ export function ContextMenu({
   return createPortal(
     <div
       ref={menuRef}
-      className="context-menu"
+      className={`context-menu${className ? ` ${className}` : ""}`}
       role="menu"
       aria-label={ariaLabel}
       style={{ left: position.left, top: position.top, minWidth }}
@@ -117,7 +121,7 @@ export function ContextMenu({
             type="button"
             role="menuitem"
             disabled={item.disabled}
-            className={`context-menu__item${item.danger ? " context-menu__item--danger" : ""}`}
+            className={`context-menu__item${item.danger ? " context-menu__item--danger" : ""}${item.variant ? ` context-menu__item--${item.variant}` : ""}`}
             onClick={(event) => {
               event.stopPropagation();
               if (!item.disabled) item.onSelect();
@@ -125,6 +129,7 @@ export function ContextMenu({
           >
             {item.icon}
             <span>{item.label}</span>
+            {item.shortcut && <span className="context-menu__shortcut">{item.shortcut}</span>}
           </button>
         );
       })}

@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"reasonix/internal/proc"
+	"reasonix/internal/secrets"
 )
 
 const closeWaitBudget = 5 * time.Second
@@ -42,14 +43,30 @@ type stdioTransport struct {
 	pending map[int]chan rpcResponse
 	readErr error // set once the reader goroutine exits; further calls fail fast
 
-	waitOnce sync.Once
+	waitOnce    sync.Once
+	releaseSlot func() // returns a bounded instance slot (e.g. CodeGraph) on close; nil when unbounded
 }
 
 func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 	if strings.TrimSpace(s.Command) == "" {
 		return nil, fmt.Errorf("stdio plugin %q: command is required", s.Name)
 	}
-	env := mergeEnv(os.Environ(), s.Env)
+	var releaseSlot func()
+	if isCodeGraphSpecName(s.Name) {
+		release, err := acquireCodeGraphSlot()
+		if err != nil {
+			return nil, err
+		}
+		releaseSlot = release
+	}
+	defer func() {
+		// Release the reserved slot if construction fails before the transport
+		// takes ownership of it (set to nil on the success path below).
+		if releaseSlot != nil {
+			releaseSlot()
+		}
+	}()
+	env := mergeEnv(secrets.ProcessEnv(), s.Env)
 	exe, env, err := resolveStdioExecutable(ctx, s, env)
 	if err != nil {
 		return nil, err
@@ -85,21 +102,81 @@ func newStdioTransport(ctx context.Context, s Spec) (*stdioTransport, error) {
 		proc.LowPriorityStarted(cmd)
 	}
 	t := &stdioTransport{
-		name:    s.Name,
-		cmd:     cmd,
-		job:     job,
-		stdin:   stdin,
-		stdout:  bufio.NewReader(stdout),
-		stderr:  stderr,
-		pending: map[int]chan rpcResponse{},
+		name:        s.Name,
+		cmd:         cmd,
+		job:         job,
+		stdin:       stdin,
+		stdout:      bufio.NewReader(stdout),
+		stderr:      stderr,
+		pending:     map[int]chan rpcResponse{},
+		releaseSlot: releaseSlot,
 	}
+	releaseSlot = nil // ownership transferred to t; close() releases it
 	go t.readLoop()
 	return t, nil
 }
 
-var stdioShellPATH = defaultStdioShellPATH
+var stdioShellPATH = cachedShellPATH(defaultStdioShellPATH)
+
+// cachedShellPATH memoizes the first completed shell-PATH probe: the user's
+// interactive PATH is stable for the process, and resolveStdioExecutable now
+// probes for every stdio plugin, so caching avoids a login shell per server.
+// The probe runs up to three login shells with a 2s timeout each, so it must
+// not run under the lock; concurrent spawns share the in-flight probe instead
+// of each running (or queueing behind) their own. Empty results are cached too
+// — a host without a usable login shell must not re-probe on every spawn —
+// except when the probe's context was cancelled, since that empty reflects the
+// aborted caller rather than the host, and caching it would pin "" for the
+// rest of the process.
+func cachedShellPATH(probe func(context.Context) string) func(context.Context) string {
+	var (
+		mu       sync.Mutex
+		cached   string
+		done     bool
+		inflight chan struct{} // non-nil while a probe runs; closed when it settles
+	)
+	return func(ctx context.Context) string {
+		for {
+			mu.Lock()
+			if done {
+				p := cached
+				mu.Unlock()
+				return p
+			}
+			if inflight != nil {
+				wait := inflight
+				mu.Unlock()
+				select {
+				case <-wait:
+					continue // re-check: the probe may not have cached (cancelled)
+				case <-ctx.Done():
+					return ""
+				}
+			}
+			ch := make(chan struct{})
+			inflight = ch
+			mu.Unlock()
+
+			p := probe(ctx)
+
+			mu.Lock()
+			inflight = nil
+			if p != "" || ctx.Err() == nil {
+				cached, done = p, true
+			}
+			mu.Unlock()
+			close(ch)
+			return p
+		}
+	}
+}
 
 func resolveStdioExecutable(ctx context.Context, s Spec, env []string) (string, []string, error) {
+	// Unconditionally enrich PATH with the user's shell PATH so every
+	// subprocess—including wrapper scripts that invoke npx, uvx, etc.—
+	// inherits the expected tool locations even under a GUI launch.
+	env = enrichStdioShellPATH(ctx, env)
+
 	if hasPathSeparator(s.Command) {
 		return s.Command, env, nil
 	}
@@ -108,17 +185,6 @@ func resolveStdioExecutable(ctx context.Context, s Spec, env []string) (string, 
 	}
 
 	currentPath, _ := envValue(env, "PATH")
-	if shellPath := strings.TrimSpace(stdioShellPATH(ctx)); shellPath != "" {
-		fallbackPath := mergePathLists(shellPath, currentPath)
-		if fallbackPath != currentPath {
-			fallbackEnv := setEnvValue(env, "PATH", fallbackPath)
-			if exe, ok := lookPathInEnv(s.Command, fallbackEnv); ok {
-				return exe, fallbackEnv, nil
-			}
-			env = fallbackEnv
-			currentPath = fallbackPath
-		}
-	}
 	if runtime.GOOS == "windows" {
 		fallbackPath := mergePathLists(windowsStdioFallbackPATH(env), currentPath)
 		if fallbackPath != currentPath {
@@ -133,6 +199,20 @@ func resolveStdioExecutable(ctx context.Context, s Spec, env []string) (string, 
 
 	return "", env, fmt.Errorf("stdio plugin %q: command %q not found on PATH; GUI launches and non-interactive sessions may not inherit your shell PATH. Use an absolute command path or set PATH in the MCP server env. PATH=%q",
 		s.Name, s.Command, currentPath)
+}
+
+// enrichStdioShellPATH probes the user's interactive login shell for its PATH
+// and prepends those directories to the current environment. The result is the
+// subprocess environment with a PATH that matches what the user sees in their
+// terminal, even when Reasonix was launched from the Finder / Dock / open(1).
+func enrichStdioShellPATH(ctx context.Context, env []string) []string {
+	currentPath, _ := envValue(env, "PATH")
+	if shellPath := strings.TrimSpace(stdioShellPATH(ctx)); shellPath != "" {
+		if fallbackPath := mergePathLists(shellPath, currentPath); fallbackPath != currentPath {
+			env = setEnvValue(env, "PATH", fallbackPath)
+		}
+	}
+	return env
 }
 
 func hasPathSeparator(s string) bool {
@@ -270,7 +350,7 @@ func stdioShell() string {
 			if isExecutableFile(shell) {
 				return shell
 			}
-		} else if exe, ok := lookPathInEnv(shell, os.Environ()); ok {
+		} else if exe, ok := lookPathInEnv(shell, secrets.ProcessEnv()); ok {
 			return exe
 		}
 	}
@@ -286,6 +366,9 @@ func runShellPATHCommand(parent context.Context, shell string, args []string) []
 	ctx, cancel := context.WithTimeout(parent, 2*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, shell, args...)
+	// Explicit env so the login-shell probe honors [secrets]
+	// filter_subprocess_env instead of inheriting the full environment.
+	cmd.Env = secrets.ProcessEnv()
 	prepareStdioShellPATHProbe(cmd)
 	cmd.Stdin = strings.NewReader("")
 	out, _ := cmd.CombinedOutput()
@@ -475,7 +558,11 @@ func (t *stdioTransport) withStderr(err error) error {
 	if t.stderr == nil {
 		return err
 	}
-	t.wait() // reap the exited child so its stderr copy goroutine has flushed the tail
+	// Reap the exited child so its stderr copy goroutine has flushed the tail.
+	// Budgeted: a surviving grandchild keeps cmd.Wait blocked forever (see
+	// close), and this path runs with callMu held — an unbounded wait here
+	// would wedge every future call on this transport.
+	waitWithBudget(t.wait, closeWaitBudget)
 	msg := t.stderr.String()
 	if msg == "" {
 		return err
@@ -493,11 +580,27 @@ func (t *stdioTransport) wait() {
 	})
 }
 
+// waitWithBudget runs wait in a goroutine and returns once it finishes or the
+// budget elapses, whichever comes first. On timeout the goroutine is left to
+// complete the reap in the background, so wait must be safe to abandon
+// (stdioTransport.wait is single-shot via waitOnce).
+func waitWithBudget(wait func(), budget time.Duration) {
+	done := make(chan struct{})
+	go func() { wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(budget):
+	}
+}
+
 // close kills the whole process tree (a launcher's surviving grandchild keeps
 // the inherited stdio pipes open, so a plain Process.Kill leaves cmd.Wait
 // blocking forever) and reaps it under a budget so one wedged server can never
 // stall a boot or a turn teardown.
 func (t *stdioTransport) close() {
+	if t.releaseSlot != nil {
+		t.releaseSlot() // idempotent; frees the bounded CodeGraph instance slot
+	}
 	if t.stdin != nil {
 		_ = t.stdin.Close()
 	}
@@ -505,12 +608,7 @@ func (t *stdioTransport) close() {
 		return
 	}
 	proc.KillTracked(t.cmd, t.job)
-	done := make(chan struct{})
-	go func() { t.wait(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(closeWaitBudget):
-	}
+	waitWithBudget(t.wait, closeWaitBudget)
 }
 
 type tailBuffer struct {

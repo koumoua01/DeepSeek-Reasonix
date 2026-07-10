@@ -15,6 +15,7 @@ import (
 	"reasonix/internal/bot"
 	"reasonix/internal/bot/feishu"
 	"reasonix/internal/bot/weixin"
+	"reasonix/internal/botruntime"
 	"reasonix/internal/config"
 )
 
@@ -29,6 +30,10 @@ type BotConnectionCredentialView struct {
 type BotConnectionSessionMappingView struct {
 	RemoteID      string `json:"remoteId"`
 	SessionID     string `json:"sessionId"`
+	SessionSource string `json:"sessionSource"`
+	ChatType      string `json:"chatType"`
+	UserID        string `json:"userId"`
+	ThreadID      string `json:"threadId"`
 	Scope         string `json:"scope"`
 	WorkspaceRoot string `json:"workspaceRoot"`
 	UpdatedAt     string `json:"updatedAt"`
@@ -44,6 +49,7 @@ type BotConnectionView struct {
 	Model            string                            `json:"model"`
 	ToolApprovalMode string                            `json:"toolApprovalMode"`
 	WorkspaceRoot    string                            `json:"workspaceRoot"`
+	Access           BotAccessView                     `json:"access"`
 	Credential       BotConnectionCredentialView       `json:"credential"`
 	SessionMappings  []BotConnectionSessionMappingView `json:"sessionMappings"`
 	LastError        string                            `json:"lastError"`
@@ -73,11 +79,16 @@ type BotInstallPollResult struct {
 }
 
 type BotConnectionDiagnostic struct {
-	ID        string `json:"id"`
-	Label     string `json:"label"`
-	Status    string `json:"status"`
-	Message   string `json:"message"`
-	MessageID string `json:"messageId"`
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	Status       string `json:"status"`
+	Message      string `json:"message"`
+	MessageID    string `json:"messageId"`
+	Phase        string `json:"phase"`
+	Code         string `json:"code"`
+	ReportKind   string `json:"reportKind"`
+	ReportDetail string `json:"reportDetail"`
+	OccurredAt   string `json:"occurredAt"`
 }
 
 type botInstallSession struct {
@@ -127,12 +138,19 @@ func (a *App) StartBotConnectionInstall(provider, domain string) (BotInstallStar
 
 func (a *App) PollBotConnectionInstall(installID string) (BotInstallPollResult, error) {
 	installID = strings.TrimSpace(installID)
+	// Copy the session under a.mu: overlapping polls of the same install can
+	// race the locked PollDomain upgrade below with unlocked field reads.
 	a.mu.RLock()
-	session := a.botInstalls[installID]
+	sessionPtr := a.botInstalls[installID]
+	var sessionCopy botInstallSession
+	if sessionPtr != nil {
+		sessionCopy = *sessionPtr
+	}
 	a.mu.RUnlock()
-	if session == nil {
+	if sessionPtr == nil {
 		return BotInstallPollResult{Error: "install session not found"}, nil
 	}
+	session := &sessionCopy
 	if time.Now().After(session.ExpireAt) {
 		a.deleteBotInstall(installID)
 		return BotInstallPollResult{Status: "expired", Error: "install session expired"}, nil
@@ -155,6 +173,7 @@ func (a *App) PollBotConnectionInstall(installID string) (BotInstallPollResult, 
 			Label:      "微信",
 			Enabled:    true,
 			Status:     "connected",
+			Access:     botInstallAccess(result.UserID),
 			Credential: config.BotConnectionCredential{AccountID: result.AccountID, TokenEnv: "WEIXIN_BOT_TOKEN"},
 		}, func(c *config.Config) {
 			c.Bot.Enabled = true
@@ -178,32 +197,54 @@ func (a *App) PollBotConnectionInstall(installID string) (BotInstallPollResult, 
 func (a *App) DiagnoseBotConnection(id string) (BotConnectionDiagnostic, error) {
 	cfg, err := a.loadDesktopBotConfig()
 	if err != nil {
-		return BotConnectionDiagnostic{ID: id, Status: "error", Message: err.Error()}, nil
+		return botConnectionDiagnostic(nil, id, "error", "config", "config_load_failed", err.Error(), true), nil
 	}
 	for _, conn := range cfg.Bot.Connections {
 		if conn.ID == id {
 			status := "ok"
 			message := "连接配置已保存。"
+			phase := "config"
+			code := "config_ok"
+			reportable := false
 			if !conn.Enabled {
 				status = "disabled"
 				message = "连接已保存但未启用。"
+				code = "connection_disabled"
 			} else if conn.Status != "connected" {
 				status = firstNonEmptyBot(conn.Status, "pending")
 				message = firstNonEmptyBot(conn.LastError, "连接还未完成。")
+				phase = "install"
+				code = "connection_not_connected"
+				reportable = status == "error" || strings.TrimSpace(conn.LastError) != ""
 			} else if conn.Credential.AppSecretEnv != "" && strings.TrimSpace(conn.Credential.AppSecretEnv) != "" && !envIsSet(conn.Credential.AppSecretEnv) {
 				status = "warning"
 				message = conn.Credential.AppSecretEnv + " 未设置。"
+				phase = "credential"
+				code = "secret_missing"
+				reportable = true
+			} else if conn.Credential.TokenEnv != "" && strings.TrimSpace(conn.Credential.TokenEnv) != "" && !botCredentialSecretSet(conn) {
+				status = "warning"
+				message = conn.Credential.TokenEnv + " 未设置，且未找到已保存的登录凭据。"
+				phase = "credential"
+				code = "secret_missing"
+				reportable = true
+			} else if conn.Provider == "weixin" && !botCredentialSecretSet(conn) {
+				status = "warning"
+				message = "未找到已保存的微信登录凭据。"
+				phase = "credential"
+				code = "secret_missing"
+				reportable = true
 			}
-			return BotConnectionDiagnostic{ID: conn.ID, Label: conn.Label, Status: status, Message: message}, nil
+			return botConnectionDiagnostic(&conn, conn.ID, status, phase, code, message, reportable), nil
 		}
 	}
-	return BotConnectionDiagnostic{ID: id, Status: "missing", Message: "未找到连接。"}, nil
+	return botConnectionDiagnostic(nil, id, "missing", "config", "connection_missing", "未找到连接。", true), nil
 }
 
 func (a *App) TestBotConnection(id, target string) (BotConnectionDiagnostic, error) {
 	cfg, err := a.loadDesktopBotConfig()
 	if err != nil {
-		return BotConnectionDiagnostic{ID: id, Status: "error", Message: err.Error()}, nil
+		return botConnectionDiagnostic(nil, id, "error", "config", "config_load_failed", err.Error(), true), nil
 	}
 	var conn *config.BotConnectionConfig
 	for i := range cfg.Bot.Connections {
@@ -213,14 +254,14 @@ func (a *App) TestBotConnection(id, target string) (BotConnectionDiagnostic, err
 		}
 	}
 	if conn == nil {
-		return BotConnectionDiagnostic{ID: id, Status: "missing", Message: "未找到连接。"}, nil
+		return botConnectionDiagnostic(nil, id, "missing", "config", "connection_missing", "未找到连接。", true), nil
 	}
 	target = firstNonEmptyBot(strings.TrimSpace(target), firstSessionRemoteID(conn.SessionMappings))
 	if conn.Provider != "feishu" && conn.Provider != "weixin" {
-		return BotConnectionDiagnostic{ID: conn.ID, Label: conn.Label, Status: "warning", Message: "当前渠道暂不支持桌面端主动发送测试消息，可使用诊断检查基础配置。"}, nil
+		return botConnectionDiagnostic(conn, conn.ID, "warning", "send", "test_send_unsupported", "当前渠道暂不支持桌面端主动发送测试消息，可使用诊断检查基础配置。", false), nil
 	}
 	if target == "" {
-		return BotConnectionDiagnostic{ID: conn.ID, Label: conn.Label, Status: "warning", Message: "请输入测试会话 ID 后再发送测试消息。"}, nil
+		return botConnectionDiagnostic(conn, conn.ID, "warning", "send", "test_target_missing", "请输入测试会话 ID 后再发送测试消息。", false), nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -241,14 +282,163 @@ func (a *App) TestBotConnection(id, target string) (BotConnectionDiagnostic, err
 		result, err = weixin.SendText(ctx, weixinCfg, target, "Reasonix bot 测试消息：连接和发送链路可用。")
 	}
 	if err != nil {
-		return BotConnectionDiagnostic{ID: conn.ID, Label: conn.Label, Status: "error", Message: err.Error()}, nil
+		return botConnectionDiagnostic(conn, conn.ID, "error", "send", "test_send_failed", err.Error(), true), nil
 	}
 	_ = a.rememberBotConnectionRemote(conn.ID, target)
 	msg := "测试消息已发送。"
 	if result.MessageID != "" {
 		msg += " Message ID: " + result.MessageID
 	}
-	return BotConnectionDiagnostic{ID: conn.ID, Label: conn.Label, Status: "ok", Message: msg, MessageID: result.MessageID}, nil
+	diag := botConnectionDiagnostic(conn, conn.ID, "ok", "send", "test_send_ok", msg, false)
+	diag.MessageID = result.MessageID
+	return diag, nil
+}
+
+func botConnectionDiagnostic(conn *config.BotConnectionConfig, id, status, phase, code, message string, reportable bool) BotConnectionDiagnostic {
+	id = strings.TrimSpace(id)
+	label := ""
+	if conn != nil {
+		id = firstNonEmptyBot(strings.TrimSpace(conn.ID), id)
+		label = strings.TrimSpace(conn.Label)
+	}
+	occurredAt := time.Now().UTC().Format(time.RFC3339)
+	diag := BotConnectionDiagnostic{
+		ID:         id,
+		Label:      label,
+		Status:     strings.TrimSpace(status),
+		Message:    strings.TrimSpace(message),
+		Phase:      strings.TrimSpace(phase),
+		Code:       strings.TrimSpace(code),
+		OccurredAt: occurredAt,
+	}
+	if reportable {
+		diag.ReportKind = "bot"
+		diag.ReportDetail = botConnectionReportDetail(conn, id, diag.Status, diag.Phase, diag.Code, diag.Message, occurredAt)
+		if diag.ReportDetail == "" {
+			diag.ReportKind = ""
+		}
+	}
+	return diag
+}
+
+func botConnectionReportDetail(conn *config.BotConnectionConfig, fallbackID, status, phase, code, message, occurredAt string) string {
+	provider := "unknown"
+	domain := "unknown"
+	configuredStatus := ""
+	enabled := false
+	workspaceScope := "global"
+	sessionMappings := 0
+	appIDSet := false
+	appSecretEnvConfigured := false
+	tokenEnvConfigured := false
+	secretAvailable := false
+	if conn != nil {
+		provider = firstNonEmptyBot(strings.TrimSpace(conn.Provider), provider)
+		domain = firstNonEmptyBot(strings.TrimSpace(conn.Domain), domain)
+		configuredStatus = strings.TrimSpace(conn.Status)
+		enabled = conn.Enabled
+		if strings.TrimSpace(conn.WorkspaceRoot) != "" {
+			workspaceScope = "project"
+		}
+		sessionMappings = len(conn.SessionMappings)
+		appIDSet = strings.TrimSpace(conn.Credential.AppID) != ""
+		appSecretEnvConfigured = strings.TrimSpace(conn.Credential.AppSecretEnv) != ""
+		tokenEnvConfigured = strings.TrimSpace(conn.Credential.TokenEnv) != ""
+		secretAvailable = botCredentialSecretSet(*conn)
+	}
+	summary := botConnectionReportSummary(code, message)
+	lines := []string{
+		"Bot connection diagnostic",
+		"",
+		"connection_id: " + safeBotReportValue(fallbackID),
+		"provider: " + safeBotReportValue(provider),
+		"domain: " + safeBotReportValue(domain),
+		"status: " + safeBotReportValue(status),
+		"phase: " + safeBotReportValue(phase),
+		"code: " + safeBotReportValue(code),
+		fmt.Sprintf("enabled: %t", enabled),
+		"configured_status: " + safeBotReportValue(configuredStatus),
+		fmt.Sprintf("app_id_set: %t", appIDSet),
+		fmt.Sprintf("app_secret_env_configured: %t", appSecretEnvConfigured),
+		fmt.Sprintf("token_env_configured: %t", tokenEnvConfigured),
+		fmt.Sprintf("secret_available: %t", secretAvailable),
+		"workspace_scope: " + workspaceScope,
+		fmt.Sprintf("session_mappings: %d", sessionMappings),
+		"",
+		"summary: " + summary,
+	}
+	payload := frontendCrashPayload{
+		SchemaVersion: 2,
+		Kind:          "bot",
+		Source:        "bot.runtime",
+		Label:         botConnectionReportLabel(provider, domain, phase),
+		Message:       strings.Join(lines, "\n"),
+		ErrorType:     "BotConnectionDiagnostic",
+		ErrorMessage:  summary,
+		TopFrame:      "bot." + safeBotReportSegment(phase),
+		OccurredAt:    occurredAt,
+	}
+	detail, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return string(detail)
+}
+
+func botConnectionReportSummary(code, message string) string {
+	switch strings.TrimSpace(code) {
+	case "config_load_failed":
+		return "desktop bot config could not be loaded: " + scrubSensitiveText(message)
+	case "connection_missing":
+		return "bot connection record was not found"
+	case "connection_not_connected":
+		return "bot connection is not connected: " + scrubSensitiveText(message)
+	case "secret_missing":
+		return "required bot credential is not available"
+	case "test_send_failed":
+		return "bot test message failed: " + scrubSensitiveText(message)
+	default:
+		if strings.TrimSpace(message) == "" {
+			return strings.TrimSpace(code)
+		}
+		return scrubSensitiveText(message)
+	}
+}
+
+func botConnectionReportLabel(provider, domain, phase string) string {
+	parts := []string{"bot", safeBotReportSegment(provider), safeBotReportSegment(domain), safeBotReportSegment(phase)}
+	return strings.Trim(strings.Join(parts, "."), ".")
+}
+
+func safeBotReportSegment(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if s == "" {
+		return "unknown"
+	}
+	var b strings.Builder
+	for _, r := range s {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+			b.WriteRune(r)
+			continue
+		}
+		if b.Len() == 0 || strings.HasSuffix(b.String(), ".") {
+			continue
+		}
+		b.WriteByte('.')
+	}
+	out := strings.Trim(b.String(), ".")
+	if out == "" {
+		return "unknown"
+	}
+	return out
+}
+
+func safeBotReportValue(s string) string {
+	s = safeBotReportSegment(s)
+	if len(s) > 80 {
+		return s[:80]
+	}
+	return s
 }
 
 func (a *App) startFeishuConnectionInstall(domain string) (BotInstallStartResult, error) {
@@ -338,6 +528,7 @@ func (a *App) pollFeishuConnectionInstall(installID string, session *botInstallS
 		Label:      label,
 		Enabled:    true,
 		Status:     "connected",
+		Access:     botInstallAccess(userID),
 		Credential: config.BotConnectionCredential{AppID: appID, AppSecretEnv: secretEnv},
 	}, func(c *config.Config) {
 		c.Bot.Enabled = true
@@ -365,6 +556,9 @@ func (a *App) upsertBotConnection(conn config.BotConnectionConfig, updateLegacy 
 	if conn.Status == "" {
 		conn.Status = "connected"
 	}
+	if normalizeBotConnectionToolApprovalMode(conn.ToolApprovalMode) == "" {
+		conn.ToolApprovalMode = "ask"
+	}
 	if conn.ID == "" {
 		conn.ID = connectionID(conn.Provider, conn.Domain)
 	}
@@ -376,6 +570,9 @@ func (a *App) upsertBotConnection(conn config.BotConnectionConfig, updateLegacy 
 		for i, existing := range c.Bot.Connections {
 			if existing.ID == conn.ID {
 				conn.CreatedAt = firstNonEmptyBot(existing.CreatedAt, conn.CreatedAt)
+				if !botruntime.BotAccessActive(conn.Access) && botruntime.BotAccessActive(existing.Access) {
+					conn.Access = existing.Access
+				}
 				c.Bot.Connections[i] = conn
 				replaced = true
 				break
@@ -517,6 +714,7 @@ func botConnectionView(conn config.BotConnectionConfig) BotConnectionView {
 	return BotConnectionView{
 		ID: conn.ID, Provider: conn.Provider, Domain: conn.Domain, Label: conn.Label, Enabled: conn.Enabled, Status: conn.Status,
 		Model: conn.Model, ToolApprovalMode: normalizeBotConnectionToolApprovalMode(conn.ToolApprovalMode), WorkspaceRoot: conn.WorkspaceRoot,
+		Access: botAccessViewFromConfig(conn.Access),
 		Credential: BotConnectionCredentialView{
 			AppID: conn.Credential.AppID, AppSecretEnv: conn.Credential.AppSecretEnv, AccountID: conn.Credential.AccountID, TokenEnv: conn.Credential.TokenEnv,
 			SecretSet: botCredentialSecretSet(conn),
@@ -583,8 +781,9 @@ func botConnectionConfig(view BotConnectionView) config.BotConnectionConfig {
 		Enabled:          view.Enabled,
 		Status:           strings.TrimSpace(view.Status),
 		Model:            strings.TrimSpace(view.Model),
-		ToolApprovalMode: normalizeBotConnectionToolApprovalMode(view.ToolApprovalMode),
+		ToolApprovalMode: firstNonEmptyBot(normalizeBotConnectionToolApprovalMode(view.ToolApprovalMode), "ask"),
 		WorkspaceRoot:    strings.TrimSpace(view.WorkspaceRoot),
+		Access:           botAccessConfigFromView(view.Access),
 		Credential: config.BotConnectionCredential{
 			AppID:        strings.TrimSpace(view.Credential.AppID),
 			AppSecretEnv: strings.TrimSpace(view.Credential.AppSecretEnv),
@@ -654,6 +853,10 @@ func botSessionMappingViews(mappings []config.BotConnectionSessionMapping, conne
 		out = append(out, BotConnectionSessionMappingView{
 			RemoteID:      m.RemoteID,
 			SessionID:     m.SessionID,
+			SessionSource: m.SessionSource,
+			ChatType:      m.ChatType,
+			UserID:        m.UserID,
+			ThreadID:      m.ThreadID,
 			Scope:         scope,
 			WorkspaceRoot: botMappingWorkspaceRoot(scope, workspaceRoot),
 			UpdatedAt:     m.UpdatedAt,
@@ -673,6 +876,10 @@ func botSessionMappingConfigs(mappings []BotConnectionSessionMappingView, connec
 		out = append(out, config.BotConnectionSessionMapping{
 			RemoteID:      strings.TrimSpace(m.RemoteID),
 			SessionID:     strings.TrimSpace(m.SessionID),
+			SessionSource: strings.TrimSpace(m.SessionSource),
+			ChatType:      strings.TrimSpace(m.ChatType),
+			UserID:        strings.TrimSpace(m.UserID),
+			ThreadID:      strings.TrimSpace(m.ThreadID),
 			Scope:         scope,
 			WorkspaceRoot: botMappingWorkspaceRoot(scope, workspaceRoot),
 			UpdatedAt:     strings.TrimSpace(m.UpdatedAt),
@@ -683,6 +890,15 @@ func botSessionMappingConfigs(mappings []BotConnectionSessionMappingView, connec
 
 func connectionID(provider, domain string) string {
 	return strings.Trim(strings.ToLower(provider+"-"+domain), "-")
+}
+
+func botInstallAccess(userID string) config.BotAccessConfig {
+	userID = strings.TrimSpace(userID)
+	access := config.BotAccessConfig{Enabled: true, PairingEnabled: true}
+	if userID != "" {
+		access.Users = []string{userID}
+	}
+	return access
 }
 
 func randomInstallID() string {

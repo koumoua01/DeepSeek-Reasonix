@@ -3,6 +3,8 @@ package hook
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -109,6 +111,52 @@ func TestRunnerPostToolUseWarn(t *testing.T) {
 	}
 }
 
+// --- Runner.PermissionRequest ---
+
+func TestRunnerPermissionRequestPayload(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "notify", Match: "bash"}, Event: PermissionRequest},
+	}
+	var got Payload
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		if err := json.Unmarshal([]byte(in.Stdin), &got); err != nil {
+			t.Fatalf("payload json: %v", err)
+		}
+		return SpawnResult{ExitCode: 0}
+	}
+	args := json.RawMessage(`{"command":"go test ./..."}`)
+	r := NewRunner(hooks, "/tmp", spawner, nil)
+	r.PermissionRequest(context.Background(), "bash", "go test ./...", args)
+
+	if got.Event != PermissionRequest {
+		t.Errorf("Event = %q, want PermissionRequest", got.Event)
+	}
+	if got.ToolName != "bash" {
+		t.Errorf("ToolName = %q, want bash", got.ToolName)
+	}
+	if got.Subject != "go test ./..." {
+		t.Errorf("Subject = %q, want command subject", got.Subject)
+	}
+	if string(got.ToolArgs) != string(args) {
+		t.Errorf("ToolArgs = %s, want %s", got.ToolArgs, args)
+	}
+}
+
+func TestRunnerPermissionRequestWarnOnly(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "warn"}, Event: PermissionRequest},
+	}
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		return SpawnResult{ExitCode: 2, Stderr: "notification failed"}
+	}
+	var notified string
+	r := NewRunner(hooks, "/tmp", spawner, func(msg string) { notified = msg })
+	r.PermissionRequest(context.Background(), "bash", "go test", nil)
+	if notified == "" {
+		t.Error("PermissionRequest warn should notify")
+	}
+}
+
 // --- Runner.PromptSubmit ---
 
 func TestRunnerPromptSubmitBlock(t *testing.T) {
@@ -142,6 +190,68 @@ func TestRunnerStopWithHooks(t *testing.T) {
 	}
 	r := NewRunner(hooks, "/tmp", spawner, nil)
 	r.Stop(context.Background(), "done", 1)
+}
+
+func TestRunnerSessionStartReturnsAdditionalContexts(t *testing.T) {
+	hooks := []ResolvedHook{
+		{HookConfig: HookConfig{Command: "plain"}, Event: SessionStart},
+		{HookConfig: HookConfig{Command: "json"}, Event: SessionStart},
+	}
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		switch in.Command {
+		case "plain":
+			return SpawnResult{ExitCode: 0, Stdout: "Load notes."}
+		case "json":
+			return SpawnResult{ExitCode: 0, Stdout: `{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"Use Superpowers."}}`}
+		default:
+			return SpawnResult{ExitCode: 1, Stderr: "unexpected"}
+		}
+	}
+	r := NewRunner(hooks, "/tmp", spawner, nil)
+	got := r.SessionStart(context.Background())
+	if len(got) != 2 || got[0] != "Load notes." || got[1] != "Use Superpowers." {
+		t.Fatalf("SessionStart contexts = %#v", got)
+	}
+}
+
+func TestRunnerSessionStartReadsContextFile(t *testing.T) {
+	dir := t.TempDir()
+	contextPath := filepath.Join(dir, "CLAUDE.md")
+	if err := os.WriteFile(contextPath, []byte("Use the packaged workflow."), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	calledSpawner := false
+	r := NewRunner([]ResolvedHook{{
+		HookConfig: HookConfig{ContextFile: contextPath, Description: "Plugin CLAUDE.md"},
+		Event:      SessionStart,
+		Scope:      ScopePlugin,
+	}}, dir, func(context.Context, SpawnInput) SpawnResult {
+		calledSpawner = true
+		return SpawnResult{ExitCode: 1}
+	}, nil)
+
+	got := r.SessionStart(context.Background())
+	if calledSpawner {
+		t.Fatal("context file hook should not invoke shell spawner")
+	}
+	if len(got) != 1 || got[0] != "Use the packaged workflow." {
+		t.Fatalf("SessionStart contexts = %#v", got)
+	}
+}
+
+func TestRunnerSessionStartWarnsOnInvalidJSON(t *testing.T) {
+	hooks := []ResolvedHook{{HookConfig: HookConfig{Command: "bad-json"}, Event: SessionStart}}
+	spawner := func(_ context.Context, in SpawnInput) SpawnResult {
+		return SpawnResult{ExitCode: 0, Stdout: `{"hookSpecificOutput":`}
+	}
+	var notified string
+	r := NewRunner(hooks, "/tmp", spawner, func(msg string) { notified = msg })
+	if got := r.SessionStart(context.Background()); len(got) != 0 {
+		t.Fatalf("SessionStart contexts = %#v, want none", got)
+	}
+	if !contains(notified, "invalid JSON") {
+		t.Fatalf("notify = %q, want invalid JSON warning", notified)
+	}
 }
 
 // --- Runner.PostLLMCall ---
@@ -319,6 +429,9 @@ func TestIsBlocking(t *testing.T) {
 func TestDefaultTimeout(t *testing.T) {
 	if defaultTimeout(PreToolUse) != 5*time.Second {
 		t.Errorf("PreToolUse timeout = %v", defaultTimeout(PreToolUse))
+	}
+	if defaultTimeout(PermissionRequest) != 5*time.Second {
+		t.Errorf("PermissionRequest timeout = %v", defaultTimeout(PermissionRequest))
 	}
 	if defaultTimeout(PostToolUse) != 30*time.Second {
 		t.Errorf("PostToolUse timeout = %v", defaultTimeout(PostToolUse))

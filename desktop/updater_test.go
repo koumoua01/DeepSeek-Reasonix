@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -95,6 +98,21 @@ func TestChannelSelectsDistinctPointers(t *testing.T) {
 	if !strings.Contains(stable[0], "/latest/latest.json") {
 		t.Errorf("stable primary = %q, want the latest/ pointer", stable[0])
 	}
+	if stable[1] != releaseGatewayBase+"/stable/latest.json" {
+		t.Errorf("stable fallback = %q, want the release gateway", stable[1])
+	}
+	// GitHub is stable's explicit last resort only (#6005: both first-party
+	// endpoints share one Cloudflare zone). Stable desktop releases own the
+	// repo-wide latest release and carry latest.json directly; no other slot may
+	// lean on repository-wide latest.
+	if len(stable) != 3 || stable[2] != githubManifestFallback {
+		t.Errorf("stable endpoints = %q, want the GitHub compatibility manifest last", stable)
+	}
+	for _, u := range append(stable[:2:2], canary...) {
+		if strings.Contains(u, "/releases/latest") {
+			t.Errorf("manifest endpoint uses GitHub's repository-wide latest release: %q", u)
+		}
+	}
 	for _, u := range canary {
 		if strings.Contains(u, "/latest/") {
 			t.Errorf("canary endpoint hits the stable latest/ pointer: %q", u)
@@ -103,8 +121,104 @@ func TestChannelSelectsDistinctPointers(t *testing.T) {
 	if !strings.Contains(canary[0], "/canary/latest.json") {
 		t.Errorf("canary primary = %q, want the canary/ pointer", canary[0])
 	}
-	if downloadPage() == (ghReleasesBase + "/latest") {
-		t.Error("canary download page should not be the stable latest releases page")
+	if canary[1] != releaseGatewayBase+"/canary/latest.json" {
+		t.Errorf("canary fallback = %q, want the release gateway", canary[1])
+	}
+	if strings.Contains(downloadPage(), "/releases/latest") {
+		t.Errorf("download page should not use GitHub's repository-wide latest release: %q", downloadPage())
+	}
+}
+
+func withUpdateCacheDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	restore := updateCacheBaseDir
+	updateCacheBaseDir = func() (string, error) { return dir, nil }
+	t.Cleanup(func() { updateCacheBaseDir = restore })
+	return dir
+}
+
+func sha256Hex(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
+}
+
+func TestSaveCachedUpdateMarksEvaluateDownloaded(t *testing.T) {
+	withUpdateCacheDir(t)
+	oldChannel := channel
+	channel = "stable"
+	t.Cleanup(func() { channel = oldChannel })
+
+	data := []byte("verified artifact")
+	asset := update.Asset{
+		URL:    "https://dl.reasonix.io/desktop-v9.9.9/Reasonix-linux-amd64.tar.gz",
+		Size:   int64(len(data)),
+		SHA256: sha256Hex(data),
+	}
+	manifest := &update.Manifest{
+		Version:   "v9.9.9",
+		Platforms: map[string]update.Asset{update.CurrentPlatform(): asset},
+	}
+	if got := evaluate("v1.0.0", manifest); got.Downloaded {
+		t.Fatal("fresh cache should not report a downloaded update")
+	}
+	meta, err := saveCachedUpdate("v9.9.9", asset, data)
+	if err != nil {
+		t.Fatalf("saveCachedUpdate: %v", err)
+	}
+	if meta.Version != "v9.9.9" || meta.Channel != "stable" || meta.Platform != update.CurrentPlatform() {
+		t.Fatalf("cached metadata mismatch: %+v", meta)
+	}
+	if got := evaluate("v1.0.0", manifest); !got.Downloaded {
+		t.Fatalf("evaluate did not detect cached update: %+v", got)
+	}
+}
+
+func TestCachedUpdateRejectsTamperedArtifact(t *testing.T) {
+	withUpdateCacheDir(t)
+	oldChannel := channel
+	channel = "stable"
+	t.Cleanup(func() { channel = oldChannel })
+
+	data := []byte("verified artifact")
+	asset := update.Asset{
+		URL:    "https://dl.reasonix.io/desktop-v9.9.9/Reasonix-linux-amd64.tar.gz",
+		Size:   int64(len(data)),
+		SHA256: sha256Hex(data),
+	}
+	meta, err := saveCachedUpdate("v9.9.9", asset, data)
+	if err != nil {
+		t.Fatalf("saveCachedUpdate: %v", err)
+	}
+	if err := os.WriteFile(meta.Path, []byte("tampered"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if cachedUpdateMatches("v9.9.9", asset) {
+		t.Fatal("tampered cached artifact should not match")
+	}
+	if _, _, err := readVerifiedCachedUpdate(); err == nil {
+		t.Fatal("readVerifiedCachedUpdate should reject a tampered artifact")
+	}
+}
+
+func TestCachedUpdateRejectsDifferentChannel(t *testing.T) {
+	withUpdateCacheDir(t)
+	oldChannel := channel
+	channel = "stable"
+	t.Cleanup(func() { channel = oldChannel })
+
+	data := []byte("verified artifact")
+	asset := update.Asset{
+		URL:    "https://dl.reasonix.io/desktop-v9.9.9/Reasonix-linux-amd64.tar.gz",
+		Size:   int64(len(data)),
+		SHA256: sha256Hex(data),
+	}
+	if _, err := saveCachedUpdate("v9.9.9", asset, data); err != nil {
+		t.Fatalf("saveCachedUpdate: %v", err)
+	}
+	channel = "canary"
+	if _, _, err := readVerifiedCachedUpdate(); err == nil {
+		t.Fatal("readVerifiedCachedUpdate should reject a cache from another channel")
 	}
 }
 

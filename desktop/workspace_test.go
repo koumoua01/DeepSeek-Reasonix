@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"mime"
 	"net/http"
 	"net/http/httptest"
@@ -13,7 +14,10 @@ import (
 	"time"
 
 	"golang.org/x/text/encoding/simplifiedchinese"
+	"reasonix/internal/agent"
+	"reasonix/internal/checkpoint"
 	"reasonix/internal/config"
+	"reasonix/internal/control"
 )
 
 // --- workspaceStatePath ---
@@ -63,6 +67,446 @@ func TestSaveWorkspaceOnlyRemembersLastWorkspace(t *testing.T) {
 	}
 	if got := loadWorkspaces(); len(got) != 0 {
 		t.Fatalf("saveWorkspace should not maintain legacy workspace list, got %v", got)
+	}
+}
+
+func TestDesktopMCPMigrationRootsIncludesLegacyWorkspaces(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	active := t.TempDir()
+	legacy := t.TempDir()
+	tabRoot := t.TempDir()
+	projectRoot := t.TempDir()
+
+	saveWorkspace(active)
+	if err := os.MkdirAll(filepath.Dir(workspaceListPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal([]string{legacy, active, legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workspaceListPath(), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: projectRoot}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	roots := desktopMCPMigrationRoots(desktopTabsFile{
+		Tabs: []desktopTabEntry{{Scope: "project", WorkspaceRoot: tabRoot}},
+	})
+	want := []string{
+		normalizeProjectRoot(active),
+		normalizeProjectRoot(legacy),
+		normalizeProjectRoot(tabRoot),
+		normalizeProjectRoot(projectRoot),
+	}
+	if len(roots) != len(want) {
+		t.Fatalf("roots len = %d, want %d: %+v", len(roots), len(want), roots)
+	}
+	for i, root := range want {
+		if roots[i] != root {
+			t.Fatalf("roots[%d] = %q, want %q; roots=%+v", i, roots[i], root, roots)
+		}
+	}
+}
+
+func TestRecoverLegacyProjectSidebarRootsPreservesUpgradeProjects(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	existing := t.TempDir()
+	active := t.TempDir()
+	legacy := t.TempDir()
+	tabRoot := t.TempDir()
+	missing := filepath.Join(t.TempDir(), "missing")
+
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: existing, Title: "Existing"}}}); err != nil {
+		t.Fatal(err)
+	}
+	saveWorkspace(active)
+	if err := os.MkdirAll(filepath.Dir(workspaceListPath()), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	b, err := json.Marshal([]string{legacy, active, missing, legacy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(workspaceListPath(), b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	tabs := desktopTabsFile{
+		Tabs: []desktopTabEntry{
+			{Scope: "project", WorkspaceRoot: tabRoot},
+			{Scope: "project", WorkspaceRoot: missing},
+			{Scope: "global"},
+		},
+	}
+	changed, err := recoverLegacyProjectSidebarRoots(tabs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !changed {
+		t.Fatal("recoverLegacyProjectSidebarRoots should add missing legacy projects")
+	}
+
+	projects := loadProjectsFile().Projects
+	want := []string{
+		normalizeProjectRoot(existing),
+		normalizeProjectRoot(active),
+		normalizeProjectRoot(legacy),
+		normalizeProjectRoot(tabRoot),
+	}
+	if len(projects) != len(want) {
+		t.Fatalf("project count = %d, want %d: %+v", len(projects), len(want), projects)
+	}
+	for i, root := range want {
+		if projects[i].Root != root {
+			t.Fatalf("projects[%d].Root = %q, want %q; projects=%+v", i, projects[i].Root, root, projects)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(desktopConfigDir(), legacyProjectSidebarRecoveryMarker)); err != nil {
+		t.Fatalf("recovery marker was not written: %v", err)
+	}
+
+	if err := removeProject(legacy); err != nil {
+		t.Fatal(err)
+	}
+	changed, err = recoverLegacyProjectSidebarRoots(tabs)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("recovery should be one-shot after the marker is written")
+	}
+	for _, project := range loadProjectsFile().Projects {
+		if project.Root == normalizeProjectRoot(legacy) {
+			t.Fatalf("removed legacy project was restored after marker: %+v", loadProjectsFile().Projects)
+		}
+		if project.Root == normalizeProjectRoot(missing) {
+			t.Fatalf("missing legacy project should not be restored: %+v", loadProjectsFile().Projects)
+		}
+	}
+}
+
+func TestProjectFileUpdatesSerializeReadModifyWrite(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	active := t.TempDir()
+	added := t.TempDir()
+
+	if err := saveProjectsFile(desktopProjectFile{Projects: []desktopProject{{Root: active, Title: "Active"}}}); err != nil {
+		t.Fatal(err)
+	}
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	updateErr := make(chan error, 1)
+	go func() {
+		updateErr <- updateProjectsFile(func(f *desktopProjectFile) (bool, error) {
+			close(entered)
+			<-release
+			for i, project := range f.Projects {
+				if project.Root == normalizeProjectRoot(active) {
+					f.Projects[i].Title = "Active edited"
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+	}()
+	<-entered
+
+	addErr := make(chan error, 1)
+	go func() {
+		addErr <- addProject(added, "Added")
+	}()
+	select {
+	case err := <-addErr:
+		t.Fatalf("addProject completed while another project update was in progress: %v", err)
+	case <-time.After(10 * time.Millisecond):
+	}
+	close(release)
+	if err := <-updateErr; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-addErr; err != nil {
+		t.Fatal(err)
+	}
+
+	projects := loadProjectsFile().Projects
+	if len(projects) != 2 {
+		t.Fatalf("project count = %d, want 2: %+v", len(projects), projects)
+	}
+	if projects[0].Root != normalizeProjectRoot(active) || projects[0].Title != "Active edited" {
+		t.Fatalf("active project was not preserved with edited title: %+v", projects)
+	}
+	if projects[1].Root != normalizeProjectRoot(added) || projects[1].Title != "Added" {
+		t.Fatalf("concurrent project add was lost: %+v", projects)
+	}
+
+	if err := addProject(active, ""); err != nil {
+		t.Fatal(err)
+	}
+	projects = loadProjectsFile().Projects
+	if len(projects) != 2 || projects[1].Root != normalizeProjectRoot(added) {
+		t.Fatalf("no-op addProject overwrote the added project: %+v", projects)
+	}
+}
+
+func TestNormalizeProjectsFileMergesEquivalentProjectRoots(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	// A textually different spelling of the same folder. filepath.Join would
+	// clean the dot segment away and hand back the identical string, so build
+	// the spelling by hand.
+	equivalentRoot := projectRoot + string(filepath.Separator) + "."
+
+	f := normalizeProjectsFile(desktopProjectFile{
+		Projects: []desktopProject{
+			{Root: projectRoot, Title: "Project", Topics: []string{"topic_a"}},
+			{Root: equivalentRoot, Color: "blue", Topics: []string{"topic_b"}, PinnedTopics: []string{"topic_b"}},
+		},
+		PinnedProjects: []string{equivalentRoot},
+		SidebarOrder:   []string{equivalentRoot, projectRoot},
+	})
+
+	if len(f.Projects) != 1 {
+		t.Fatalf("projects = %+v, want one merged project", f.Projects)
+	}
+	if f.Projects[0].Root != normalizeProjectRoot(projectRoot) {
+		t.Fatalf("merged root = %q, want %q", f.Projects[0].Root, normalizeProjectRoot(projectRoot))
+	}
+	if f.Projects[0].Title != "Project" || f.Projects[0].Color != "blue" {
+		t.Fatalf("merged metadata = %+v, want title and color preserved", f.Projects[0])
+	}
+	if got := f.Projects[0].Topics; len(got) != 2 || got[0] != "topic_a" || got[1] != "topic_b" {
+		t.Fatalf("merged topics = %v, want [topic_a topic_b]", got)
+	}
+	if len(f.PinnedProjects) != 1 || f.PinnedProjects[0] != f.Projects[0].Root {
+		t.Fatalf("pinned projects = %v, want canonical root %q", f.PinnedProjects, f.Projects[0].Root)
+	}
+	if len(f.SidebarOrder) != 1 || f.SidebarOrder[0] != f.Projects[0].Root {
+		t.Fatalf("sidebar order = %v, want canonical root %q", f.SidebarOrder, f.Projects[0].Root)
+	}
+}
+
+func TestSwitchWorkspaceReaddsRemovedProject(t *testing.T) {
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+
+	if err := addProject(projectRoot, "Project"); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := removeProject(projectRoot); err != nil {
+		t.Fatalf("remove project: %v", err)
+	}
+	if got := loadProjectsFile().Projects; len(got) != 0 {
+		t.Fatalf("projects after remove = %+v, want none", got)
+	}
+
+	app := NewApp()
+	installNoopRuntimeEvents(app)
+	if got, err := app.SwitchWorkspace(projectRoot + string(filepath.Separator) + "."); err != nil {
+		t.Fatalf("switch workspace: %v", err)
+	} else if got != normalizeProjectRoot(projectRoot) {
+		t.Fatalf("SwitchWorkspace root = %q, want %q", got, normalizeProjectRoot(projectRoot))
+	}
+
+	projects := loadProjectsFile().Projects
+	if len(projects) != 1 || projects[0].Root != normalizeProjectRoot(projectRoot) {
+		t.Fatalf("projects after re-add = %+v, want %q", projects, normalizeProjectRoot(projectRoot))
+	}
+	if got := loadWorkspace(); got != normalizeProjectRoot(projectRoot) {
+		t.Fatalf("active workspace = %q, want %q", got, normalizeProjectRoot(projectRoot))
+	}
+}
+
+// flipPathASCIICase returns the path with the case of every ASCII letter
+// swapped — on Windows an equivalent spelling of the same folder that
+// normalizeProjectRoot cannot fold away.
+func flipPathASCIICase(t *testing.T, path string) string {
+	t.Helper()
+	flipped := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r - 'a' + 'A'
+		case r >= 'A' && r <= 'Z':
+			return r - 'A' + 'a'
+		}
+		return r
+	}, path)
+	if flipped == path {
+		t.Skipf("path %q contains no ASCII letters to flip", path)
+	}
+	return flipped
+}
+
+func TestNormalizeProjectsFileFoldsRootCaseOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive root matching only applies to Windows paths")
+	}
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	flipped := flipPathASCIICase(t, projectRoot)
+
+	f := normalizeProjectsFile(desktopProjectFile{
+		Projects: []desktopProject{
+			{Root: projectRoot, Title: "Project", Topics: []string{"topic_a"}},
+			{Root: flipped, Color: "blue", Topics: []string{"topic_b"}},
+		},
+		PinnedProjects: []string{flipped},
+		SidebarOrder:   []string{flipped, projectRoot},
+	})
+
+	if len(f.Projects) != 1 {
+		t.Fatalf("projects = %+v, want case-equivalent roots merged", f.Projects)
+	}
+	canonical := f.Projects[0].Root
+	if canonical != normalizeProjectRoot(projectRoot) {
+		t.Fatalf("merged root = %q, want first spelling %q", canonical, normalizeProjectRoot(projectRoot))
+	}
+	if f.Projects[0].Title != "Project" || f.Projects[0].Color != "blue" {
+		t.Fatalf("merged metadata = %+v, want title and color preserved", f.Projects[0])
+	}
+	if got := f.Projects[0].Topics; len(got) != 2 || got[0] != "topic_a" || got[1] != "topic_b" {
+		t.Fatalf("merged topics = %v, want [topic_a topic_b]", got)
+	}
+	if len(f.PinnedProjects) != 1 || f.PinnedProjects[0] != canonical {
+		t.Fatalf("pinned projects = %v, want canonical root %q", f.PinnedProjects, canonical)
+	}
+	if len(f.SidebarOrder) != 1 || f.SidebarOrder[0] != canonical {
+		t.Fatalf("sidebar order = %v, want canonical root %q", f.SidebarOrder, canonical)
+	}
+}
+
+func TestProjectRootOpsFoldCaseOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive root matching only applies to Windows paths")
+	}
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	flipped := flipPathASCIICase(t, projectRoot)
+
+	if err := addProject(projectRoot, "Project"); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := addProject(flipped, ""); err != nil {
+		t.Fatalf("re-add project under flipped case: %v", err)
+	}
+	projects := loadProjectsFile().Projects
+	if len(projects) != 1 {
+		t.Fatalf("projects = %+v, want re-add under equivalent spelling to update in place", projects)
+	}
+	if projects[0].Root != normalizeProjectRoot(flipped) {
+		t.Fatalf("root = %q, want self-healed to latest spelling %q", projects[0].Root, normalizeProjectRoot(flipped))
+	}
+	if projects[0].Title != "Project" {
+		t.Fatalf("title = %q, want preserved across re-add", projects[0].Title)
+	}
+
+	if err := prependTopicInProjectsFile(projectRoot, "topic_a", true); err != nil {
+		t.Fatalf("prepend topic: %v", err)
+	}
+	projects = loadProjectsFile().Projects
+	if len(projects) != 1 {
+		t.Fatalf("projects = %+v, want topic prepend to reuse the case-equivalent entry", projects)
+	}
+	if got := projects[0].Topics; len(got) != 1 || got[0] != "topic_a" {
+		t.Fatalf("topics = %v, want [topic_a] on the merged entry", got)
+	}
+
+	if err := removeProject(projectRoot); err != nil {
+		t.Fatalf("remove project via original spelling: %v", err)
+	}
+	if got := loadProjectsFile().Projects; len(got) != 0 {
+		t.Fatalf("projects after remove = %+v, want none", got)
+	}
+}
+
+func TestSyncTabWorkspaceRootSpellingsOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive root matching only applies to Windows paths")
+	}
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	flipped := flipPathASCIICase(t, projectRoot)
+
+	if err := addProject(projectRoot, "Project"); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+
+	app := NewApp()
+	installNoopRuntimeEvents(app)
+	app.tabs["tab_case"] = &WorkspaceTab{
+		ID:            "tab_case",
+		Scope:         "project",
+		WorkspaceRoot: normalizeProjectRoot(projectRoot),
+		Ready:         true,
+		disabledMCP:   map[string]ServerView{},
+	}
+	app.tabOrder = []string{"tab_case"}
+
+	// Re-registering under the flipped spelling self-heals the registry root;
+	// open tabs must follow so the frontend keeps comparing one string form.
+	app.registerProjectRoot(flipped)
+
+	projects := loadProjectsFile().Projects
+	if len(projects) != 1 || projects[0].Root != normalizeProjectRoot(flipped) {
+		t.Fatalf("registry projects = %+v, want single root %q", projects, normalizeProjectRoot(flipped))
+	}
+	if got := app.tabs["tab_case"].WorkspaceRoot; got != projects[0].Root {
+		t.Fatalf("tab root = %q, want registry spelling %q", got, projects[0].Root)
+	}
+}
+
+func TestFindTopicSessionAfterCaseFlippedReaddOnWindows(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("case-insensitive root matching only applies to Windows paths")
+	}
+	isolateDesktopUserDirs(t)
+	projectRoot := t.TempDir()
+	flipped := flipPathASCIICase(t, projectRoot)
+
+	// Register under original spelling.
+	if err := addProject(projectRoot, "Project"); err != nil {
+		t.Fatalf("add project: %v", err)
+	}
+	if err := prependTopicInProjectsFile(projectRoot, "topic_case", true); err != nil {
+		t.Fatalf("prepend topic: %v", err)
+	}
+
+	// Write a session file with the original root spelling in its meta.
+	sessionDir := desktopSessionDir(projectRoot)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("mkdir session dir: %v", err)
+	}
+	sessionPath := filepath.Join(sessionDir, "topic-case.jsonl")
+	if err := os.WriteFile(sessionPath, []byte(`{"role":"user","content":"hello"}`+"\n"), 0o644); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	if err := agent.SaveBranchMeta(sessionPath, agent.BranchMeta{
+		TopicID:       "topic_case",
+		Scope:         "project",
+		WorkspaceRoot: projectRoot,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
+	}); err != nil {
+		t.Fatalf("save branch meta: %v", err)
+	}
+
+	// Re-add under the flipped-case spelling — simulates Windows Explorer
+	// or a different shell returning the same folder with different case.
+	app := NewApp()
+	installNoopRuntimeEvents(app)
+	app.registerProjectRoot(flipped)
+
+	// findTopicSessionForTarget must match the session whose meta carries
+	// the original case spelling against the registry's new (flipped) root.
+	path, _ := app.findTopicSessionForTarget("project", normalizeProjectRoot(flipped), "topic_case")
+	if path == "" {
+		t.Fatal("findTopicSessionForTarget returned empty path; session with old-case root should still match")
+	}
+	if path != sessionPath {
+		t.Fatalf("findTopicSessionForTarget = %q, want %q", path, sessionPath)
 	}
 }
 
@@ -735,12 +1179,63 @@ func TestWorkspaceChangesNonGitDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if got.GitAvailable {
 		t.Fatal("non-git directory should mark git unavailable")
 	}
 	if len(got.Files) != 0 {
 		t.Fatalf("files = %+v, want none", got.Files)
+	}
+}
+
+func TestWorkspaceChangesUsesRequestedTabCheckpoints(t *testing.T) {
+	workspace := t.TempDir()
+	sessionDir := t.TempDir()
+	sessionA := filepath.Join(sessionDir, "a.jsonl")
+	sessionB := filepath.Join(sessionDir, "b.jsonl")
+	content := "old"
+	now := time.Now()
+
+	for _, tc := range []struct {
+		session string
+		path    string
+		prompt  string
+	}{
+		{sessionA, "a.txt", "edit a"},
+		{sessionB, "b.txt", "edit b"},
+	} {
+		ckptDir := strings.TrimSuffix(tc.session, ".jsonl") + ".ckpt"
+		if err := os.MkdirAll(ckptDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		seedCheckpoint(t, ckptDir, checkpoint.Checkpoint{
+			Turn:   0,
+			Time:   now,
+			Prompt: tc.prompt,
+			Files:  []checkpoint.FileSnap{{Path: tc.path, Content: &content}},
+		})
+	}
+
+	ctrlA := control.New(control.Options{SessionDir: sessionDir, SessionPath: sessionA, Label: "a"})
+	ctrlB := control.New(control.Options{SessionDir: sessionDir, SessionPath: sessionB, Label: "b"})
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"a": {ID: "a", Scope: "project", WorkspaceRoot: workspace, Ctrl: ctrlA, Ready: true},
+			"b": {ID: "b", Scope: "project", WorkspaceRoot: workspace, Ctrl: ctrlB, Ready: true},
+		},
+		activeTabID: "a",
+	}
+
+	got := app.WorkspaceChanges("b")
+	byPath := map[string]WorkspaceChangeView{}
+	for _, file := range got.Files {
+		byPath[file.Path] = file
+	}
+	if _, ok := byPath["a.txt"]; ok {
+		t.Fatalf("requested tab b included active tab a changes: %+v", got.Files)
+	}
+	if byPath["b.txt"].LatestPrompt != "edit b" {
+		t.Fatalf("requested tab b changes = %+v, want b.txt from tab b", got.Files)
 	}
 }
 
@@ -768,7 +1263,7 @@ func TestWorkspaceChangesGitStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -819,7 +1314,7 @@ func TestWorkspaceChangesGitStatusFromRepoSubdirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -860,7 +1355,7 @@ func TestWorkspaceChangesUntrackedDirectoryListsFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	byPath := map[string]WorkspaceChangeView{}
 	for _, file := range got.Files {
 		byPath[file.Path] = file
@@ -895,7 +1390,7 @@ func TestWorkspaceChangesGitBranchDetachedHead(t *testing.T) {
 	short := gitOutput(t, "rev-parse", "--short", "HEAD")
 	runGit(t, "checkout", "--detach", "HEAD")
 
-	got := (&App{}).WorkspaceChanges()
+	got := (&App{}).WorkspaceChanges("")
 	if !got.GitAvailable {
 		t.Fatalf("git unavailable: %s", got.GitErr)
 	}
@@ -933,7 +1428,7 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	runGit(t, "commit", "-m", "init file2")
 
 	app := &App{}
-	history, err := app.WorkspaceGitHistory("")
+	history, err := app.WorkspaceGitHistory("", "")
 	if err != nil {
 		t.Fatalf("WorkspaceGitHistory err = %v", err)
 	}
@@ -948,7 +1443,7 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	}
 
 	// Test history for specific file
-	history, err = app.WorkspaceGitHistory("file1.txt")
+	history, err = app.WorkspaceGitHistory("", "file1.txt")
 	if err != nil {
 		t.Fatalf("WorkspaceGitHistory err = %v", err)
 	}
@@ -957,6 +1452,52 @@ func TestWorkspaceGitHistory(t *testing.T) {
 	}
 	if history[0].Message != "init file1" {
 		t.Errorf("expected commit message 'init file1', got %q", history[0].Message)
+	}
+}
+
+func TestWorkspaceGitHistoryUsesRequestedTabWorkspace(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not installed")
+	}
+	orig, _ := os.Getwd()
+	defer os.Chdir(orig)
+
+	makeRepo := func(name, message string) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), name)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chdir(dir); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, "init")
+		runGit(t, "config", "user.email", "test@example.com")
+		runGit(t, "config", "user.name", "Test User")
+		if err := os.WriteFile("file.txt", []byte(message+"\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runGit(t, "add", "file.txt")
+		runGit(t, "commit", "-m", message)
+		return dir
+	}
+
+	repoA := makeRepo("a", "repo a commit")
+	repoB := makeRepo("b", "repo b commit")
+	app := &App{
+		tabs: map[string]*WorkspaceTab{
+			"a": {ID: "a", Scope: "project", WorkspaceRoot: repoA, Ready: true},
+			"b": {ID: "b", Scope: "project", WorkspaceRoot: repoB, Ready: true},
+		},
+		activeTabID: "a",
+	}
+
+	history, err := app.WorkspaceGitHistory("b", "")
+	if err != nil {
+		t.Fatalf("WorkspaceGitHistory err = %v", err)
+	}
+	if len(history) != 1 || history[0].Message != "repo b commit" {
+		t.Fatalf("history for requested tab = %+v, want repo b commit", history)
 	}
 }
 
@@ -993,7 +1534,7 @@ func TestWorkspaceGitCommitDetail(t *testing.T) {
 	app := &App{}
 
 	// Test project level detail
-	detail, err := app.WorkspaceGitCommitDetail(hash, "")
+	detail, err := app.WorkspaceGitCommitDetail("", hash, "")
 	if err != nil {
 		t.Fatalf("WorkspaceGitCommitDetail err = %v", err)
 	}
@@ -1005,7 +1546,7 @@ func TestWorkspaceGitCommitDetail(t *testing.T) {
 	}
 
 	// Test file level detail
-	detail, err = app.WorkspaceGitCommitDetail(hash, "file1.txt")
+	detail, err = app.WorkspaceGitCommitDetail("", hash, "file1.txt")
 	if err != nil {
 		t.Fatalf("WorkspaceGitCommitDetail err = %v", err)
 	}

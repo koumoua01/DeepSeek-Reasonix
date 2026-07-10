@@ -11,6 +11,7 @@ import (
 	"reasonix/internal/event"
 	"reasonix/internal/permission"
 	"reasonix/internal/provider"
+	"reasonix/internal/sandbox"
 	"reasonix/internal/tool"
 )
 
@@ -71,7 +72,7 @@ func TestAutoApproveToolsStillAutoPlansAndRequiresPlanApproval(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("approved plan did not continue into execution")
 	}
-	if got := firstUserMessage(ag.Session().Messages); !strings.HasPrefix(got, PlanModeMarker) {
+	if got := agent.StripTransientUserBlocks(firstUserMessage(ag.Session().Messages)); !strings.HasPrefix(got, PlanModeMarker) {
 		t.Fatalf("first model input = %q, want the auto-plan marker prefixed", got)
 	}
 	if c.PlanMode() {
@@ -104,7 +105,7 @@ func TestRequestApprovalHonorsAutoApproveTools(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			t.Errorf("requestApproval: %v", err)
 		}
@@ -139,7 +140,7 @@ func TestMemoryApprovalIgnoresAutoApproveTools(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "remember", "")
+		allow, _, err := c.requestApproval(context.Background(), "remember", "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -211,6 +212,22 @@ func TestToolApprovalModeAutoForcesMemoryAskRules(t *testing.T) {
 	}
 }
 
+func TestToolApprovalModeYoloForcesMemoryAskRules(t *testing.T) {
+	c := New(Options{})
+	c.SetToolApprovalMode(ToolApprovalYolo)
+
+	gate := c.newInteractiveGate()
+	for _, toolName := range []string{"remember", "forget"} {
+		if got := gate.Policy.Decide(toolName, false, json.RawMessage(`{}`)); got != permission.Ask {
+			t.Fatalf("%s under yolo mode = %v, want ask", toolName, got)
+		}
+	}
+	// Verify that regular tools ARE auto-allowed in YOLO (sanity check).
+	if got := gate.Policy.Decide("bash", false, json.RawMessage(`{"command":"go test ./..."}`)); got != permission.Allow {
+		t.Fatalf("regular tool under yolo mode = %v, want allow", got)
+	}
+}
+
 func TestToolApprovalModeAutoDrainsPendingFallbackApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -225,7 +242,7 @@ func TestToolApprovalModeAutoDrainsPendingFallbackApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -270,7 +287,7 @@ func TestToolApprovalModeAutoDoesNotDrainPendingExplicitAsk(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "bash", "git commit -m x")
+		allow, _, err := c.requestApproval(context.Background(), "bash", "git commit -m x", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -315,7 +332,7 @@ func TestToolApprovalModeYoloBypassesApprovalPrompts(t *testing.T) {
 	if !c.AutoApproveTools() {
 		t.Fatal("YOLO mode should satisfy legacy AutoApproveTools")
 	}
-	allow, remember, err := c.requestApproval(context.Background(), "bash", "go test ./...")
+	allow, remember, err := c.requestApproval(context.Background(), "bash", "go test ./...", nil)
 	if err != nil || !allow || remember {
 		t.Fatalf("requestApproval in YOLO = (%v,%v,%v), want allow without remember", allow, remember, err)
 	}
@@ -335,7 +352,7 @@ func TestPlanApprovalIgnoresAutoApproveTools(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "")
+		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -383,7 +400,7 @@ func TestSetAutoApproveToolsAllowsPendingApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, err := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -414,6 +431,75 @@ func TestSetAutoApproveToolsAllowsPendingApproval(t *testing.T) {
 	}
 }
 
+func TestSandboxEscapeApprovalIgnoresAutoApproveTools(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+	c.SetAutoApproveTools(true)
+
+	type escapeResult struct {
+		allow  bool
+		reason string
+		err    error
+	}
+	done := make(chan escapeResult, 1)
+	go func() {
+		allow, reason, err := sandboxEscapeApprover{c}.ApproveSandboxEscape(context.Background(), sandbox.EscapeRequest{
+			Command: "go test ./...",
+			Reason:  "Windows sandbox failed. Run this command unconfined once?",
+		})
+		done <- escapeResult{allow: allow, reason: reason, err: err}
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sandbox escape approval request was not emitted")
+	}
+	if approval.Tool != SandboxEscapeApprovalTool {
+		t.Fatalf("approval tool = %q, want %q", approval.Tool, SandboxEscapeApprovalTool)
+	}
+
+	c.SetAutoApproveTools(true)
+	select {
+	case got := <-done:
+		t.Fatalf("tool auto-approval must not answer sandbox escape; got %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	c.Approve(approval.ID, true, true, true)
+	select {
+	case got := <-done:
+		if got.err != nil || !got.allow || got.reason != "" {
+			t.Fatalf("sandbox escape result = %+v, want allowed without reason/error", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("sandbox escape approval stayed blocked after Approve")
+	}
+
+	if !(sandboxEscapeApprover{c}).SandboxEscapeSessionAllowed(context.Background(), sandbox.EscapeRequest{Command: "npm test"}) {
+		t.Fatal("sandbox escape session checker = false, want true after session grant")
+	}
+	allow, reason, err := sandboxEscapeApprover{c}.ApproveSandboxEscape(context.Background(), sandbox.EscapeRequest{
+		Command: "npm test",
+		Reason:  "Windows sandbox failed. Run this command unconfined once?",
+	})
+	if err != nil || !allow || reason != "" {
+		t.Fatalf("sandbox escape session grant result = (%v,%q,%v), want allow", allow, reason, err)
+	}
+	select {
+	case approval := <-approvalRequests:
+		t.Fatalf("sandbox escape session grant emitted another approval: %+v", approval)
+	default:
+	}
+}
+
 func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -427,7 +513,7 @@ func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "")
+		allow, _, err := c.requestApproval(context.Background(), planApprovalTool, "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -469,6 +555,119 @@ func TestSetAutoApproveToolsDoesNotDrainPendingPlanApproval(t *testing.T) {
 	}
 }
 
+func TestSetAutoApproveToolsDoesNotDrainPendingMCPReadOnlyTrust(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+
+	type trustResult struct {
+		allow  bool
+		reason string
+		err    error
+	}
+	done := make(chan trustResult, 1)
+	req := agent.PlanModeReadOnlyTrustRequest{
+		ToolName:    "mcp__github__issue_read",
+		ServerName:  "github",
+		RawToolName: "issue/read",
+	}
+	go func() {
+		allow, reason, err := planModeReadOnlyTrustApprover{c}.CheckPlanModeReadOnlyTrust(context.Background(), req)
+		done <- trustResult{allow: allow, reason: reason, err: err}
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP read-only trust approval request was not emitted")
+	}
+
+	c.SetAutoApproveTools(true)
+
+	select {
+	case got := <-done:
+		t.Fatalf("SetAutoApproveTools must not auto-answer MCP read-only trust; got %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !c.AutoApproveTools() {
+		t.Fatal("tool auto-approval should turn on while MCP read-only trust stays pending")
+	}
+
+	c.Approve(approval.ID, true, false, false)
+	select {
+	case got := <-done:
+		if got.err != nil || !got.allow || got.reason != "" {
+			t.Fatalf("manual MCP read-only trust approval = %+v, want allow", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("MCP read-only trust approval stayed blocked after Approve")
+	}
+}
+
+func TestSetAutoApproveToolsDoesNotDrainPendingPlanModeReadOnlyCommandTrust(t *testing.T) {
+	approvalRequests := make(chan event.Approval, 1)
+	c := New(Options{
+		Sink: event.FuncSink(func(e event.Event) {
+			if e.Kind == event.ApprovalRequest {
+				approvalRequests <- e.Approval
+			}
+		}),
+	})
+
+	type trustResult struct {
+		allow  bool
+		reason string
+		err    error
+	}
+	done := make(chan trustResult, 1)
+	req := agent.PlanModeReadOnlyTrustRequest{
+		ToolName: agent.PlanModeReadOnlyCommandApprovalTool,
+		Command:  "gh issue view 5867",
+		Prefix:   "gh issue view",
+	}
+	go func() {
+		allow, reason, err := planModeReadOnlyTrustApprover{c}.CheckPlanModeReadOnlyTrust(context.Background(), req)
+		done <- trustResult{allow: allow, reason: reason, err: err}
+	}()
+
+	var approval event.Approval
+	select {
+	case approval = <-approvalRequests:
+	case <-time.After(2 * time.Second):
+		t.Fatal("plan-mode bash read-only command trust approval request was not emitted")
+	}
+	if approval.Tool != agent.PlanModeReadOnlyCommandApprovalTool {
+		t.Fatalf("approval tool = %q, want %q", approval.Tool, agent.PlanModeReadOnlyCommandApprovalTool)
+	}
+
+	c.SetAutoApproveTools(true)
+
+	select {
+	case got := <-done:
+		t.Fatalf("SetAutoApproveTools must not auto-answer plan-mode bash read-only command trust; got %+v", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if !c.AutoApproveTools() {
+		t.Fatal("tool auto-approval should turn on while plan-mode bash read-only command trust stays pending")
+	}
+
+	c.Approve(approval.ID, true, false, false)
+	select {
+	case got := <-done:
+		if got.err != nil || !got.allow || got.reason != "" {
+			t.Fatalf("manual plan-mode bash read-only command trust approval = %+v, want allow", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("plan-mode bash read-only command trust approval stayed blocked after Approve")
+	}
+}
+
 func TestSetAutoApproveToolsDoesNotDrainPendingMemoryApproval(t *testing.T) {
 	approvalRequests := make(chan event.Approval, 1)
 	c := New(Options{
@@ -482,7 +681,7 @@ func TestSetAutoApproveToolsDoesNotDrainPendingMemoryApproval(t *testing.T) {
 	done := make(chan bool, 1)
 	errs := make(chan error, 1)
 	go func() {
-		allow, _, err := c.requestApproval(context.Background(), "forget", "")
+		allow, _, err := c.requestApproval(context.Background(), "forget", "", nil)
 		if err != nil {
 			errs <- err
 			return
@@ -528,7 +727,7 @@ func TestSetModeYoloDrainsPendingApproval(t *testing.T) {
 
 	done := make(chan bool, 1)
 	go func() {
-		allow, _, _ := c.requestApproval(context.Background(), "multi_edit", "/tmp/file")
+		allow, _, _ := c.requestApproval(context.Background(), "multi_edit", "/tmp/file", nil)
 		done <- allow
 	}()
 
@@ -771,7 +970,7 @@ func TestAskSerializesBehindPromptLockEvenWithAutoApproveTools(t *testing.T) {
 		},
 	}}
 
-	c.promptMu.Lock()
+	c.approval.promptMu.Lock()
 	started := make(chan struct{})
 	done := make(chan []event.AskAnswer, 1)
 	errs := make(chan error, 1)
@@ -804,7 +1003,7 @@ func TestAskSerializesBehindPromptLockEvenWithAutoApproveTools(t *testing.T) {
 	}
 
 	// Release the lock — Ask proceeds but must still emit an AskRequest.
-	c.promptMu.Unlock()
+	c.approval.promptMu.Unlock()
 
 	var ask event.Ask
 	select {
@@ -851,7 +1050,7 @@ func TestAskSerializesBehindPromptLockEvenWithBypass(t *testing.T) {
 		},
 	}}
 
-	c.promptMu.Lock()
+	c.approval.promptMu.Lock()
 	done := make(chan []event.AskAnswer, 1)
 	errs := make(chan error, 1)
 	go func() {
@@ -875,7 +1074,7 @@ func TestAskSerializesBehindPromptLockEvenWithBypass(t *testing.T) {
 	// Enable bypass while Ask is queued behind promptMu.
 	c.SetBypass(true)
 	// Release the lock — Ask proceeds but must still emit an AskRequest.
-	c.promptMu.Unlock()
+	c.approval.promptMu.Unlock()
 
 	// Post-unlock assertion: Ask must emit AskRequest now that it holds the lock.
 	var ask event.Ask

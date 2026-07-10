@@ -40,6 +40,7 @@ func (m chatTUI) confirmClearContext() (tea.Model, tea.Cmd) {
 		m.notice(fmt.Sprintf("%s: %v", i18n.M.SlashClearFailed, err))
 		return m, nil
 	}
+	m.followSessionLease()
 	m.resetFreshContextView(true)
 	m.notice(i18n.M.SlashClearDone)
 	return m, tea.ClearScreen
@@ -55,14 +56,14 @@ func (m *chatTUI) resetFreshContextView(clearTranscript bool) {
 	m.bubblePending = false
 	m.turnDiscarded = false
 	if clearTranscript {
-		m.transcript = nil
-		m.wrappedLines = nil
-		m.viewport.SetContent("")
+		m.clearTranscriptDisplay()
+		m.sessionSwitch = true
 	} else {
 		m.commitLine("")
 	}
-	m.commitLine(strings.TrimRight(renderTUIBanner(m.label, "", m.width), "\n"))
+	m.commitLine(strings.TrimRight(renderTUIBanner(m.label, "", transcriptContentWidth(m.width, m.nativeScrollback)), "\n"))
 	m.transcriptDirty = true
+	m.forceGotoBottom = true
 }
 
 func (m chatTUI) renderClearConfirm() string {

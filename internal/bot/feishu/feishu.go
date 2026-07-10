@@ -10,6 +10,7 @@ package feishu
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -25,7 +26,6 @@ import (
 	"reasonix/internal/config"
 
 	lark "github.com/larksuite/oapi-sdk-go/v3"
-	larknormalize "github.com/larksuite/oapi-sdk-go/v3/channel/normalize"
 	larkcore "github.com/larksuite/oapi-sdk-go/v3/core"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher"
 	"github.com/larksuite/oapi-sdk-go/v3/event/dispatcher/callback"
@@ -171,30 +171,35 @@ func (a *adapter) runWebSocket(ctx context.Context) {
 		return
 	}
 	eventHandler := a.newEventDispatcher()
-	opts := []larkws.ClientOption{
-		larkws.WithEventHandler(eventHandler),
-		larkws.WithLogLevel(larkcore.LogLevelError),
-		larkws.WithAutoReconnect(true),
-		larkws.WithOnReady(func() { a.logger.Info("feishu sdk websocket connected") }),
-		larkws.WithOnReconnecting(func() { a.logger.Warn("feishu sdk websocket reconnecting") }),
-		larkws.WithOnReconnected(func() { a.logger.Info("feishu sdk websocket reconnected") }),
-		larkws.WithOnError(func(err error) { a.logger.Error("feishu sdk websocket error", "err", err) }),
-	}
-	if feishuDomain(a.cfg.Domain) == "lark" {
-		opts = append(opts, larkws.WithDomain(lark.LarkBaseUrl))
-	}
-	client := larkws.NewClient(a.cfg.AppID, secret, opts...)
-	a.wsClient = client
-	errCh := make(chan error, 1)
-	go func() { errCh <- client.Start(ctx) }()
-	select {
-	case <-ctx.Done():
-		client.Close()
-	case err := <-errCh:
-		if err != nil {
-			a.logger.Error("feishu sdk websocket stopped", "err", err)
+	bot.RunWithRetry(ctx, a.logger, "feishu sdk websocket", bot.RetryConfig{}, func(ctx context.Context) error {
+		opts := []larkws.ClientOption{
+			larkws.WithEventHandler(eventHandler),
+			larkws.WithLogLevel(larkcore.LogLevelError),
+			larkws.WithAutoReconnect(true),
+			larkws.WithOnReady(func() { a.logger.Info("feishu sdk websocket connected") }),
+			larkws.WithOnReconnecting(func() { a.logger.Warn("feishu sdk websocket reconnecting") }),
+			larkws.WithOnReconnected(func() { a.logger.Info("feishu sdk websocket reconnected") }),
+			larkws.WithOnError(func(err error) { a.logger.Error("feishu sdk websocket error", "err", err) }),
 		}
-	}
+		if feishuDomain(a.cfg.Domain) == "lark" {
+			opts = append(opts, larkws.WithDomain(lark.LarkBaseUrl))
+		}
+		client := larkws.NewClient(a.cfg.AppID, secret, opts...)
+		a.wsClient = client
+		// client.Start blocks; run it off-loop so cancellation closes the client
+		// immediately rather than waiting for Start to notice ctx. RunWithRetry
+		// handles the reconnect backoff.
+		errCh := make(chan error, 1)
+		go func() { errCh <- client.Start(ctx) }()
+		select {
+		case <-ctx.Done():
+			client.Close()
+			return nil
+		case err := <-errCh:
+			client.Close()
+			return err
+		}
+	})
 }
 
 func (a *adapter) newEventDispatcher() *dispatcher.EventDispatcher {
@@ -399,7 +404,10 @@ func cardActionToast(toastType, content string) *callback.CardActionTriggerRespo
 }
 
 func (a *adapter) verificationTokenValid(token string) bool {
-	return a.cfg.VerificationToken == "" || token == a.cfg.VerificationToken
+	if a.cfg.VerificationToken == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(token), []byte(a.cfg.VerificationToken)) == 1
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -434,7 +442,7 @@ func (a *adapter) handleMessage(msg feishuMsgEvent) {
 
 	// @mention gating：仅在群聊中检查是否 @了 bot
 	chatType := bot.ChatDM
-	if msg.ChatType == "group" {
+	if msg.ChatType == "group" || msg.ChatType == "topic_group" {
 		chatType = bot.ChatGroup
 		if a.cfg.RequireMention && len(msg.Mentions) == 0 {
 			a.logger.Info("feishu message ignored", "reason", "missing_mention", "chat", logHash(msg.ChatID), "message", logHash(msg.MessageID))
@@ -465,34 +473,63 @@ func (a *adapter) handleMessage(msg feishuMsgEvent) {
 	}
 }
 
-// SendText sends one markdown-rendered message to a Feishu/Lark chat_id using the SDK.
+// SendText sends an interactive card with markdown content to a Feishu/Lark chat_id using the SDK.
 // It is used by the desktop settings panel as an actual connection test.
 func SendText(ctx context.Context, cfg config.FeishuBotConfig, chatID, text string) (bot.SendResult, error) {
 	a := &adapter{cfg: cfg, logger: slog.Default().With("platform", "feishu")}
 	return a.sendMessage(ctx, bot.OutboundMessage{ChatID: chatID, Text: text})
 }
 
-// sendMessage 使用飞书/Lark SDK 回复或主动发送消息。
+// sendMessage 使用飞书/Lark SDK 以 Interactive Card (JSON 2.0) 发送消息。
+// Card 内嵌 markdown 元素，支持 CommonMark 标准语法。
+// 当卡片体积超过 30KB 限制（如大段代码），自动降级为纯文本消息。
 func (a *adapter) sendMessage(ctx context.Context, msg bot.OutboundMessage) (bot.SendResult, error) {
 	if msg.Card != nil {
 		return a.sendCard(ctx, msg)
 	}
-	content, err := feishuMarkdownPostContent(msg.Text)
+	cardContent, err := buildMarkdownCard(msg.Text)
 	if err != nil {
-		a.logger.Warn("format feishu markdown failed, falling back to text", "err", err)
-		content = feishuTextContent(msg.Text)
-		return a.sendSDKContent(ctx, msg, larkim.MsgTypeText, content)
+		a.logger.Warn("build markdown card failed, falling back to text", "err", err)
+		return a.sendSDKContent(ctx, msg, larkim.MsgTypeText, feishuTextContent(msg.Text))
 	}
-	return a.sendSDKContent(ctx, msg, larkim.MsgTypePost, content)
+	result, err := a.sendSDKContent(ctx, msg, larkim.MsgTypeInteractive, cardContent)
+	if err != nil && isCardLimitError(err) {
+		a.logger.Warn("card send failed (size limit), retrying as text", "err", err)
+		return a.sendSDKContent(ctx, msg, larkim.MsgTypeText, feishuTextContent(msg.Text))
+	}
+	return result, err
 }
 
-func feishuMarkdownPostContent(text string) (string, error) {
-	return larknormalize.SimpleMarkdownToPost("", text, nil)
+func buildMarkdownCard(content string) (string, error) {
+	card := map[string]any{
+		"schema": "2.0",
+		"body": map[string]any{
+			"elements": []map[string]any{
+				{
+					"tag":     "markdown",
+					"content": content,
+				},
+			},
+		},
+	}
+	data, err := json.Marshal(card)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 func feishuTextContent(text string) string {
 	content, _ := json.Marshal(textContent{Text: text})
 	return string(content)
+}
+
+func isCardLimitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "11310") || strings.Contains(s, "11325")
 }
 
 func (a *adapter) sdkClient() (*lark.Client, error) {
@@ -520,27 +557,6 @@ func (a *adapter) sendSDKContent(ctx context.Context, msg bot.OutboundMessage, m
 	if err != nil {
 		return bot.SendResult{}, err
 	}
-	if msg.ReplyToMsgID != "" {
-		req := larkim.NewReplyMessageReqBuilder().
-			MessageId(msg.ReplyToMsgID).
-			Body(larkim.NewReplyMessageReqBodyBuilder().MsgType(msgType).Content(content).Build()).
-			Build()
-		resp, err := client.Im.Message.Reply(ctx, req)
-		if err != nil {
-			return bot.SendResult{}, err
-		}
-		if resp == nil {
-			return bot.SendResult{}, fmt.Errorf("feishu reply error: empty response")
-		}
-		if !resp.Success() {
-			return bot.SendResult{}, fmt.Errorf("feishu reply error: %s", feishuCodeError(resp.Code, resp.Msg))
-		}
-		if resp.Data == nil {
-			return bot.SendResult{}, nil
-		}
-		return bot.SendResult{MessageID: stringPtrValue(resp.Data.MessageId)}, nil
-	}
-
 	chatID := strings.TrimSpace(msg.ChatID)
 	if chatID == "" {
 		return bot.SendResult{}, fmt.Errorf("feishu chat_id is empty")
@@ -565,14 +581,14 @@ func (a *adapter) sendSDKContent(ctx context.Context, msg bot.OutboundMessage, m
 	return bot.SendResult{MessageID: stringPtrValue(resp.Data.MessageId)}, nil
 }
 
-func (a *adapter) AddPendingReaction(ctx context.Context, messageID string) error {
+func (a *adapter) AddPendingReaction(ctx context.Context, messageID string) (func(), error) {
 	messageID = strings.TrimSpace(messageID)
 	if messageID == "" {
-		return nil
+		return nil, nil
 	}
 	client, err := a.sdkClient()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	req := larkim.NewCreateMessageReactionReqBuilder().
 		MessageId(messageID).
@@ -582,15 +598,31 @@ func (a *adapter) AddPendingReaction(ctx context.Context, messageID string) erro
 		Build()
 	resp, err := client.Im.MessageReaction.Create(ctx, req)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if resp == nil {
-		return fmt.Errorf("feishu reaction error: empty response")
+	if resp == nil || !resp.Success() {
+		if resp != nil {
+			return nil, fmt.Errorf("feishu reaction error: %s", feishuCodeError(resp.Code, resp.Msg))
+		}
+		return nil, fmt.Errorf("feishu reaction error: empty response")
 	}
-	if !resp.Success() {
-		return fmt.Errorf("feishu reaction error: %s", feishuCodeError(resp.Code, resp.Msg))
+	reactionID := ""
+	if resp.Data != nil && resp.Data.ReactionId != nil {
+		reactionID = *resp.Data.ReactionId
 	}
-	return nil
+	if reactionID == "" {
+		return nil, nil
+	}
+	cleanup := func() {
+		delReq := larkim.NewDeleteMessageReactionReqBuilder().
+			MessageId(messageID).
+			ReactionId(reactionID).
+			Build()
+		if _, err := client.Im.MessageReaction.Delete(context.Background(), delReq); err != nil {
+			a.logger.Warn("feishu reaction cleanup failed", "message", logHash(messageID), "err", err)
+		}
+	}
+	return cleanup, nil
 }
 
 // sendCard 发送 interactive card 消息（用于审批/问答）。

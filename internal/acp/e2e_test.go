@@ -349,7 +349,7 @@ func TestE2ESessionListResumeAndDelete(t *testing.T) {
 	default:
 	}
 
-	deleteResp := client2.call(t, "session/delete", SessionDeleteParams(nr))
+	deleteResp := client2.call(t, "session/delete", SessionDeleteParams{SessionID: nr.SessionID})
 	if deleteResp.Error != nil {
 		t.Fatalf("session/delete errored: %+v", deleteResp.Error)
 	}
@@ -504,6 +504,10 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 		var pr PermissionRequestParams
 		json.Unmarshal(req.Params, &pr)
 		reqSeen <- pr
+		if _, ok := invalidACPv1PermissionOptionKind(pr.Options); ok {
+			client.replyError(req.ID, ErrInvalidParams, "Invalid params")
+			return
+		}
 		client.reply(req.ID, PermissionRequestResult{
 			Outcome: PermissionOutcome{Outcome: "selected", OptionID: string(OptAllowOnce)},
 		})
@@ -522,6 +526,7 @@ func TestE2EApprovalRoundTrip(t *testing.T) {
 		if !strings.Contains(pr.ToolCall.Title, "writeit") {
 			t.Errorf("permission title = %q, want it to mention writeit", pr.ToolCall.Title)
 		}
+		assertACPv1PermissionOptionKinds(t, pr.Options)
 	case <-time.After(2 * time.Second):
 		t.Fatal("no permission request was raised")
 	}

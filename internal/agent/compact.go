@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -21,16 +22,17 @@ import (
 // fraction of the window, so a huge window still compacts rarely while a small
 // one still lands below the trigger (which is what stops the re-compaction loop).
 const (
-	defaultSoftCompactRatio   = 0.5   // report growing context here, but keep the cache-stable prefix intact
-	defaultCompactRatio       = 0.8   // trigger: prompt at this fraction of the window compacts
-	defaultCompactForceRatio  = 0.9   // force compaction at this high-water mark even for low-value folds
-	defaultCompactTarget      = 0.5   // safety cap: the kept tail never exceeds this fraction of the window
-	defaultTailTokens         = 16384 // verbatim recent-tail budget, in tokens
-	minRecentKeep             = 2     // never keep fewer recent messages than this
-	minCompactMessages        = 2     // skip compaction below this many compactable messages
-	fallbackTokPerChar        = 0.25  // ~4 chars/token, used before any usage is available to calibrate
-	maxPinnedFirstUserTokens  = 1500  // ceiling on pinning the first user turn verbatim; larger first turns (pasted content) stay foldable
-	pinnedFirstUserWindowFrac = 0.15  // and never pin a first turn worth more than this fraction of the window
+	defaultSoftCompactRatio    = 0.5   // report growing context here, but keep the cache-stable prefix intact
+	defaultToolResultSnipRatio = 0.6   // rewrite stale tool results cheaply before summary compaction
+	defaultCompactRatio        = 0.8   // trigger: prompt at this fraction of the window compacts
+	defaultCompactForceRatio   = 0.9   // force compaction at this high-water mark even for low-value folds
+	defaultCompactTarget       = 0.5   // safety cap: the kept tail never exceeds this fraction of the window
+	defaultTailTokens          = 16384 // verbatim recent-tail budget, in tokens
+	minRecentKeep              = 2     // never keep fewer recent messages than this
+	minCompactMessages         = 2     // skip compaction below this many compactable messages
+	fallbackTokPerChar         = 0.25  // ~4 chars/token, used before any usage is available to calibrate
+	maxPinnedFirstUserTokens   = 1500  // ceiling on pinning the first user turn verbatim; larger first turns (pasted content) stay foldable
+	pinnedFirstUserWindowFrac  = 0.15  // and never pin a first turn worth more than this fraction of the window
 )
 
 // summaryTag wraps the compaction summary so the model can distinguish it from
@@ -85,12 +87,23 @@ func (a *Agent) maybeCompact(ctx context.Context, u *provider.Usage) {
 		return
 	}
 	high := int(float64(a.contextWindow) * a.compactRatio)
+	snip := int(float64(a.contextWindow) * a.toolResultSnipRatio)
 	soft := int(float64(a.contextWindow) * a.softCompactRatio)
 	// Between the soft ratio and the trigger, report growing context once without
 	// rewriting the prefix — a compaction here would needlessly crater the cache.
-	if u.PromptTokens >= soft && u.PromptTokens < high && !a.softCompactNoticed {
+	if u.PromptTokens >= soft && u.PromptTokens < snip && !a.softCompactNoticed {
 		a.softCompactNoticed = true
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf("context reached %.0f%% of window; keeping cache-first prefix until compact threshold %.0f%%", a.softCompactRatio*100, a.compactRatio*100)})
+		detail := fmt.Sprintf("context reached %.0f%% of window; keeping cache-first prefix until compact threshold %.0f%%", a.softCompactRatio*100, a.compactRatio*100)
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context is getting large; preserving cache until cleanup is needed.", Detail: detail})
+		return
+	}
+	if u.PromptTokens >= snip && u.PromptTokens < high {
+		ratio := a.tokPerChar()
+		if st, err := a.SnipStaleToolResults(); err == nil && st.Results > 0 {
+			saved := int(float64(st.SavedChars) * ratio)
+			a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf(
+				"snipped %d stale tool results (~%d tokens est.) before compaction", st.Results, saved)})
+		}
 		return
 	}
 	if u.PromptTokens < high {
@@ -116,7 +129,7 @@ func (a *Agent) maybeCompact(ctx context.Context, u *provider.Usage) {
 		}
 	}
 	if err := a.compact(ctx, "auto", "", force); err != nil {
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: fmt.Sprintf("compaction skipped: %v", err)})
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context cleanup skipped for now.", Detail: fmt.Sprintf("compaction skipped: %v", err)})
 		return
 	}
 	// A healthy compaction drops the prompt under the trigger, so the next turn
@@ -127,7 +140,7 @@ func (a *Agent) maybeCompact(ctx context.Context, u *provider.Usage) {
 	a.consecutiveCompacts++
 	if a.consecutiveCompacts >= 2 {
 		a.compactStuck = true
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: fmt.Sprintf(
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Automatic context cleanup paused because the context window is too small.", Detail: fmt.Sprintf(
 			"context_window=%d is too small for compaction to help (the system prompt plus one turn already exceeds %.0f%% of it); raise context_window or shrink tool output. Auto-compaction paused until the prompt drops.",
 			a.contextWindow, a.compactRatio*100)})
 	}
@@ -246,7 +259,7 @@ func (a *Agent) compact(ctx context.Context, trigger, instructions string, force
 		// deterministic marker rather than aborting. /compact then always frees
 		// context (and auto-compaction can't loop on a still-full window); the
 		// verbatim user turns kept above are untouched.
-		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "compaction summary unavailable (" + err.Error() + "); folded mechanically"})
+		a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo, Text: "Context was compacted without a generated summary.", Detail: "compaction summary unavailable (" + err.Error() + "); folded mechanically"})
 		summary = mechanicalFoldDigest(len(fold), archived)
 	}
 
@@ -302,6 +315,7 @@ func (a *Agent) SummarizeFrom(ctx context.Context, fromIdx int) error {
 		Content: "Summary of the later conversation (compacted from here on):\n" + summary,
 	})
 	a.session.Replace(next)
+	a.session.IncrementRewrite()
 	a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("summarized %d later messages → summary", len(region))})
 	return nil
@@ -335,10 +349,17 @@ func (a *Agent) SummarizeUpTo(ctx context.Context, toIdx int) error {
 	})
 	next = append(next, msgs[toIdx:]...)
 	a.session.Replace(next)
+	a.session.IncrementRewrite()
 	a.sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelInfo,
 		Text: fmt.Sprintf("summarized %d earlier messages → summary", len(region))})
 	return nil
 }
+
+// IsCompactionSummary reports whether m is a rolling digest inserted by a
+// prior compaction fold. Exported for session owners outside this package
+// (e.g. the guardian) whose turn rollback must not treat a digest as a
+// disposable user message.
+func IsCompactionSummary(m provider.Message) bool { return isCompactionSummary(m) }
 
 // isCompactionSummary reports whether m is a rolling summary from a prior fold.
 func isCompactionSummary(m provider.Message) bool {
@@ -385,14 +406,114 @@ func (a *Agent) pinnableUserTurn(m provider.Message) bool {
 // later fold never re-summarizes an earlier digest and drops the facts it already
 // captured) — and the rest, which folds. Order within each group is preserved.
 func (a *Agent) partitionFold(region []provider.Message) (kept, fold []provider.Message) {
-	for _, m := range region {
-		if isCompactionSummary(m) || (m.Role == provider.RoleUser && a.pinnableUserTurn(m)) {
+	policyKeep := keepIndexes(region, a.keepPolicy)
+	for i, m := range region {
+		if policyKeep[i] || isCompactionSummary(m) || (m.Role == provider.RoleUser && a.pinnableUserTurn(m)) {
 			kept = append(kept, m)
 		} else {
 			fold = append(fold, m)
 		}
 	}
 	return kept, fold
+}
+
+func keepIndexes(region []provider.Message, policy KeepPolicy) []bool {
+	keep := make([]bool, len(region))
+	policyStart := 0
+	for i, m := range region {
+		if isCompactionSummary(m) {
+			policyStart = i + 1
+		}
+	}
+	// Retention applies only to messages since the latest digest; older kept
+	// messages are allowed to fold on the next pass so they cannot grow forever.
+	for i, m := range region {
+		if i >= policyStart && shouldKeepMessage(m, policy) {
+			keep[i] = true
+		}
+	}
+	for i, m := range region {
+		if !keep[i] {
+			continue
+		}
+		switch m.Role {
+		case provider.RoleTool:
+			if j := findToolCaller(region, i, m.ToolCallID); j >= 0 {
+				keepToolCallGroup(region, keep, j)
+			}
+		case provider.RoleAssistant:
+			keepToolCallGroup(region, keep, i)
+		}
+	}
+	return keep
+}
+
+func keepToolCallGroup(region []provider.Message, keep []bool, assistantIndex int) {
+	if assistantIndex < 0 || assistantIndex >= len(region) {
+		return
+	}
+	m := region[assistantIndex]
+	if m.Role != provider.RoleAssistant || len(m.ToolCalls) == 0 {
+		return
+	}
+	keep[assistantIndex] = true
+	ids := toolCallIDs(m)
+	for j := assistantIndex + 1; j < len(region) && region[j].Role == provider.RoleTool; j++ {
+		if ids[region[j].ToolCallID] {
+			keep[j] = true
+		}
+	}
+}
+
+func shouldKeepMessage(m provider.Message, policy KeepPolicy) bool {
+	if policy&KeepErrors != 0 && isErrorMessage(m) {
+		return true
+	}
+	if policy&KeepUserMarked != 0 && isUserMarked(m) {
+		return true
+	}
+	return false
+}
+
+func isErrorMessage(m provider.Message) bool {
+	if m.Role != provider.RoleTool {
+		return false
+	}
+	s := strings.TrimSpace(strings.ToLower(m.Content))
+	return strings.HasPrefix(s, "error:") || strings.HasPrefix(s, "blocked:")
+}
+
+func isUserMarked(m provider.Message) bool {
+	if m.Role != provider.RoleUser {
+		return false
+	}
+	content := strings.TrimSpace(strings.ToLower(m.Content))
+	return strings.HasPrefix(content, "[[keep]]") ||
+		strings.HasPrefix(content, "[keep]") ||
+		strings.HasPrefix(content, "<keep>") ||
+		strings.HasPrefix(content, "<!-- keep -->")
+}
+
+func findToolCaller(region []provider.Message, toolIndex int, id string) int {
+	for i := toolIndex - 1; i >= 0; i-- {
+		if region[i].Role != provider.RoleAssistant {
+			continue
+		}
+		for _, tc := range region[i].ToolCalls {
+			if tc.ID == id {
+				return i
+			}
+		}
+	}
+	return -1
+}
+
+func toolCallIDs(m provider.Message) map[string]bool {
+	ids := make(map[string]bool, len(m.ToolCalls))
+	for _, tc := range m.ToolCalls {
+		ids[tc.ID] = true
+	}
+	return ids
 }
 
 // planCompaction locates the region to summarize. head is the count of leading
@@ -509,7 +630,7 @@ func (a *Agent) summarize(ctx context.Context, region []provider.Message, instru
 			{Role: provider.RoleSystem, Content: sys},
 			{Role: provider.RoleUser, Content: renderTranscript(region)},
 		},
-		Temperature: a.temperature,
+		Temperature: provider.OptionalTemperature(a.temperature),
 	})
 	if err != nil {
 		return "", err
@@ -518,12 +639,19 @@ func (a *Agent) summarize(ctx context.Context, region []provider.Message, instru
 	// select on ctx.Done so a stalled stream (open but never delivering or closing)
 	// unblocks on timeout instead of pinning the "compacting…" placeholder forever.
 	var b strings.Builder
+	var usage *provider.Usage
+	emitUsage := func() {
+		if usage != nil && usage.TotalTokens > 0 {
+			a.sink.Emit(event.Event{Kind: event.Usage, Usage: usage, Pricing: a.pricing, UsageSource: event.UsageSourceCompaction})
+		}
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return "", ctx.Err()
 		case chunk, ok := <-ch:
 			if !ok {
+				emitUsage()
 				s := strings.TrimSpace(b.String())
 				if s == "" {
 					return "", fmt.Errorf("summarizer returned empty output")
@@ -533,6 +661,8 @@ func (a *Agent) summarize(ctx context.Context, region []provider.Message, instru
 			switch chunk.Type {
 			case provider.ChunkText:
 				b.WriteString(chunk.Text)
+			case provider.ChunkUsage:
+				usage = chunk.Usage
 			case provider.ChunkError:
 				return "", chunk.Err
 			}
@@ -574,7 +704,7 @@ func renderTranscript(msgs []provider.Message) string {
 				fmt.Fprintf(&b, "[assistant]\n%s\n", m.Content)
 			}
 			for _, tc := range m.ToolCalls {
-				fmt.Fprintf(&b, "[assistant calls %s] %s\n", tc.Name, tc.Arguments)
+				fmt.Fprintf(&b, "[assistant calls %s] %s\n", tc.Name, summarizeToolArgs(tc.Arguments))
 			}
 			b.WriteString("\n")
 		case provider.RoleTool:
@@ -584,6 +714,27 @@ func renderTranscript(msgs []provider.Message) string {
 		}
 	}
 	return b.String()
+}
+
+// summarizeToolArgs returns a short summary of tool-call arguments instead of
+// the full JSON. This prevents the summarizer from reproducing long argument
+// text (like sub-agent task prompts) in the compaction summary, which would
+// leak into the session as a user message (#4317).
+func summarizeToolArgs(args string) string {
+	if args == "" {
+		return "(no arguments)"
+	}
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		// Not valid JSON — return a length hint instead of raw text.
+		return fmt.Sprintf("(%d bytes)", len(args))
+	}
+	keys := make([]string, 0, len(parsed))
+	for k := range parsed {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return fmt.Sprintf("{%s} (%d keys)", strings.Join(keys, ", "), len(parsed))
 }
 
 // archiveMessages writes the dropped originals to a timestamped .jsonl (one

@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"reasonix/internal/config"
+	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 )
 
 type savedAccount struct {
@@ -52,7 +54,7 @@ func loadSavedAccount(accountID string) (savedAccount, error) {
 	if path == "" {
 		return savedAccount{}, fmt.Errorf("reasonix user config dir is unavailable")
 	}
-	data, err := os.ReadFile(path)
+	data, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		return savedAccount{}, err
 	}
@@ -110,7 +112,8 @@ func saveAccount(accountID string, account savedAccount) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, data, 0o600)
+	// Atomic write: a truncated credentials file silently breaks login.
+	return fileutil.AtomicWriteFile(path, data, 0o600)
 }
 
 func Login(ctx context.Context, out io.Writer, timeout time.Duration) (*LoginResult, error) {

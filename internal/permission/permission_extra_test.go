@@ -140,6 +140,13 @@ func TestSubjectPriority(t *testing.T) {
 	}
 }
 
+func TestSubjectMoveFilePaths(t *testing.T) {
+	got := Subject(json.RawMessage(`{"source_path":"a.md","destination_path":"docs/a.md"}`))
+	if got != "a.md" {
+		t.Errorf("move_file subject = %q, want source path", got)
+	}
+}
+
 // --- rememberRule ---
 
 func TestRememberRuleWithBashSubjectUsesPrefixWhenAvailable(t *testing.T) {
@@ -190,6 +197,48 @@ func TestRememberRuleForBashUsesPrefixWhenAvailable(t *testing.T) {
 	if RuleMatchesString("Bash(go test *)", "bash", "go test ./legacy && rm -rf /tmp/x") {
 		t.Errorf("legacy space-star prefix should not match commands with shell syntax")
 	}
+	if !RuleMatchesString("Bash(go test:*)", "bash", `go "test" ./legacy`) {
+		t.Errorf("prefix rule should match statically quoted command fields")
+	}
+	if RuleMatchesString("Bash(go test:*)", "bash", `go "$subcmd" ./legacy`) {
+		t.Errorf("prefix rule should not match dynamic command fields")
+	}
+}
+
+func TestBashPrefixRulesMatchSafeRedirectsOnly(t *testing.T) {
+	safe := []string{
+		"git log 2>/dev/null",
+		"git log 2> /dev/null",
+		"git log >/dev/null",
+		"git log >>/dev/null",
+		"git log &>/dev/null",
+		"git log >$null",
+		"git log >NUL",
+		"git log 2>&1",
+		"git log >&2",
+	}
+	for _, cmd := range safe {
+		if !RuleMatchesString("Bash(git log:*)", "bash", cmd) {
+			t.Errorf("prefix rule should match safe redirect command %q", cmd)
+		}
+	}
+
+	unsafe := []string{
+		"git log > out.txt",
+		"git log 2>out.txt",
+		"git log < input.txt",
+		"git log >$nullish",
+		"git log >nul.txt",
+		"git log 2>&1rm",
+		"git log >/dev/null && rm -rf /tmp/x",
+		"git log 2>&1 && rm -rf /tmp/x",
+		"git log >/dev/null\nrm -rf /tmp/x",
+	}
+	for _, cmd := range unsafe {
+		if RuleMatchesString("Bash(git log:*)", "bash", cmd) {
+			t.Errorf("prefix rule should not match unsafe shell command %q", cmd)
+		}
+	}
 }
 
 func TestRememberRuleWithFileSubjectIsToolWide(t *testing.T) {
@@ -216,7 +265,7 @@ func TestPersistedEditRuleIsToolWide(t *testing.T) {
 		t.Fatalf("persisted rule = %q, want tool-wide Edit (no path restriction)", rule)
 	}
 	// The tool-wide Edit rule matches any file-mutation tool on any file.
-	allMutationTools := []string{"write_file", "edit_file", "multi_edit", "notebook_edit", "delete_range", "delete_symbol"}
+	allMutationTools := []string{"write_file", "edit_file", "multi_edit", "move_file", "notebook_edit", "delete_range", "delete_symbol"}
 	for _, tm := range allMutationTools {
 		if !RuleMatchesString(rule, tm, "any/path/at/all.txt") {
 			t.Errorf("tool-wide Edit should match %s on any path", tm)

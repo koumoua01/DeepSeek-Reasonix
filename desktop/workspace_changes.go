@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"time"
 
+	"reasonix/internal/control"
 	"reasonix/internal/proc"
 )
 
@@ -23,9 +27,33 @@ type workspaceChangeAccumulator struct {
 	hasGit     bool
 }
 
-func (a *App) WorkspaceChanges() WorkspaceChangesView {
-	out := WorkspaceChangesView{GitAvailable: true}
-	base, err := a.activeWorkspaceBase()
+const workspaceGitBranchCacheTTL = 2 * time.Second
+
+type workspaceGitBranchCacheEntry struct {
+	branch     string
+	expires    time.Time
+	refreshing bool
+}
+
+var workspaceGitBranchCache = struct {
+	sync.Mutex
+	entries map[string]workspaceGitBranchCacheEntry
+}{entries: map[string]workspaceGitBranchCacheEntry{}}
+
+var workspaceGitBranchForMetaProbe = workspaceGitBranch
+
+func (a *App) WorkspaceChanges(tabID string) WorkspaceChangesView {
+	out := WorkspaceChangesView{Files: []WorkspaceChangeView{}, GitAvailable: true}
+	tabID = strings.TrimSpace(tabID)
+
+	workspaceRoot, ctrl, ok := a.workspaceChangesTarget(tabID)
+	if !ok {
+		out.GitAvailable = false
+		out.GitErr = fmt.Sprintf("tab %q not found", tabID)
+		return out
+	}
+
+	base, err := workspaceBaseFromRoot(workspaceRoot)
 	if err != nil {
 		out.GitAvailable = false
 		out.GitErr = err.Error()
@@ -46,9 +74,6 @@ func (a *App) WorkspaceChanges() WorkspaceChangesView {
 		return changes[path]
 	}
 
-	a.mu.RLock()
-	ctrl := a.activeCtrlLocked()
-	a.mu.RUnlock()
 	if ctrl != nil {
 		for _, meta := range ctrl.Checkpoints() {
 			for _, path := range meta.Paths {
@@ -103,13 +128,47 @@ func (a *App) WorkspaceChanges() WorkspaceChangesView {
 	return out
 }
 
+func (a *App) workspaceChangesTarget(tabID string) (string, control.SessionAPI, bool) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	var tab *WorkspaceTab
+	if tabID == "" {
+		tab = a.activeTabLocked()
+	} else {
+		tab = a.tabs[tabID]
+	}
+	if tab == nil {
+		return "", nil, tabID == ""
+	}
+	return tab.WorkspaceRoot, tab.Ctrl, true
+}
+
+func (a *App) workspaceBaseForTab(tabID string) (string, error) {
+	tabID = strings.TrimSpace(tabID)
+	workspaceRoot, _, ok := a.workspaceChangesTarget(tabID)
+	if !ok {
+		return "", fmt.Errorf("tab %q not found", tabID)
+	}
+	return workspaceBaseFromRoot(workspaceRoot)
+}
+
 // workspaceGit builds a console-hidden git probe: CREATE_NO_WINDOW so git's own
 // children inherit the invisible console, fsmonitor/auto-maintenance off so a
 // probe never spawns a background daemon that opens a console of its own (#3906).
 func workspaceGit(args ...string) *exec.Cmd {
-	cmd := exec.Command("git", append([]string{"-c", "core.fsmonitor=false", "-c", "maintenance.auto=false"}, args...)...)
+	return workspaceGitCommand(context.Background(), args...)
+}
+
+func workspaceGitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-c", "core.fsmonitor=false", "-c", "maintenance.auto=false"}, args...)...)
 	proc.HideWindow(cmd)
 	return cmd
+}
+
+func workspaceGitOutputWithTimeout(timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	return workspaceGitCommand(ctx, args...).Output()
 }
 
 func workspaceGitStatus(base string) ([]gitStatusEntry, error) {
@@ -188,12 +247,66 @@ func workspaceRelPathFromGitStatus(repoRoot, base, path string) string {
 	return normalizeWorkspaceRelPath(base, path)
 }
 
+// workspaceGitBranchForMeta is the cached variant used by high-frequency UI
+// metadata refreshes. It never waits for git on the caller path: stale branch
+// metadata is less harmful than blocking tab activation or hydration. Workflows
+// that need an immediate git read, such as WorkspaceChanges, should call
+// workspaceGitBranch directly.
+func workspaceGitBranchForMeta(base string) string {
+	key := filepath.Clean(base)
+	now := time.Now()
+
+	workspaceGitBranchCache.Lock()
+	if cached, ok := workspaceGitBranchCache.entries[key]; ok {
+		branch := cached.branch
+		if now.Before(cached.expires) || cached.refreshing {
+			workspaceGitBranchCache.Unlock()
+			return branch
+		}
+		cached.refreshing = true
+		workspaceGitBranchCache.entries[key] = cached
+		workspaceGitBranchCache.Unlock()
+		go refreshWorkspaceGitBranchForMeta(key, base)
+		return branch
+	}
+
+	workspaceGitBranchCache.entries[key] = workspaceGitBranchCacheEntry{
+		expires:    now.Add(workspaceGitBranchCacheTTL),
+		refreshing: true,
+	}
+	workspaceGitBranchCache.Unlock()
+
+	go refreshWorkspaceGitBranchForMeta(key, base)
+	return ""
+}
+
+func refreshWorkspaceGitBranchForMeta(key, base string) {
+	branch := ""
+	// Store via defer so the refreshing flag is always cleared, even when the
+	// probe panics or exits the goroutine early; otherwise the entry would stay
+	// marked refreshing forever and never update again.
+	defer func() {
+		storeNow := time.Now()
+		workspaceGitBranchCache.Lock()
+		if len(workspaceGitBranchCache.entries) > 256 {
+			for k, cached := range workspaceGitBranchCache.entries {
+				if storeNow.After(cached.expires) {
+					delete(workspaceGitBranchCache.entries, k)
+				}
+			}
+		}
+		workspaceGitBranchCache.entries[key] = workspaceGitBranchCacheEntry{branch: branch, expires: storeNow.Add(workspaceGitBranchCacheTTL)}
+		workspaceGitBranchCache.Unlock()
+	}()
+
+	branch = workspaceGitBranchForMetaProbe(base)
+}
+
 // workspaceGitBranch returns the current git branch name for the repo rooted
 // at base, or an empty string when base is not inside a git repository or when
 // git is unavailable.
 func workspaceGitBranch(base string) string {
-	cmd := workspaceGit("-C", base, "branch", "--show-current")
-	raw, err := cmd.Output()
+	raw, err := workspaceGitOutputWithTimeout(2*time.Second, "-C", base, "branch", "--show-current")
 	if err != nil {
 		return ""
 	}
@@ -201,8 +314,7 @@ func workspaceGitBranch(base string) string {
 		return branch
 	}
 
-	headCmd := workspaceGit("-C", base, "rev-parse", "--short", "HEAD")
-	raw, err = headCmd.Output()
+	raw, err = workspaceGitOutputWithTimeout(2*time.Second, "-C", base, "rev-parse", "--short", "HEAD")
 	if err != nil {
 		return ""
 	}
@@ -258,8 +370,8 @@ type GitCommitDetailView struct {
 	Files []string `json:"files,omitempty"`
 }
 
-func (a *App) WorkspaceGitHistory(path string) ([]GitCommitView, error) {
-	base, err := a.activeWorkspaceBase()
+func (a *App) WorkspaceGitHistory(tabID string, path string) ([]GitCommitView, error) {
+	base, err := a.workspaceBaseForTab(tabID)
 	if err != nil {
 		return nil, err
 	}
@@ -289,8 +401,8 @@ func (a *App) WorkspaceGitHistory(path string) ([]GitCommitView, error) {
 	return out, nil
 }
 
-func (a *App) WorkspaceGitCommitDetail(hash string, path string) (GitCommitDetailView, error) {
-	base, err := a.activeWorkspaceBase()
+func (a *App) WorkspaceGitCommitDetail(tabID string, hash string, path string) (GitCommitDetailView, error) {
+	base, err := a.workspaceBaseForTab(tabID)
 	if err != nil {
 		return GitCommitDetailView{}, err
 	}

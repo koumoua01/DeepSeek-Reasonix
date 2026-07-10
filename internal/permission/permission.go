@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+
+	"reasonix/internal/shellparse"
 )
 
 // Decision is the outcome of evaluating a tool call against a Policy.
@@ -127,15 +129,30 @@ func New(mode string, allow, ask, deny []string) Policy {
 
 // Decide evaluates a tool call. readOnly is the tool's own classification; args
 // is the raw JSON the model sent, from which the call's subject is extracted
-// for glob matching. Precedence: deny > ask > allow > fallback (Allow for
-// readers, Mode for writers).
+// for glob matching. Calls with multiple subjects, such as move_file's source
+// and destination paths, must be safe for every subject before the call is
+// allowed. Precedence: deny > ask > allow > fallback (Allow for readers, Mode
+// for writers).
 func (p Policy) Decide(toolName string, readOnly bool, args json.RawMessage) Decision {
-	return p.DecideSubject(toolName, readOnly, Subject(args))
+	return p.DecideSubjects(toolName, readOnly, Subjects(args))
 }
 
 // DecideSubject evaluates a tool call when the caller already extracted the
 // stable approval subject from args.
 func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) Decision {
+	if canonicalRuleTool(toolName) == "bash" {
+		switch {
+		case matchAny(p.Deny, toolName, subject):
+			return Deny
+		case matchAny(p.Ask, toolName, subject):
+			return Ask
+		case matchAny(p.Allow, toolName, subject):
+			return Allow
+		}
+		if parts := DecomposeBashCommand(subject); parts != nil {
+			return p.decideBashSegments(readOnly, parts)
+		}
+	}
 	switch {
 	case matchAny(p.Deny, toolName, subject):
 		return Deny
@@ -148,6 +165,73 @@ func (p Policy) DecideSubject(toolName string, readOnly bool, subject string) De
 	default:
 		return p.Mode
 	}
+}
+
+// decideBashSegments evaluates each simple-command segment of a compound bash
+// invocation against the rule table independently. This lets prefix rules like
+// `Bash(git push:*)` — created by the existing auto-save path for atomic
+// commands — cover common compound flows (`git add . && git commit && git
+// push`) without ever synthesizing a new prefix from a compound command.
+//
+// Precedence stays deny > ask > allow > fallback. Any single segment hitting
+// deny denies the whole call; any segment needing approval turns the whole
+// call into Ask; the whole call is Allow only if every segment is covered or
+// writer fallback allows uncovered segments.
+// A segment recognized as read-only by shellsafe (echo/ls/git status/...) is
+// allowed on its own without a rule, matching the behavior of an atomic
+// read-only bash call.
+func (p Policy) decideBashSegments(readOnly bool, parts []string) Decision {
+	out := Allow
+	for _, sub := range parts {
+		segReadOnly := readOnly
+		if !segReadOnly {
+			if isReadOnlyBashSubject(sub) {
+				segReadOnly = true
+			}
+		}
+		switch {
+		case matchAny(p.Deny, "bash", sub):
+			return Deny
+		case matchAny(p.Ask, "bash", sub):
+			out = Ask
+		case matchAny(p.Allow, "bash", sub):
+			// covered
+		case segReadOnly:
+			// covered
+		default:
+			// Segment not covered by a rule or read-only classification: apply
+			// the same writer fallback used for atomic bash commands.
+			switch p.Mode {
+			case Deny:
+				return Deny
+			case Ask:
+				out = Ask
+			default:
+				// covered by fallback allow
+			}
+		}
+	}
+	return out
+}
+
+// DecideSubjects evaluates a tool call against every subject the call touches.
+// This keeps two-path operations honest: a move is denied if either endpoint is
+// denied, asks if either endpoint requires approval, and is allowed only when
+// every endpoint is allowed under the same policy.
+func (p Policy) DecideSubjects(toolName string, readOnly bool, subjects []string) Decision {
+	if len(subjects) == 0 {
+		return p.DecideSubject(toolName, readOnly, "")
+	}
+	out := Allow
+	for _, subject := range subjects {
+		switch p.DecideSubject(toolName, readOnly, subject) {
+		case Deny:
+			return Deny
+		case Ask:
+			out = Ask
+		}
+	}
+	return out
 }
 
 // matchAny reports whether any rule matches the (toolName, subject) pair. A
@@ -229,24 +313,52 @@ func bashRulePrefixBaseMatches(existing, candidate Rule) bool {
 // call's "subject" — the thing a Subject glob matches against. Generic so tools
 // need not implement a permission-specific method: bash exposes command, the
 // file tools expose path / file_path, grep & glob expose pattern.
-var subjectKeys = []string{"command", "file_path", "path", "pattern"}
+var subjectKeys = []string{"command", "file_path", "path", "source_path", "destination_path", "pattern"}
 
-// Subject extracts the matchable subject string from a call's raw JSON args,
-// returning "" when none of the known keys is present (such a call only matches
-// bare "ToolName" rules).
+// Subject extracts the primary matchable subject string from a call's raw JSON
+// args, returning "" when none of the known keys is present (such a call only
+// matches bare "ToolName" rules). Use Subjects for permission decisions that
+// must account for every touched endpoint.
 func Subject(args json.RawMessage) string {
+	subjects := Subjects(args)
+	if len(subjects) > 0 {
+		return subjects[0]
+	}
+	return ""
+}
+
+// Subjects extracts every matchable subject from a call's raw JSON args. Most
+// tools expose one subject; move_file exposes both source_path and
+// destination_path so path-scoped permission rules can protect either endpoint.
+func Subjects(args json.RawMessage) []string {
 	if len(args) == 0 {
-		return ""
+		return nil
 	}
 	var m map[string]any
 	if err := json.Unmarshal(args, &m); err != nil {
-		return ""
+		return nil
+	}
+	src := stringArg(m, "source_path")
+	dst := stringArg(m, "destination_path")
+	if src != "" && dst != "" {
+		out := []string{src}
+		if dst != src {
+			out = append(out, dst)
+		}
+		return out
 	}
 	for _, k := range subjectKeys {
-		if v, ok := m[k]; ok {
-			if s, ok := v.(string); ok && s != "" {
-				return s
-			}
+		if s := stringArg(m, k); s != "" {
+			return []string{s}
+		}
+	}
+	return nil
+}
+
+func stringArg(m map[string]any, key string) string {
+	if v, ok := m[key]; ok {
+		if s, ok := v.(string); ok && s != "" {
+			return s
 		}
 	}
 	return ""
@@ -293,6 +405,12 @@ type Approver interface {
 	Approve(ctx context.Context, toolName, subject string, args json.RawMessage) (allow, remember bool, err error)
 }
 
+// ReasonedApprover is the optional extension used by frontends that can return
+// a denial reason to feed back to the model.
+type ReasonedApprover interface {
+	ApproveWithReason(ctx context.Context, toolName, subject string, args json.RawMessage) (allow, remember bool, reason string, err error)
+}
+
 // Gate is what the agent consults at execute time: a Policy plus an optional
 // Approver. It satisfies the agent's Gate interface structurally.
 type Gate struct {
@@ -325,12 +443,16 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 			return true, "", nil // non-interactive: preserve autonomy
 		}
 		subject := Subject(args)
-		allow, remember, err := g.Approver.Approve(ctx, toolName, subject, args)
+		allow, remember, approverReason, err := g.approve(ctx, toolName, subject, args)
 		if err != nil {
 			return false, "approval aborted", err
 		}
 		if !allow {
-			return false, "the user declined this tool call — do not retry it; ask how they would like to proceed or choose another approach.", nil
+			reason := "the user declined this tool call — do not retry it; ask how they would like to proceed or choose another approach."
+			if approverReason != "" {
+				reason = approverReason
+			}
+			return false, reason, nil
 		}
 		if remember && g.OnRemember != nil {
 			// "Always allow" is tool-wide: persist the bare tool name so any
@@ -350,6 +472,14 @@ func (g *Gate) Check(ctx context.Context, toolName string, args json.RawMessage,
 	default:
 		return true, "", nil
 	}
+}
+
+func (g *Gate) approve(ctx context.Context, toolName, subject string, args json.RawMessage) (bool, bool, string, error) {
+	if a, ok := g.Approver.(ReasonedApprover); ok {
+		return a.ApproveWithReason(ctx, toolName, subject, args)
+	}
+	allow, remember, err := g.Approver.Approve(ctx, toolName, subject, args)
+	return allow, remember, "", err
 }
 
 // rememberRule builds the rule string persisted when the user picks "always
@@ -417,7 +547,10 @@ func BashCommandPrefix(subject string) string {
 	if BashDangerWarning(cmd) != "" {
 		return ""
 	}
-	fields := strings.Fields(cmd)
+	fields, malformed := shellparse.StaticFields(cmd)
+	if malformed != "" {
+		return ""
+	}
 	if len(fields) < 2 {
 		return ""
 	}
@@ -440,7 +573,7 @@ func isPackageManagerRun(base string) bool {
 // IsFileMutationTool reports whether a built-in tool mutates workspace files.
 func IsFileMutationTool(toolName string) bool {
 	switch toolName {
-	case "write_file", "edit_file", "multi_edit", "notebook_edit", "delete_range", "delete_symbol":
+	case "write_file", "edit_file", "multi_edit", "move_file", "notebook_edit", "delete_range", "delete_symbol":
 		return true
 	default:
 		return false
@@ -515,8 +648,21 @@ func bashPrefixBase(pattern string) (string, bool) {
 }
 
 func bashPrefixMatches(base, subject string) bool {
-	if containsShellSyntax(subject) {
+	if normalized, ok := normalizeBashSafeRedirectsForMatch(subject); ok {
+		subject = normalized
+	}
+	fields, malformed := shellparse.StaticFields(subject)
+	if malformed != "" {
 		return false
 	}
-	return subject == base || strings.HasPrefix(subject, base+" ")
+	baseFields, malformed := shellparse.StaticFields(base)
+	if malformed != "" || len(baseFields) == 0 || len(fields) < len(baseFields) {
+		return false
+	}
+	for i, want := range baseFields {
+		if fields[i] != want {
+			return false
+		}
+	}
+	return true
 }
