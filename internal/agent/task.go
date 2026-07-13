@@ -6,11 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
+	"time"
 
 	"reasonix/internal/event"
+	"reasonix/internal/evidence"
 	"reasonix/internal/jobs"
 	"reasonix/internal/planmode"
 	"reasonix/internal/provider"
@@ -69,6 +73,19 @@ var readOnlySubagentWorkflowTools = []string{
 }
 
 const subagentToolBoundarySummary = "Recursive agent/skill tools are exposed only while max_subagent_depth leaves another delegation layer; unsupported background job tools (parallel_tasks, wait, bash_output, kill_shell) are excluded; bash is exposed as foreground-only inside subagents."
+
+// AlwaysHiddenSubagentTools returns the tool names excluded from every
+// subagent's registry regardless of an explicit allowlist or delegation
+// depth (unlike subagentRecursiveTools, which depends on remaining depth).
+// That covers both subagentAlwaysHiddenTools and subagentJobTools —
+// SubagentToolRegistryForDepth and its read-only variant strip the job tools
+// unconditionally too. Host UIs offering a tool picker for a subagent
+// profile's allowed-tools should exclude these from the offered choices —
+// selecting them would be silently ignored at runtime.
+func AlwaysHiddenSubagentTools() []string {
+	names := append([]string(nil), subagentAlwaysHiddenTools...)
+	return append(names, subagentJobTools...)
+}
 
 // SubagentMetaTools returns the tool names that spawned agents should not inherit
 // from the parent registry unless a future call site deliberately opts into a
@@ -205,6 +222,7 @@ type TaskTool struct {
 	baseEffort          string
 	identityProfile     func(modelRef, effort string) (string, string)
 	maxSubagentDepth    int
+	deliveryProfile     bool
 }
 
 // NewTaskTool wires a task tool to the parent agent's environment so its
@@ -260,6 +278,14 @@ func (t *TaskTool) WithTranscriptIdentityResolver(resolve func(modelRef, effort 
 
 func (t *TaskTool) WithMaxSubagentDepth(depth int) *TaskTool {
 	t.maxSubagentDepth = NormalizeMaxSubagentDepth(depth)
+	return t
+}
+
+// WithDeliveryProfile propagates the parent's runtime delivery contract into
+// writer-capable sub-agents. Read-only sub-agents may receive the flag too, but
+// the mutation gate remains dormant for them.
+func (t *TaskTool) WithDeliveryProfile(enabled bool) *TaskTool {
+	t.deliveryProfile = enabled
 	return t
 }
 
@@ -387,7 +413,11 @@ func (r *ReadOnlyTaskTool) Execute(ctx context.Context, args json.RawMessage) (s
 	if err != nil {
 		return "", fmt.Errorf("read-only sub-agent profile: %w", err)
 	}
-	return r.task.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth)
+	answer, err := r.task.runSubSession(ctx, p.Prompt, subReg, subSink(ctx), maxSteps, prov, pricing, ctxWin, NewSession(DefaultReadOnlyTaskSystemPrompt), childDepth)
+	if err != nil {
+		return "", err
+	}
+	return GuardSubagentHostDecisionText(answer), nil
 }
 
 // childMaxSteps resolves a sub-agent's step budget. An explicit request wins.
@@ -520,7 +550,7 @@ func (t *TaskTool) Execute(ctx context.Context, args json.RawMessage) (string, e
 		}
 		return FormatSubagentRunResult(answer, run, false), nil
 	}
-	return answer, nil
+	return GuardSubagentHostDecisionText(answer), nil
 }
 
 func (t *TaskTool) prepareTranscriptRun(subReg *tool.Registry, modelRef, effortRef, parentSession, parentID, continueFrom, legacyForkFrom string) (*SubagentRun, error) {
@@ -758,8 +788,12 @@ func (t *TaskTool) resolveSubSessionRuntime(modelRef, effort string) (provider.P
 }
 
 func (t *TaskTool) runSubSession(ctx context.Context, prompt string, subReg *tool.Registry, sink event.Sink, maxSteps int, prov provider.Provider, pricing *provider.Pricing, ctxWin int, sess *Session, childDepth int) (string, error) {
+	opts := t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth)
+	// Capture the pristine task before host framing is prepended: delivery
+	// intent classification must judge the task, not the wrapper.
+	opts.ClassifierTaskText = prompt
 	prompt = t.withWorkspaceContext(prompt)
-	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, t.subagentOptions(ctx, maxSteps, pricing, ctxWin, childDepth), sink)
+	return RunSubAgentWithSession(ctx, prov, subReg, sess, prompt, opts, sink)
 }
 
 // subagentOptions is the single construction point for the run options every
@@ -785,6 +819,7 @@ func (t *TaskTool) subagentOptions(ctx context.Context, maxSteps int, pricing *p
 		ReasoningLanguage:   ReasoningLanguageFromContext(ctx),
 		SubagentDepth:       childDepth,
 		MaxSubagentDepth:    t.maxDepth(),
+		DeliveryProfile:     t.deliveryProfile,
 	}
 }
 
@@ -804,9 +839,12 @@ func subagentWorkspaceContext(root string) string {
 	if root == "" {
 		return ""
 	}
+	// Wording note: avoid incidental action verbs ("resolve", "fix", …) in this
+	// host framing — it is prepended to every sub-agent prompt and must never
+	// read as task intent (see classifierTaskText, which also strips it).
 	return `<workspace-context event="SubagentWorkspace">
 Current workspace: ` + strconv.Quote(root) + `
-File tools resolve relative paths against this workspace. For project inspection, prefer "." or relative paths unless the user explicitly named another absolute path.
+File tools interpret relative paths against this workspace. For project inspection, prefer "." or relative paths unless the user explicitly named another absolute path.
 </workspace-context>`
 }
 
@@ -828,6 +866,7 @@ func FormatSubagentReference(run *SubagentRun) string {
 }
 
 func FormatSubagentRunResult(answer string, run *SubagentRun, failed bool) string {
+	answer = GuardSubagentHostDecisionText(answer)
 	if run == nil || run.Ref == "" {
 		return answer
 	}
@@ -840,6 +879,35 @@ func FormatSubagentRunResult(answer string, run *SubagentRun, failed bool) strin
 	return FormatSubagentReference(run) + "\n\nFinal answer:\n" + answer
 }
 
+// GuardSubagentHostDecisionText appends a fixed boundary warning only when a
+// child agent result appears to discuss host approval or user-owned decisions.
+// The implementation lives in internal/tool so the skill tools share the exact
+// same phrase list and notice.
+func GuardSubagentHostDecisionText(answer string) string {
+	return tool.GuardSubagentHostDecisionText(answer)
+}
+
+// maxReviewReportNudges bounds the in-session completion nudges sent to a
+// review subagent that finished without submitting review_report. Each nudge is
+// one cheap continuation request on the same (cached) subagent session — far
+// cheaper than discarding the run and re-reviewing from scratch.
+const maxReviewReportNudges = 2
+
+// reviewReportTaskContract is appended to the task prompt of a review subagent
+// whose run must end with a typed report. The skill body describes how to
+// review; this states the non-negotiable submission protocol.
+func reviewReportTaskContract(kind evidence.ReviewKind) string {
+	return fmt.Sprintf(`<review-report-contract event="SubagentReviewReport">
+Before your final answer you MUST call the review_report tool exactly once with kind=%q, your verdict (pass | warn | block), reviewed_paths listing only files you actually read this run, and your findings. The host discards a review run that ends without a successful review_report call — your prose summary alone does not count.
+</review-report-contract>`, string(kind))
+}
+
+// reviewReportNudgePrompt asks an already-finished review subagent to submit
+// the missing typed report without redoing the review.
+func reviewReportNudgePrompt(kind evidence.ReviewKind) string {
+	return fmt.Sprintf("You finished the review without calling the review_report tool, so the host cannot accept the run yet. Do not redo the review. Call review_report now with kind=%q, your verdict (pass | warn | block), reviewed_paths listing only the files you actually read in this conversation, and the findings you already reported. Then restate your final verdict in one sentence.", string(kind))
+}
+
 // RunSubAgentWithSession continues an existing sub-agent session with prompt and
 // returns the latest final assistant answer. Fresh sub-agents pass a newly-created
 // session; continued sub-agents pass a loaded transcript session.
@@ -850,13 +918,47 @@ func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *to
 	if opts.SubagentDepth > 0 {
 		ctx = WithSubagentDepth(ctx, opts.SubagentDepth)
 	}
+	// Callers that wrap the prompt themselves (runSubSession) set
+	// ClassifierTaskText before wrapping; for everyone else the prompt is
+	// still pristine here, so capture it before host framing is prepended.
+	if strings.TrimSpace(opts.ClassifierTaskText) == "" {
+		opts.ClassifierTaskText = prompt
+	}
 	if opts.SubagentDepth > 0 && isFreshSubagentSession(sess) {
 		prompt = subagentStartContext + "\n\n" + prompt
 	}
+	if kind := opts.RequireReviewReportKind; kind != "" {
+		prompt = prompt + "\n\n" + reviewReportTaskContract(kind)
+	}
 	sub := New(prov, reg, sess, opts, sink)
 	if err := sub.Run(ctx, prompt); err != nil {
+		// Still merge any partial child evidence so parent gates see real writes.
+		mergeChildEvidence(ctx, sub)
 		return "", fmt.Errorf("sub-agent: %w", err)
 	}
+	// Review/security subagents must hand back a typed report the parent's
+	// delivery gate can verify; prose alone would leave the gate demanding a
+	// review forever with no way to tell why it never arrives. A run that
+	// finished without the report gets bounded completion nudges on the same
+	// session (evidence preserved, so review_report can still cite the reads it
+	// already earned) before the whole run is declared failed.
+	if kind := opts.RequireReviewReportKind; kind != "" {
+		nudges := 0
+		for !sub.HasSuccessfulReviewReport(kind) && nudges < maxReviewReportNudges {
+			nudges++
+			sub.preserveEvidenceOnce = true
+			if err := sub.Run(ctx, reviewReportNudgePrompt(kind)); err != nil {
+				mergeChildEvidence(ctx, sub)
+				return "", fmt.Errorf("sub-agent: %w", err)
+			}
+		}
+		if !sub.HasSuccessfulReviewReport(kind) {
+			mergeChildEvidence(ctx, sub)
+			dumpRef := dumpFailedSubagentSession(opts.ArchiveDir, string(kind), sess)
+			return "", fmt.Errorf("%s subagent finished without submitting review_report (kind=%s) even after %d host nudges; the report must be submitted by the review subagent itself (the parent has no review_report tool) — re-run the review skill%s", kind, kind, nudges, dumpRef)
+		}
+	}
+	mergeChildEvidence(ctx, sub)
 	// Walk the session backwards for the last assistant message with content —
 	// that's the sub-agent's final answer. Intermediate assistant messages with
 	// tool_calls but no text don't count.
@@ -867,6 +969,54 @@ func RunSubAgentWithSession(ctx context.Context, prov provider.Provider, reg *to
 		}
 	}
 	return "", fmt.Errorf("sub-agent finished without producing a final answer")
+}
+
+// dumpFailedSubagentSession best-effort persists a failed report-required
+// subagent transcript for post-hoc diagnosis (read-only skill subagents are
+// otherwise ephemeral, so a protocol failure leaves no trace). Returns a
+// human-readable suffix naming the dump, or "" when disabled/failed.
+func dumpFailedSubagentSession(archiveDir, kind string, sess *Session) string {
+	if strings.TrimSpace(archiveDir) == "" || sess == nil {
+		return ""
+	}
+	dir := filepath.Join(archiveDir, "subagent-report-failures")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return ""
+	}
+	path := filepath.Join(dir, fmt.Sprintf("%s-%d.jsonl", kind, time.Now().UnixNano()))
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
+	if err != nil {
+		return ""
+	}
+	defer f.Close()
+	enc := json.NewEncoder(f)
+	for _, m := range sess.Messages {
+		if err := enc.Encode(m); err != nil {
+			return ""
+		}
+	}
+	return "; transcript dumped to " + path
+}
+
+// mergeChildEvidence folds a sub-agent's real receipts into the parent ledger
+// carried on ctx. Meta tools themselves are never mutations.
+func mergeChildEvidence(ctx context.Context, sub *Agent) {
+	if sub == nil {
+		return
+	}
+	parent, ok := evidence.FromContext(ctx)
+	if !ok || parent == nil {
+		return
+	}
+	parent.MergeChild(sub.EvidenceSummary())
+}
+
+// EvidenceSummary exports this agent's turn-scoped receipts for parent merge.
+func (a *Agent) EvidenceSummary() evidence.ChildEvidenceSummary {
+	if a == nil || a.evidence == nil {
+		return evidence.ChildEvidenceSummary{}
+	}
+	return a.evidence.Summary()
 }
 
 func isFreshSubagentSession(sess *Session) bool {

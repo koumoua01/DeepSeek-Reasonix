@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/netclient"
 	"reasonix/internal/provider"
 )
@@ -61,9 +62,22 @@ type Config struct {
 	Serve            ServeConfig         `toml:"serve"`
 	Secrets          SecretsConfig       `toml:"secrets"`
 
-	providerSources          map[string]providerSourceScope
-	shadowedProjectProviders []ProviderEntry
-	expansionEnv             map[string]string
+	providerSources            map[string]providerSourceScope
+	shadowedProjectProviders   []ProviderEntry
+	ignoredProjectDefaultModel string
+	expansionEnv               map[string]string
+	pluginPackageOwners        map[string]string
+	pluginPackageSkillOwners   map[string][]string
+}
+
+// IgnoredProjectDefaultModel returns the project reasonix.toml default_model
+// that LoadForRoot ignored because no configured provider serves it (see
+// restoreUnresolvableProjectDefaultModel), or "" when none was ignored.
+func (c *Config) IgnoredProjectDefaultModel() string {
+	if c == nil {
+		return ""
+	}
+	return c.ignoredProjectDefaultModel
 }
 
 // SecretsConfig controls the credential protection layers. It is a user-global
@@ -124,7 +138,7 @@ type DesktopConfig struct {
 	DisplayMode             string   `toml:"display_mode"`               // standard|compact (legacy "minimal" maps to compact); transcript display mode
 	StatusBarStyle          string   `toml:"status_bar_style"`           // icon|text; desktop status bar metric labels
 	StatusBarItems          []string `toml:"status_bar_items"`           // ordered visible desktop status bar items
-	DefaultToolApprovalMode string   `toml:"default_tool_approval_mode"` // ask|auto|yolo; default for newly-created desktop sessions
+	DefaultToolApprovalMode string   `toml:"default_tool_approval_mode"` // ask|auto|yolo; defaults to auto for newly-created desktop sessions
 	CheckUpdates            *bool    `toml:"check_updates"`              // startup update checks; nil keeps the default enabled
 	Telemetry               *bool    `toml:"telemetry"`                  // anonymous launch ping (install id + version + OS); nil keeps the default enabled
 	Metrics                 *bool    `toml:"metrics"`                    // aggregate desktop metrics (anonymous signal/bucket counts; no content); nil keeps the default enabled
@@ -529,6 +543,20 @@ type BotConfig struct {
 	Weixin             WeixinBotConfig       `toml:"weixin"`
 	Routes             []BotRouteConfig      `toml:"routes"`
 	Connections        []BotConnectionConfig `toml:"connections"`
+	// DesktopWatchers persists /desktop watch subscriptions so god-view
+	// notifications survive a desktop restart. Managed by the desktop bot
+	// bridge, not the settings UI.
+	DesktopWatchers []BotDesktopWatcherConfig `toml:"desktop_watchers"`
+}
+
+// BotDesktopWatcherConfig is one bot chat subscribed to desktop events
+// (/desktop watch on).
+type BotDesktopWatcherConfig struct {
+	Platform     string `toml:"platform"`
+	ConnectionID string `toml:"connection_id"`
+	Domain       string `toml:"domain"`
+	ChatType     string `toml:"chat_type"`
+	ChatID       string `toml:"chat_id"`
 }
 
 type BotSelfUserIDs struct {
@@ -612,6 +640,11 @@ type FeishuBotConfig struct {
 	Mode              string `toml:"mode"`               // webhook（默认）| websocket
 	WebhookPort       int    `toml:"webhook_port"`       // webhook 模式端口
 	RequireMention    bool   `toml:"require_mention"`
+	// OutboundMediaRoots contains absolute local directories the loopback /send
+	// control API may attach files from. Media refs must be bare filenames and
+	// must exist in exactly one configured root. Empty (the default) disables
+	// outbound file sending.
+	OutboundMediaRoots []string `toml:"outbound_media_roots"`
 }
 
 // WeixinBotConfig 微信 iLink Bot 配置。
@@ -959,18 +992,20 @@ func (c *Config) BashMode() string {
 }
 
 // BashModeForGOOS normalises the bash-sandbox mode for tests and cross-platform
-// rendering. Explicit "enforce" and "off" always win; only the empty default is
-// platform-specific.
+// rendering. Windows currently forces bash sandboxing off, even when older
+// configs explicitly requested "enforce", because the native backend still
+// breaks common Git Bash/MSYS2, Docker, and git workflows. macOS/Linux keep the
+// existing explicit-mode behavior.
 func (c *Config) BashModeForGOOS(goos string) string {
+	if goos == "windows" {
+		return "off"
+	}
 	switch strings.TrimSpace(c.Sandbox.Bash) {
 	case "enforce":
 		return "enforce"
 	case "off":
 		return "off"
 	case "":
-		if goos == "windows" {
-			return "off"
-		}
 		return "enforce"
 	default:
 		return "enforce"
@@ -1521,6 +1556,7 @@ func Default() *Config {
 		DefaultModel:     "deepseek-flash",
 		CredentialsStore: CredentialsStoreAuto,
 		UI:               UIConfig{Theme: "auto"},
+		Desktop:          DesktopConfig{DefaultToolApprovalMode: "auto"},
 		Notifications: NotificationsConfig{
 			Enabled:         false,
 			TurnDone:        true,
@@ -1547,10 +1583,9 @@ func Default() *Config {
 		// deny/allow rules to harden or quiet specific tools.
 		Permissions: PermissionsConfig{Mode: "ask"},
 		// Sandbox uses platform defaults: macOS/Linux jail bash by default;
-		// Windows defaults bash to off because AppContainer behavior varies by
-		// host, while an explicit bash = "enforce" still enables it. Network=true
-		// here so an absent [sandbox] in a user's file keeps egress (zero value
-		// would wrongly deny it).
+		// Windows forces bash off until the native sandbox backend is reliable.
+		// Network=true here so an absent [sandbox] in a user's file keeps egress
+		// (zero value would wrongly deny it).
 		Sandbox: SandboxConfig{Network: true},
 		// LSP tools on by default, but dormant until a language server is on PATH;
 		// a missing server yields an install hint rather than an error.
@@ -1786,7 +1821,7 @@ func (c *Config) ResolveSystemPromptForRoot(root string) (string, error) {
 		if !filepath.IsAbs(path) {
 			path = filepath.Join(resolveRoot(root), path)
 		}
-		b, err := os.ReadFile(path)
+		b, err := fileencoding.ReadFileUTF8(path)
 		if err != nil {
 			return "", fmt.Errorf("system_prompt_file: %w", err)
 		}

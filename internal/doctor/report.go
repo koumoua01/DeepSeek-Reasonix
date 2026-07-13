@@ -14,8 +14,10 @@ import (
 
 	"reasonix/internal/agent"
 	"reasonix/internal/config"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/netclient"
 	"reasonix/internal/sandbox"
+	"reasonix/internal/skill"
 	"reasonix/internal/store"
 )
 
@@ -90,6 +92,11 @@ type SandboxReport struct {
 	// Git-for-Windows/MSYS2 bash is far more fragile under a low-integrity
 	// token than PowerShell.
 	Shell string `json:"shell,omitempty"`
+	// BashConfigIgnored is set when the config file requests bash = "enforce"
+	// but the platform force-resolves it to "off" (Windows, until the native
+	// backend is reliable) — the one case where Bash silently disagrees with
+	// what the user wrote.
+	BashConfigIgnored bool `json:"bash_config_ignored,omitempty"`
 }
 
 type NetworkReport struct {
@@ -123,7 +130,7 @@ func Collect(opts Options) Report {
 	// Settings while the project file pins [sandbox] read the no-op as "bash is
 	// broken" (#5961, #6046) — surface the layering explicitly.
 	if sourcePath != "" && filepath.Base(sourcePath) == "reasonix.toml" {
-		if raw, err := os.ReadFile(sourcePath); err == nil && tomlHasSandboxTable(raw) {
+		if raw, err := fileencoding.ReadFileUTF8(sourcePath); err == nil && tomlHasSandboxTable(raw) {
 			warnings = append(warnings, "project "+redactHome(sourcePath)+" sets [sandbox]; it overrides user-level Settings -> Sandbox for this workspace — edit the project file to change sandbox behavior here")
 		}
 	}
@@ -135,6 +142,14 @@ func Collect(opts Options) Report {
 					" but is ignored because "+redactHome(userPath)+" exists")
 			}
 		}
+	}
+	// A config that says enforce while the platform force-resolves it to off is
+	// the one case where bash behavior silently disagrees with the file the user
+	// edited (Windows forces off until the native backend is reliable) — say it
+	// out loud instead of leaving it to be discovered from unconfined commands.
+	bashConfigIgnored := strings.TrimSpace(cfg.Sandbox.Bash) == "enforce" && cfg.BashMode() == "off"
+	if bashConfigIgnored {
+		warnings = append(warnings, `config requests [sandbox] bash = "enforce", but this platform currently forces the Bash sandbox off; bash runs unconfined`)
 	}
 	report := Report{
 		Version: opts.Version,
@@ -152,11 +167,12 @@ func Collect(opts Options) Report {
 		},
 		Sessions: collectSessions(config.SessionDir()),
 		Sandbox: SandboxReport{
-			Bash:       cfg.BashMode(),
-			Network:    cfg.Sandbox.Network,
-			WriteRoots: redactHomeAll(cfg.WriteRoots()),
-			Available:  sandbox.Available(),
-			Shell:      resolvedShellSummary(cfg),
+			Bash:              cfg.BashMode(),
+			Network:           cfg.Sandbox.Network,
+			WriteRoots:        redactHomeAll(cfg.WriteRoots()),
+			Available:         sandbox.Available(),
+			Shell:             resolvedShellSummary(cfg),
+			BashConfigIgnored: bashConfigIgnored,
 		},
 		Network: NetworkReport{
 			ProxyMode: cfg.NetworkProxyMode(),
@@ -170,6 +186,13 @@ func Collect(opts Options) Report {
 			DenyRules:  len(cfg.Permissions.Deny),
 		},
 		Warnings: warnings,
+	}
+	// Skill / MCP capability health (optional diagnostics; never fail doctor).
+	if skStore := skill.New(skill.Options{ProjectRoot: cwd}); skStore != nil {
+		report.Warnings = append(report.Warnings, CollectSkillHealthWarnings(SkillHealthOptions{
+			Skills:  skStore.List(),
+			Plugins: cfg.Plugins,
+		})...)
 	}
 	report.Sessions.Dir = redactHome(report.Sessions.Dir)
 	for i := range cfg.Providers {
@@ -257,6 +280,9 @@ func RenderText(r Report) string {
 	bashLine := r.Sandbox.Bash
 	if r.Sandbox.Bash == "enforce" && !r.Sandbox.Available {
 		bashLine += " (unavailable: no OS sandbox on this host; bash execution is refused. " + sandbox.UnavailableRemediation() + ")"
+	}
+	if r.Sandbox.BashConfigIgnored {
+		bashLine += ` (config requests "enforce", ignored: this platform currently forces the Bash sandbox off)`
 	}
 	fmt.Fprintf(&b, "  bash         %s\n", bashLine)
 	if r.Sandbox.Shell != "" {

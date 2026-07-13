@@ -19,6 +19,7 @@ import (
 	"reasonix/internal/control"
 	"reasonix/internal/event"
 	"reasonix/internal/fileutil"
+	fileencoding "reasonix/internal/fileutil/encoding"
 	"reasonix/internal/jobs"
 	"reasonix/internal/plugin"
 	"reasonix/internal/provider"
@@ -1606,6 +1607,9 @@ func availableCommandsFor(ctrl acpController) []AvailableCommand {
 	}
 	byName := map[string]AvailableCommand{}
 	for _, cmd := range ctrl.Commands() {
+		if cmd.Hidden {
+			continue
+		}
 		name := strings.TrimSpace(cmd.Name)
 		if name == "" {
 			continue
@@ -1620,8 +1624,8 @@ func availableCommandsFor(ctrl acpController) []AvailableCommand {
 		}
 		byName[name] = ac
 	}
-	for _, sk := range ctrl.Skills() {
-		name := strings.TrimSpace(sk.Name)
+	for _, sk := range ctrl.SlashSkills() {
+		name := strings.TrimSpace(sk.SlashName())
 		if name == "" {
 			continue
 		}
@@ -1753,7 +1757,7 @@ func loadACPMeta(sessionPath string) (acpSessionMeta, bool, error) {
 	if path == "" {
 		return acpSessionMeta{}, false, nil
 	}
-	b, err := os.ReadFile(path)
+	b, err := fileencoding.ReadFileUTF8(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return acpSessionMeta{}, false, nil

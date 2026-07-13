@@ -344,6 +344,9 @@ func TestSetAutoPlan(t *testing.T) {
 
 func TestSetDesktopDefaultToolApprovalMode(t *testing.T) {
 	c := Default()
+	if got := c.DesktopDefaultToolApprovalMode(); got != "auto" {
+		t.Fatalf("desktop default tool approval mode = %q, want built-in auto", got)
+	}
 	for _, mode := range []string{"ask", "auto", "yolo"} {
 		if err := c.SetDesktopDefaultToolApprovalMode(mode); err != nil {
 			t.Fatalf("SetDesktopDefaultToolApprovalMode(%q): %v", mode, err)
@@ -360,6 +363,16 @@ func TestSetDesktopDefaultToolApprovalMode(t *testing.T) {
 	}
 	if err := c.SetDesktopDefaultToolApprovalMode("maybe"); err == nil {
 		t.Fatal("expected error for invalid desktop default tool approval mode")
+	}
+}
+
+func TestLoadForEditMissingDesktopApprovalDefaultsAuto(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.toml")
+	if err := os.WriteFile(path, []byte("config_version = 4\n"), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	if got := LoadForEdit(path).DesktopDefaultToolApprovalMode(); got != "auto" {
+		t.Fatalf("missing desktop default tool approval mode = %q, want auto", got)
 	}
 }
 
@@ -1454,6 +1467,85 @@ func TestSaveToExistingProjectRemovesPluginDelta(t *testing.T) {
 	}
 	if len(got.Plugins) != 0 {
 		t.Fatalf("plugins = %+v, want none", got.Plugins)
+	}
+}
+
+func TestSaveToExistingProjectRemovesIneffectiveWindowsBashEnforce(t *testing.T) {
+	setRuntimeGOOS(t, "windows")
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[sandbox]\nbash = \"enforce\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	cfg.Sandbox.Bash = "enforce"
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), `[sandbox]`) || strings.Contains(string(body), `bash = "enforce"`) {
+		t.Fatalf("ineffective Windows project bash enforce should be removed:\n%s", body)
+	}
+	if _, err := toml.Decode(string(body), &Config{}); err != nil {
+		t.Fatalf("saved project config does not parse: %v", err)
+	}
+}
+
+func TestSaveToExistingProjectRemovesIneffectiveWindowsBashEnforceWhenTargetIsOff(t *testing.T) {
+	setRuntimeGOOS(t, "windows")
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[sandbox]\nbash = \"enforce\"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	cfg.Sandbox.Bash = "off"
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), `[sandbox]`) || strings.Contains(string(body), `bash = "enforce"`) {
+		t.Fatalf("ineffective Windows project bash enforce should be removed even when the target mode is raw off:\n%s", body)
+	}
+	if _, err := toml.Decode(string(body), &Config{}); err != nil {
+		t.Fatalf("saved project config does not parse: %v", err)
+	}
+}
+
+func TestSaveToExistingProjectRemovesOnlyIneffectiveWindowsBashEnforce(t *testing.T) {
+	setRuntimeGOOS(t, "windows")
+	projectPath := filepath.Join(t.TempDir(), "reasonix.toml")
+	if err := os.WriteFile(projectPath, []byte("[sandbox]\nbash = \"enforce\"\nnetwork = true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	cfg.Sandbox.Bash = "enforce"
+	if err := cfg.SaveTo(projectPath); err != nil {
+		t.Fatalf("SaveTo: %v", err)
+	}
+	body, err := os.ReadFile(projectPath)
+	if err != nil {
+		t.Fatalf("read project config: %v", err)
+	}
+	if strings.Contains(string(body), `bash = "enforce"`) {
+		t.Fatalf("ineffective Windows project bash enforce should be removed:\n%s", body)
+	}
+	if !strings.Contains(string(body), `[sandbox]`) || !strings.Contains(string(body), `network = true`) {
+		t.Fatalf("other sandbox fields should be preserved:\n%s", body)
+	}
+	var got Config
+	if _, err := toml.Decode(string(body), &got); err != nil {
+		t.Fatalf("saved project config does not parse: %v", err)
+	}
+	if !got.Sandbox.Network {
+		t.Fatalf("network = false, want preserved true")
 	}
 }
 

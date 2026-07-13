@@ -21,6 +21,7 @@
 - [桌面端 Hooks](./DESKTOP_HOOKS.zh-CN.md)
 - [快捷键](#快捷键)
 - [权限与沙盒](#权限与沙盒)
+- [能力诊断](#能力诊断)
 - [插件（MCP）](#插件mcp)
 - [斜杠命令](#斜杠命令)
 - [@ 引用](#-引用)
@@ -176,7 +177,7 @@ Token 模式会在终端打印带 `?token=...` 的分享链接；可通过 `--to
 ```bash
 reasonix serve --hash-password --password 'strong-password'
 
-# ~/.reasonix/config.toml
+# <Reasonix home>/config.toml
 [serve]
 auth_mode = "password" # none|token|password
 password_hash = "$2a$12$..."
@@ -349,6 +350,7 @@ CJK 双宽字符，造成视觉错位。想保留旧的终端块状光标可设�
 | `Shift+Tab` | 切换 Plan 开/关 | Plan 是只读规划，不会循环 Ask/Auto/YOLO。 |
 | `Ctrl+Y` | 切换 YOLO 开/关 | 关闭 YOLO 时会尽量恢复之前的 Ask/Auto 基底。终端若能转发 Command/Super，也可能识别 `Cmd+Y`，但稳定可用的是 `Ctrl+Y`。 |
 | `--yolo`、`--dangerously-skip-permissions` | 启动时进入 YOLO | 和 `Ctrl+Y` 是同一个运行时模式。 |
+| `/work-mode [economy|balanced|delivery]` | 查看或切换当前会话的工作模式 | `/profile` 是兼容别名。切换会原子重建运行时，保留对话和审批姿态；有工作正在进行时会拒绝切换。 |
 | `Ctrl+O` | 切换详细 reasoning 显示 | 也可通过 `/verbose` 使用。 |
 | `Ctrl+B` | 展开或收起较长 shell 输出 | TUI 默认不启用鼠标报告，因此可和终端原生文本选择共存。 |
 | Ask / Auto | 没有键盘循环 | Ask 是默认交互基底；Auto 不通过 `Shift+Tab` 进入，需要由暴露工具审批姿态的客户端或 API 直接设置。 |
@@ -404,7 +406,14 @@ workspace、每次命令专用 temp root 和目标可执行文件的访问权，
 low-integrity token 下，除配置的 root 外它仍能写入 Windows 对任何 low-integrity 进程开放的
 少数位置（例如 `%USERPROFILE%\AppData\LocalLow`），但 workspace 边界与 `forbid_read`
 拒绝依然有效。只读 AppContainer 命令在关闭网络时不给 network capability；可写 Windows 命令遇到
-`[sandbox] network = false` 时会 fail closed。没有可用 OS 沙盒时，`bash = "enforce"` 会拒绝 bash 执行，不会无沙盒运行
+`[sandbox] network = false` 时会 fail closed。
+
+**Windows 现状说明：**稳定版目前在 Windows 上把 Bash 沙箱的生效模式强制为
+`off`——即使显式写了 `bash = "enforce"` 也会解析为 `off`（`reasonix doctor`
+会提示该设置被忽略）——因为原生 Windows 后端仍会破坏常见的 Git Bash/MSYS2、
+Docker 和 git 工作流。上面的 Windows 沙盒描述保留为后端修复后重新启用时的设计基准。
+
+没有可用 OS 沙盒时，`bash = "enforce"` 会拒绝 bash 执行，不会无沙盒运行
 （越界询问与可选的 Windows elevated 加固见
 [`SPEC.md` §9](./SPEC.md#9-roadmap-not-in-current-scope)）。
 
@@ -420,6 +429,41 @@ bash 会以明确报错拒绝执行，而不是返回空输出。同一 workspac
 low-integrity token 下较脆弱。运行 `reasonix doctor` 可查看解析到的 shell、沙盒
 可用性，以及项目 `reasonix.toml` 是否固定了 `[sandbox]`（项目文件优先级高于
 Settings/用户配置；沙盒配置变更需 reload session config 或新开会话才生效）。
+
+反馈编码质量问题时，可运行 `reasonix doctor quality <branch-id-or-path>`（加
+`--json` 输出结构化结果）。命令会读取指定 session，但只输出不含内容的计数与
+Profile 分类：模型家族、运行模式、协作/审批模式、消息和工具调用数、验证与已持久化的
+compaction 摘要数，以及可用时的桌面端 token/cache telemetry。结果不会包含对话正文、
+路径、session 标识、工具参数与输出、服务端点或自定义模型名，适合粘贴到公开 Issue
+或 Discussion。它不同于 `reasonix doctor session`：后者生成的支持 zip 含完整未脱敏
+会话，只能在可信支持渠道分享。
+
+## 能力诊断
+
+当 skill、斜杠命令、Hook、插件包、MCP 或 `AGENTS.md` 缺失、被覆盖、未信任或启动失败时，用统一只读诊断。完整参数、JSON schema 与 issue code 见
+**[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)**。
+
+```bash
+# 静态（默认）：无网络、不启动 MCP 子进程
+reasonix doctor capabilities
+
+# 机器可读（stdout 仅为合法 JSON）
+reasonix doctor capabilities --json
+
+# 指定工作区
+reasonix doctor capabilities --root /path/to/project
+
+# Live MCP 探测——仅在你明确允许启动第三方服务器时使用
+reasonix doctor capabilities --live --timeout 5s
+```
+
+| 入口 | 用法 |
+| --- | --- |
+| CLI | 见上方 `reasonix doctor capabilities` |
+| 桌面端 | **设置 → 诊断** — 刷新、复制脱敏 JSON、可选「包含当前会话运行状态」（只读活动标签 Host，**不**启动 MCP） |
+| Agent | `/reasonix-guide`（内置 inline Skill）或自然语言描述症状；优先静态 doctor JSON，再问是否 `--live` |
+
+退出码：`0` 允许 warning/info；`1` 表示存在 `error`（或 live 启动失败）；`2` 为参数错误。与 `reasonix doctor`（provider/沙箱）以及 `reasonix plugin doctor <name>`（单个插件包）相互独立。
 
 ## 插件（MCP）
 
@@ -468,6 +512,9 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 启用的 MCP 服务器会在会话开始后于后台自动连接，因此工具上线期间聊天仍可正常使用。
 用 `/mcp` 或桌面端 MCP 面板可刷新状态、重连服务器、查看失败原因，或在当前会话内禁用某个服务器。
+若要跨 skills / hooks / 插件包 / MCP 做只读健康检查（不改配置），见
+[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)
+（`reasonix doctor capabilities` 或 **设置 → 诊断**）。
 
 **已有 Claude Code 的 `.mcp.json`？** 直接放到项目根目录，Reasonix 会原样读取——其
 `mcpServers` 规范（`command`/`args`/`env`、`type`/`url`/`headers`、`${VAR}` 展开）
@@ -488,13 +535,45 @@ headers = { Authorization = "Bearer ${STRIPE_KEY}" }
 
 ## 斜杠命令
 
-交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/memory-v5`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
+交互式 `reasonix` 会话里，内置命令（`/compact`、`/new`、`/clear`、`/rewind`、`/tree`、`/branch`、`/switch`、`/todo`、`/model`、`/work-mode`、`/mcp`、`/skills`、`/hooks`、`/memory`、`/memory-v5`、`/goal`、`/output-style`、`/sandbox`、`/language`、`/auto-plan`、`/reasoning-language`、`/help`）在本地执行——`/help` 可列出全部。
+内置 **Skill**（如 `/init`、`/explore`、`/test`、`/reasonix-guide`）也会出现在斜杠菜单，
+并可通过 `run_skill` 调用（正文按需加载；只有索引行进入缓存稳定前缀）。配置或能力排障时
+用 `/reasonix-guide`，它会引导运行 `reasonix doctor capabilities`（见
+[能力诊断](./CAPABILITY_DIAGNOSTICS.zh-CN.md)）。
 `/new` 会开启新会话，同时保存之前的 transcript 供历史记录和恢复使用；`/clear` 会二次确认，确认后丢弃当前上下文且不保存。
 `/tree` 查看已保存的对话分支，`/branch [name]` 从当前对话末端分支，`/branch <turn> [name]`
 从较早的 checkpoint 轮次分支，`/switch <id|name>` 切换到另一个分支。**自定义命令**
 是放在 `.reasonix/commands/`（项目）或 `~/.reasonix/commands/`（用户）下的 Markdown 文件——
 `review.md` 即 `/review`，子目录构成命名空间（`git/commit.md` → `/git:commit`）。文件正文
 是 prompt 模板，调用即作为一轮对话发出。
+
+### 子智能体 Profile
+
+子智能体 profile 是带有 `runAs: subagent` 和 `invocation: manual` 的手动 Skill。
+它与桌面设置页共用项目级/全局 Skill 目录，因此任一端创建的 profile 在会话刷新后都会被
+另一端发现。交互式聊天里使用 `/<name> <任务>` 调用；Reasonix 会启动隔离子智能体，
+父会话只保留任务和最终答案。
+
+Headless CLI 提供显式管理和运行命令，同时不改变普通 `reasonix run` 的任务语义：
+
+```bash
+reasonix subagent list
+reasonix subagent create reviewer --description "审查改动" --prompt-file reviewer.md --tools read_file,grep,bash
+reasonix subagent edit reviewer --effort high --model deepseek-pro
+reasonix subagent try reviewer "审查当前 diff"   # 始终只读
+reasonix subagent run reviewer "审查并修复当前 diff"
+reasonix subagent delete reviewer --yes
+```
+
+workspace 可用时，`create` 默认写入项目级目录，否则默认写入全局目录；可用
+`--scope project|global` 明确选择。`edit` 只修改显式传入的字段，`--model=`、`--tools=`
+这类空值会清除对应配置。Profile 编辑器会拒绝
+custom path 或包含更多手写结构的 Skill，避免丢失 frontmatter、references 或 scripts；
+这些文件仍应通过 Skills 工作流管理。内置 profile 没有可编辑文件，因此 `edit` 对它们只接受
+`--model` 和 `--effort`，并写入与桌面设置页相同的按名称覆盖配置。
+
+完整 CLI 参数、Skill 文件格式、模型优先级、安全行为和排障说明见
+[子智能体 Profile](./SUBAGENT_PROFILES.zh-CN.md)。
 
 `/memory` 会同时列出记忆文档（`REASONIX.md` / `AGENTS.md`）和已保存的 auto-memory 条目。
 在 agent 回合中，只读的 `history` 和 `memory` 工具可以按需检索历史 session 决策、
@@ -623,6 +702,26 @@ ephemeral 只读 subagent，只暴露只读研究工具和安全前台 bash，�
 `connect_tool_source(source="read_only_skill")` 连接这条窄入口；完整的 `skills`
 source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 
+启动会话时可以用 `--profile economy|balanced|delivery` 选择运行模式，例如
+`reasonix run --profile delivery "修复并验证这个 bug"`。Economy（轻量）精简初始工具面并按需
+连接可选来源；Balanced（均衡）是保持旧请求字节兼容的默认档，提供完整工具面；Delivery（交付优先）
+保留完整工具面，额外增加稳定能力代理 `use_capability`（按需 inspect/call MCP，包括
+`auto_start=false`，且不改变主工具 Schema），并增加“明确验收标准、修复根因、运行验证、复审最终
+diff”的稳定交付合约。该合约由宿主运行时强制执行：没有具体 `todo_write` 验收清单时会阻止变更和验证
+命令；发生变更后，必须复查结果、在最后一次变更之后运行验证，并用带证据的 `complete_step` 签收后才能
+结束；Skill/MCP 的 require/prefer 路由会被门禁；中/高风险改动强制结构化 review；`task`/`run_skill`
+等元工具本身不算 mutation。纯只读分析不会被迫产生写入。
+
+交互式 TUI 会话内可用 `/work-mode` 查看当前模式，或用
+`/work-mode economy|balanced|delivery` 热切换；`/profile` 是兼容别名。切换会原子重建
+Controller，同时保留 history、session 路径、Lease 和 Ask/Auto/Yolo 审批姿态；当前 turn、审批/询问、
+后台任务或另一场运行时切换尚未结束时会拒绝切换。构建失败时旧 Controller 继续可用。该命令只修改当前
+会话，不持久化新的全局默认值。跨 Profile 切换会产生一次新的 provider 缓存前缀；进入目标 Profile 后，
+system contract 和工具 Schema 在后续轮次保持稳定。
+
+桌面端标签页提供相同三档并持久化轻量或交付优先
+模式；旧的空值/`full` 继续解释为均衡模式。
+
 交互式前端中，计划模式默认手动开启。设置 `agent.auto_plan = "on"` 后，看起来复杂
 的任务会自动进入 plan mode：Reasonix 先只读生成计划，待用户批准后才
 编辑文件或执行有副作用的命令。`auto_plan_classifier` 可以指定便宜的 provider，例如
@@ -635,7 +734,7 @@ source 仍会启用可写 skill 工具，plan mode 下继续阻断。
 或 `reasonix config memory-v5 off|observe|compact|on|status`，并且只认用户级设置。只有明确想为
 reasoning-language 写项目级覆盖时，才给 shell 命令加 `--local`。
 
-桌面端“协作方式”菜单里的计划模式、目标模式和省 token 模式的使用方法与注意事项，
+桌面端“协作方式”菜单里的计划模式、目标模式和“轻量 / 均衡 / 交付优先”三档运行模式的使用方法与注意事项，
 见 [`COLLABORATION_MODES.zh-CN.md`](./COLLABORATION_MODES.zh-CN.md)。
 
 桌面端“工具权限”里的询问、自动和 Yolo 模式的区别与使用场景，
