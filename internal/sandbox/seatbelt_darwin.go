@@ -1,11 +1,14 @@
 package sandbox
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 )
 
 // Command returns the argv to run `command` through sh, wrapped in sandbox-exec
@@ -30,10 +33,35 @@ func CommandArgs(spec Spec, args []string) ([]string, bool) {
 	return append([]string{"sandbox-exec", "-p", seatbeltProfile(spec)}, args...), true
 }
 
-// Available reports whether sandbox-exec is on PATH (it ships with macOS).
+// sandboxExecUsability caches the probe result per resolved binary path, so
+// repeated Available() calls stay O(1) after the first check.
+var sandboxExecUsability sync.Map // resolved executable path -> bool
+
+// usableSandboxExec distinguishes an installed sandbox-exec from a usable
+// Seatbelt backend. On restricted macOS hosts, sandbox-exec can be on PATH
+// while sandbox_apply fails with exit 71. Probe that operation directly with a
+// minimal profile, mirroring usableBwrap on Linux.
+func usableSandboxExec() bool {
+	path, err := exec.LookPath("sandbox-exec")
+	if err != nil {
+		return false
+	}
+	if cached, ok := sandboxExecUsability.Load(path); ok {
+		return cached.(bool)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	err = exec.CommandContext(ctx, path, "-p", "(version 1)(allow default)", "true").Run()
+	usable := err == nil
+	actual, _ := sandboxExecUsability.LoadOrStore(path, usable)
+	return actual.(bool)
+}
+
+// Available reports whether the OS sandbox backend can actually confine
+// processes. macOS probes sandbox-exec; Linux verifies bubblewrap can enter its
+// namespace (see seatbelt_other.go).
 func Available() bool {
-	_, err := exec.LookPath("sandbox-exec")
-	return err == nil
+	return usableSandboxExec()
 }
 
 // seatbeltProfile builds an SBPL profile that allows everything, then denies
@@ -47,7 +75,7 @@ func Available() bool {
 func seatbeltProfile(spec Spec) string {
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n(deny file-write*)\n(allow file-write*\n")
-	for _, p := range writeAllowDirs(spec.WriteRoots) {
+	for _, p := range writeAllowDirsForSpec(spec) {
 		fmt.Fprintf(&b, "    (subpath %s)\n", sbplString(p))
 	}
 	b.WriteString(")\n")
@@ -68,12 +96,27 @@ func seatbeltProfile(spec Spec) string {
 // common toolchain caches under $HOME. Symlinks are resolved because macOS's
 // /tmp and $TMPDIR live under /private, which is the path Seatbelt matches.
 func writeAllowDirs(roots []string) []string {
+	return writeAllowDirsForSpec(Spec{WriteRoots: roots})
+}
+
+func writeAllowDirsForSpec(spec Spec) []string {
+	roots := spec.WriteRoots
 	dirs := append([]string{}, roots...)
-	dirs = append(dirs, "/dev", "/tmp", "/private/tmp", "/private/var/folders", os.TempDir())
-	if home, err := os.UserHomeDir(); err == nil {
-		// go build/test → Library/Caches + go; pip/etc → .cache; npm/cargo too.
-		for _, sub := range []string{"Library/Caches", ".cache", ".npm", ".cargo", "go"} {
-			dirs = append(dirs, filepath.Join(home, sub))
+	dirs = append(dirs, "/dev")
+	if dir := strings.TrimSpace(spec.SessionTemp); dir != "" {
+		// Session-private temporary directory must be writable under Seatbelt
+		// even when MinimalWrites omits the broad host temp allowances.
+		dirs = append(dirs, dir)
+	}
+	if !spec.MinimalWrites {
+		dirs = append(dirs, "/tmp", "/private/tmp", "/private/var/folders", os.TempDir())
+	}
+	if !spec.MinimalWrites {
+		if home, err := os.UserHomeDir(); err == nil {
+			// go build/test → Library/Caches + go; pip/etc → .cache; npm/cargo too.
+			for _, sub := range []string{"Library/Caches", ".cache", ".npm", ".cargo", "go"} {
+				dirs = append(dirs, filepath.Join(home, sub))
+			}
 		}
 	}
 	seen := map[string]bool{}

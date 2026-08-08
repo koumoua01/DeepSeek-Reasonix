@@ -41,7 +41,7 @@ input,textarea{font:inherit;color:inherit}
 
 .app{display:grid;grid-template-columns:220px 1fr;grid-template-rows:1fr auto;height:100vh}
 .sidebar{grid-row:1/3;background:var(--bg-2);border-right:1px solid var(--border);display:flex;flex-direction:column;overflow:hidden}
-.transcript{overflow-y:auto;padding:24px 28px;scroll-behavior:smooth}
+.transcript{overflow-y:auto;padding:24px 28px}
 .footer{border-top:1px solid var(--border);background:var(--bg);padding:12px 28px 16px;display:flex;flex-direction:column;gap:8px;position:relative}
 .footer::before{content:'';position:absolute;inset:-20px 0 auto 0;height:20px;background:linear-gradient(to top,var(--bg),transparent);pointer-events:none}
 
@@ -141,6 +141,7 @@ input,textarea{font:inherit;color:inherit}
 
 /* approval */
 .approval{background:var(--panel);border:1px solid var(--accent);border-radius:var(--radius-lg);padding:12px 14px;margin:8px 0;box-shadow:var(--shadow-md);animation:msg-in .2s ease}
+.approval:focus{outline:none}
 .approval__header{display:flex;align-items:center;gap:7px;margin-bottom:8px}
 .approval__icon{color:var(--warning);width:16px;height:16px}
 .approval__title{font-weight:600;font-size:13px}
@@ -607,6 +608,7 @@ const __T = {
     'ready': 'Ready',
     'thinking': 'Thinking...',
     'retrying_status': 'Retrying ({attempt}/{max})...',
+    'recovery_paused': 'Automatic retries paused. Reasonix stopped repeated attempts and kept completed work. Send “Continue” to start a fresh attempt, or add instructions to change direction.',
     'stats': 'Stats',
     'statistics': 'Statistics',
     'model': 'Model',
@@ -632,6 +634,7 @@ const __T = {
     'cmd_mcp': 'MCP servers',
     'cmd_skill': 'Skills',
     'cmd_hooks': 'Hooks',
+    'cmd_reload': 'Reload extensions',
     'cmd_memory': 'Show memory',
     'cmd_forget': 'Forget memory',
     'cmd_goal': 'Set a goal for the agent to pursue autonomously',
@@ -645,6 +648,9 @@ const __T = {
     'cmd_group_memory': 'Memory',
     'cmd_group_agent': 'Agent',
     'cmd_group_help': 'Help',
+    'extensions_reloading': 'Reloading extensions...',
+    'extensions_reloaded': 'Extensions reloaded',
+    'extensions_reload_failed': 'Could not reload extensions',
     'command_palette': 'Command palette',
     'command_empty': 'No commands match',
     'command_nav': '↑↓ navigate · Enter insert · Esc close',
@@ -672,7 +678,7 @@ const __T = {
     'session_tool': 'Tool for session',
     'deny': 'Deny',
     'auto_mode': 'Auto mode (auto-approve fallback approvals)',
-    'plan_mode': 'Plan mode (read-only)',
+    'plan_mode': 'Plan first; permissions and sandbox still apply',
     'yolo_mode': 'YOLO mode (auto-approve tool approvals; ask and plan still wait)',
     'goal_mode_desc': 'Goal mode — type a task for the agent to pursue autonomously',
     'goal_mode': 'Goal mode',
@@ -688,6 +694,8 @@ const __T = {
     'cancel_plain': 'Cancel',
     'delete': 'Delete',
     'delete_session': 'Delete Session',
+    'cannot_delete_active': 'Cannot delete the active session',
+    'delete_failed': 'Could not delete the session. Check your connection and try again.',
     'search_sessions': 'Search sessions',
     'active': 'Active',
     'use_model': 'Use',
@@ -741,6 +749,7 @@ const __T = {
     'ready': '就绪',
     'thinking': '思考中...',
     'retrying_status': '正在重试 ({attempt}/{max})...',
+    'recovery_paused': '已暂停自动重试。Reasonix 已停止重复尝试，并保留已完成的工作。发送“继续”即可开始新一轮，也可以补充要求来调整方向。',
     'stats': '统计',
     'statistics': '统计',
     'model': '模型',
@@ -766,6 +775,7 @@ const __T = {
     'cmd_mcp': 'MCP 服务器',
     'cmd_skill': '技能',
     'cmd_hooks': '钩子',
+    'cmd_reload': '重新加载扩展',
     'cmd_memory': '显示记忆',
     'cmd_forget': '忘记记忆',
     'cmd_goal': '设置目标让代理自主执行',
@@ -779,6 +789,9 @@ const __T = {
     'cmd_group_memory': '记忆',
     'cmd_group_agent': '代理',
     'cmd_group_help': '帮助',
+    'extensions_reloading': '正在重新加载扩展…',
+    'extensions_reloaded': '扩展已重新加载',
+    'extensions_reload_failed': '无法重新加载扩展',
     'command_palette': '命令面板',
     'command_empty': '没有匹配的命令',
     'command_nav': '↑↓ 选择 · Enter 插入 · Esc 关闭',
@@ -806,7 +819,7 @@ const __T = {
     'session_tool': '本会话允许此工具',
     'deny': '拒绝',
     'auto_mode': '自动模式（自动批准兜底审批）',
-    'plan_mode': '计划模式（只读）',
+    'plan_mode': '先规划；权限与沙箱仍然生效',
     'yolo_mode': 'YOLO 模式（自动批准工具权限；ask 和计划仍会等待）',
     'goal_mode_desc': '目标模式 — 输入任务让代理自主执行',
     'goal_mode': '目标模式',
@@ -822,6 +835,8 @@ const __T = {
     'cancel_plain': '取消',
     'delete': '删除',
     'delete_session': '删除会话',
+    'cannot_delete_active': '无法删除当前会话',
+    'delete_failed': '无法删除会话，请检查连接后重试',
     'search_sessions': '搜索会话',
     'active': '当前',
     'use_model': '使用',
@@ -935,6 +950,7 @@ const SLASH_CMDS = [
   {cmd:'mcp',sig:'/mcp',desc:__('cmd_mcp'),group:'system'},
   {cmd:'skill',sig:'/skill',desc:__('cmd_skill'),group:'system'},
   {cmd:'hooks',sig:'/hooks',desc:__('cmd_hooks'),group:'system'},
+  {cmd:'reload',sig:'/reload',desc:__('cmd_reload'),group:'system'},
   {cmd:'memory',sig:'/memory',desc:__('cmd_memory'),group:'memory'},
   {cmd:'forget',sig:'/forget <item>',desc:__('cmd_forget'),group:'memory',danger:true},
   {cmd:'help',sig:'/help',desc:__('cmd_help'),group:'help'},
@@ -946,9 +962,29 @@ function slashGroupLabel(group){return __('cmd_group_'+group)||group;}
 function post(path, body) {
   return fetch(path, {method:'POST',headers:{'content-type':'application/json'},body:body?JSON.stringify(body):undefined});
 }
-function scrollDown() { requestAnimationFrame(()=>{log.scrollTop=log.scrollHeight;});}
+// Follow streaming output only while the user is pinned to the bottom of the
+// transcript; scrolling up detaches so history stays readable mid-stream.
+// Detach triggers on wheel intent (any upward notch on scrollable content),
+// not only on position: during fast streaming every frame re-bottoms the
+// viewport, so a slow trackpad drag would never accumulate the 40px position
+// delta. force re-pins (own message sent, session loaded, action prompts,
+// click feedback) and wins over a concurrent user scroll — an approval needs
+// a decision and its key handler is document-level, so it must not sit
+// off-screen. Scrolls are instant: a smooth animation lags behind rapid
+// chunks, and its intermediate positions would read as "not at bottom" and
+// break pin detection.
+let pinnedToBottom=true;
+function atBottom() { return log.scrollHeight-log.scrollTop-log.clientHeight<40; }
+log.addEventListener('scroll',()=>{pinnedToBottom=atBottom();});
+log.addEventListener('wheel',e=>{if(e.deltaY<0&&log.scrollHeight>log.clientHeight)pinnedToBottom=false;},{passive:true});
+function scrollDown(force) { if(force)pinnedToBottom=true; if(!pinnedToBottom)return; requestAnimationFrame(()=>{if(force)pinnedToBottom=true; else if(!pinnedToBottom)return; log.scrollTo({top:log.scrollHeight,behavior:'instant'});});}
 function hideWelcome() { if(welcome) welcome.style.display='none';}
 function showWelcome() { if(welcome) welcome.style.display='';}
+// Global single-key shortcuts must stay dead while the user is typing (the
+// composer is autofocused, so this is the default state) and when a
+// browser/OS chord is held (Cmd+A must never resolve an approval).
+function isTextEntry(t) { return !!t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable); }
+function isPlainKey(e) { return !e.ctrlKey&&!e.metaKey&&!e.altKey&&!isTextEntry(e.target); }
 function fmtTok(n) { return n>=1000?(n/1000).toFixed(1).replace(/\.0$/,'')+'k':String(n);}
 function currencySymbol(c){const v=String(c||'¥').trim();if(/^(cny|rmb|yuan)$/i.test(v))return '¥';if(/^(usd|dollar)$/i.test(v))return '$';return v||'¥';}
 function fmtMoney(n,c){if(typeof n!=='number'||!isFinite(n))return '—';const s=currencySymbol(c);return s+(n<1?n.toFixed(4):n.toFixed(2));}
@@ -977,7 +1013,7 @@ function showNotice(text, tone) {
   hideWelcome();
   const n=el('div','notice'+(tone==='warn'?' notice--warn':''),text);
   log.appendChild(n);
-  scrollDown();
+  scrollDown(true); // synchronous feedback to a user action — always reveal
 }
 function updateActionAvailability() {
   setActionDisabled('btn-compact', running || !hasVisibleHistory, running ? __('thinking') : __('no_conversation'));
@@ -1025,7 +1061,7 @@ function setConnState(state) {
 }
 
 // ── messages ──
-function addUserMsg(text) { hasVisibleHistory=true; updateActionAvailability(); hideWelcome(); const d=el('div','msg msg--user'); d.appendChild(el('span','msg__caret','›')); d.appendChild(el('div','msg__text',text)); log.appendChild(d); scrollDown(); currentMsg=null;currentText=null;currentReasoning=null; }
+function addUserMsg(text) { hasVisibleHistory=true; updateActionAvailability(); hideWelcome(); const d=el('div','msg msg--user'); d.appendChild(el('span','msg__caret','›')); d.appendChild(el('div','msg__text',text)); log.appendChild(d); scrollDown(true); currentMsg=null;currentText=null;currentReasoning=null; }
 function ensureMsg() { if(!currentMsg){hasVisibleHistory=true; updateActionAvailability(); hideWelcome();currentMsg=el('div','msg msg--assistant');log.appendChild(currentMsg);} return currentMsg; }
 function appendText(t) { const m=ensureMsg(); if(!currentText){currentText=document.createElement('span');currentText.className='msg__text'; const old=m.querySelector('.cursor');if(old)old.remove(); m.appendChild(currentText); m.appendChild(el('span','cursor'));} currentText.textContent+=t; scrollDown(); }
 function appendReasoning(t) { const m=ensureMsg(); if(!currentReasoning){const w=el('div','reasoning'); const b=el('button','reasoning__toggle'); b.innerHTML='<span class="reasoning__chevron">▶</span> '+__('thinking'); const body=el('div','reasoning__body'); body.style.display='none'; b.onclick=()=>{body.style.display=body.style.display==='none'?'':'none';b.querySelector('.reasoning__chevron').className='reasoning__chevron'+(body.style.display!=='none'?' reasoning__chevron--open':'');}; w.appendChild(b);w.appendChild(body); if(currentText) m.insertBefore(w,currentText); else m.appendChild(w); currentReasoning=body;} currentReasoning.textContent+=t; scrollDown(); }
@@ -1066,31 +1102,73 @@ function copyText(text) {
   return Promise.resolve(false);
 }
 function renderToolDispatch(tool) {
+
+  // Partial, full, and post-write preview-refresh dispatches share one ID.
+  // Update the existing card in place so a refreshed dependent writer never
+  // appears as a duplicate operation in the timeline.
+  if(!tool.id)return;
+  const existing=toolCards[tool.id];
+  if(existing){
+    const summary=toolArgsSummary(tool.args);
+    const title=existing.querySelector('.card-title');
+    if(title)title.innerHTML='<span class="name">'+escHtml(tool.name)+'</span>'+(summary?'<span class="subject">'+escHtml(summary)+'</span>':'');
+    existing.dataset.toolArgs=String(tool.args||existing.dataset.toolArgs||'');
+    updateToolMeta(existing,__('tool_args')+' '+fmtTok(existing.dataset.toolArgs.length));
+    scrollDown(); return;
+  }
   hideWelcome(); const card=el('div','card'); card.id='tool-'+tool.id; card.dataset.open='false'; card.dataset.tone='accent';
   card.dataset.startedAt=String(Date.now());
+  card.dataset.toolArgs=String(tool.args||'');
   const head=el('div','card-head');
   const summary=toolArgsSummary(tool.args);
   head.innerHTML='<span class="ico spin">'+toolIcon('accent')+'</span><div class="card-main"><div class="card-title"><span class="name">'+escHtml(tool.name)+'</span>'+(summary?'<span class="subject">'+escHtml(summary)+'</span>':'')+'</div><div class="card-meta">'+escHtml(__('tool_args'))+' '+fmtTok(String(tool.args||'').length)+'</div></div><span class="card-badge">'+escHtml(__('tool_running'))+'</span><div class="card-actions"><button type="button" class="card-action card-copy" title="'+escAttr(__('tool_copy'))+'" aria-label="'+escAttr(__('tool_copy'))+'"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button><span class="chev"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg></span></div>';
   const body=el('div','card-body'); body.style.display='none';
   head.onclick=e=>{if(e.target.closest('button'))return;const open=card.dataset.open==='true';card.dataset.open=open?'false':'true';body.style.display=open?'none':'';};
   const copy=head.querySelector('.card-copy');
-  if(copy)copy.onclick=async e=>{e.stopPropagation();const ok=await copyText(body.textContent||tool.args||'');copy.title=ok?__('tool_copied'):__('tool_copy');setTimeout(()=>{copy.title=__('tool_copy');},1200);};
+  if(copy)copy.onclick=async e=>{e.stopPropagation();const ok=await copyText(body.textContent||card.dataset.toolArgs||'');copy.title=ok?__('tool_copied'):__('tool_copy');setTimeout(()=>{copy.title=__('tool_copy');},1200);};
   card.appendChild(head);card.appendChild(body);log.appendChild(card);toolCards[tool.id]=card;scrollDown();
+}
+function shellDisplayName(ex){
+  if(!ex||!ex.shell)return 'bash';
+  if(ex.shell==='git-bash')return 'Git Bash';
+  if(ex.shell==='powershell')return 'Windows PowerShell';
+  if(ex.shell==='pwsh')return 'PowerShell 7+';
+  return ex.shell;
 }
 function renderToolResult(tool) {
   const card=toolCards[tool.id]; if(!card)return;
   const elapsed=Math.max(0,Date.now()-Number(card.dataset.startedAt||Date.now()));
+  const ex=tool.execution||null;
+  if(ex&&tool.name==='bash'){
+    const title=card.querySelector('.card-title .name');
+    if(title)title.textContent=shellDisplayName(ex);
+  }
   setToolStatus(card,tool.err?'danger':'success',tool.err?__('tool_failed'):__('tool_done'));
-  if(tool.err){card.appendChild(el('div','err-body',tool.err));updateToolMeta(card,fmtElapsed(elapsed));}
-  else {
+  let meta=fmtElapsed(elapsed);
+  if(ex){
+    const bits=[];
+    if(typeof ex.exitCode==='number')bits.push('exit '+ex.exitCode);
+    if(ex.failurePhase)bits.push(ex.failurePhase);
+    if(ex.verification&&ex.verification!=='not_verification')bits.push(ex.verification);
+    if(bits.length)meta=bits.join(' · ')+' · '+meta;
+  }
+  if(tool.err){
+    const err=el('div','err-body',tool.err);
+    if(ex&&ex.outputTail){const pre=el('pre','err-stderr',ex.outputTail.slice(0,16000));err.appendChild(pre);}
+    card.appendChild(err);
+    updateToolMeta(card,meta);
+  } else {
     const body=card.querySelector('.card-body');
     const output=String(tool.output||'');
     if(body)body.textContent=output?output.slice(0,2000)+(tool.truncated?'\n...[truncated]':''):__('tool_no_output');
-    updateToolMeta(card,fmtElapsed(elapsed)+' · '+lineCount(output)+' '+__('tool_lines'));
+    updateToolMeta(card,meta+' · '+lineCount(output)+' '+__('tool_lines'));
   }
   scrollDown();
 }
 function renderToolProgress(tool) {
+  // Reserved sub-agent progress channels (reasonix.subagent.*) are an internal
+  // local-frontend contract; they must never land in ordinary tool output.
+  if (tool.name && tool.name.indexOf('reasonix.subagent.') === 0) return;
   const card=toolCards[tool.id]; if(!card)return;
   const body=card.querySelector('.card-body'); if(!body)return;
   body.style.display=''; card.dataset.open='true';
@@ -1098,6 +1176,42 @@ function renderToolProgress(tool) {
   if(body.textContent.length>4000) body.textContent=body.textContent.slice(-3000);
   updateToolMeta(card,fmtElapsed(Date.now()-Number(card.dataset.startedAt||Date.now()))+' · '+lineCount(body.textContent)+' '+__('tool_lines'));
   scrollDown();
+}
+
+// Serve renders the structured extension contract as safe native text. It
+// never injects extension-provided HTML/Markdown into innerHTML, so a sidecar
+// cannot turn a card, form, status, or notification into executable content.
+function renderExtensionSurface(p) {
+  if(!p)return;
+  const lines=[];
+  const plugin=p.pluginId||'extension';
+  let severity='';
+  if(p.status){
+    severity=p.status.severity||'';
+    lines.push(p.status.label||'');
+    if(p.status.detail)lines.push(p.status.detail);
+    if(typeof p.status.progress==='number')lines.push(Math.round(p.status.progress*100)+'%');
+  } else if(p.card){
+    lines.push(p.card.title||'');
+    lines.push(p.card.text||p.card.markdown||'');
+    (p.card.fields||[]).forEach(f=>lines.push((f.key||'')+': '+(f.value||'')));
+    (p.card.actions||[]).forEach(a=>lines.push('['+(a.label||a.actionId||'action')+']'));
+  } else if(p.form){
+    lines.push(p.form.title||'');
+    lines.push(p.form.message||'');
+    (p.form.fields||[]).forEach(f=>{
+      let detail=(f.label||f.key||'')+(f.required?' *':'');
+      if((f.options||[]).length)detail+=' — '+f.options.join(', ');
+      lines.push(detail);
+    });
+  } else if(p.notification){
+    severity=p.notification.severity||'';
+    lines.push(p.notification.title||'');
+    lines.push(p.notification.body||'');
+  }
+  const text='['+plugin+'] '+lines.filter(Boolean).join('\n');
+  const node=el('div','notice'+((severity==='warn'||severity==='error')?' notice--warn':''),text);
+  log.appendChild(node);scrollDown();
 }
 
 // ── approval ──
@@ -1140,6 +1254,12 @@ function dangerousBashCommand(command) {
     || /^dd\s+if=/.test(command)
     || /^fdisk\b/.test(command);
 }
+// A turn's approval/ask prompts die with the turn: cancel (composer Esc, stop
+// button) or turn end must remove the cards and their key listeners, or a
+// stale card keeps soliciting a decision for a dead request and the approval
+// key listener would resolve it on a later unrelated keypress.
+let pendingPrompts=[];
+function clearPendingPrompts(){pendingPrompts.splice(0).forEach(fn=>fn());}
 function showApproval(a) {
   const d=el('div','approval');
   const prefix = a.tool === 'bash' ? bashCommandPrefix(a.subject) : '';
@@ -1157,16 +1277,32 @@ function showApproval(a) {
   }
   actions.push('<button class="approval__btn approval__btn--deny" data-allow="false"><span class="approval__key">N</span> '+__('deny')+'</button>');
   d.innerHTML='<div class="approval__header"><svg class="approval__icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg><span class="approval__title">'+__('approval_title')+'</span></div><div class="approval__subject">'+escHtml(a.tool)+(a.subject?' — '+escHtml(a.subject):'')+'</div><div class="approval__actions">'+actions.join('')+'</div>';
-  log.appendChild(d);scrollDown();
-  const resolve=payload=>{post('/approve',Object.assign({id:a.id},payload));d.remove();document.removeEventListener('keydown',onkey);};
+  log.appendChild(d);scrollDown(true);
+  // The advertised Y/A/P/N keys need a non-text-entry target (isPlainKey), but
+  // the composer is autofocused, so in the default state every shortcut would
+  // just type into the draft. Move focus onto the card so the keys route here —
+  // unless the user is mid-entry (a non-empty composer draft, or any other
+  // text field such as the session search): stealing focus there would turn
+  // their next keystroke into an unintended approval. Cleanup hands focus back
+  // to the composer only when it still sits inside the card, so a user who
+  // deliberately moved elsewhere is not yanked back.
+  d.tabIndex=-1;
+  if(!isTextEntry(document.activeElement)||(document.activeElement===input&&!input.value))d.focus({preventScroll:true});
+  const cleanup=()=>{pendingPrompts=pendingPrompts.filter(f=>f!==cleanup);const hadFocus=d.contains(document.activeElement);d.remove();document.removeEventListener('keydown',onkey);if(hadFocus)input.focus();};
+  pendingPrompts.push(cleanup);
+  const resolve=payload=>{post('/approve',Object.assign({id:a.id},payload));cleanup();};
   d.querySelectorAll('.approval__btn').forEach(btn=>{btn.onclick=()=>resolve({allow:btn.dataset.allow==='true',session:btn.dataset.session==='true',persist:btn.dataset.persist==='true',scope:btn.dataset.scope||''});});
-  const onkey=e=>{const k=e.key.toLowerCase();if(k==='y'||k==='1'){resolve({allow:true,session:false});}else if(k==='a'||k==='2'){resolve({allow:true,session:true});}else if(hasPrefix&&k==='3'){resolve({allow:true,session:true,scope:'prefix'});}else if(k==='p'||(!hasPrefix&&k==='3')||(hasPrefix&&k==='4')){resolve({allow:true,session:true,persist:true,scope:hasPrefix?'prefix':''});}else if(k==='n'||k==='escape'||(!hasPrefix&&k==='4')||(hasPrefix&&k==='5')){resolve({allow:false,session:false});}};
+  // A consumed shortcut must preventDefault: cleanup refocuses the composer
+  // synchronously, and the keystroke's default text insertion runs after
+  // keydown — without it the approving key lands in the draft as a stray char.
+  const onkey=e=>{if(!isPlainKey(e))return; const k=e.key.toLowerCase(); let payload=null;if(k==='y'||k==='1'){payload={allow:true,session:false};}else if(k==='a'||k==='2'){payload={allow:true,session:true};}else if(hasPrefix&&k==='3'){payload={allow:true,session:true,scope:'prefix'};}else if(k==='p'||(!hasPrefix&&k==='3')||(hasPrefix&&k==='4')){payload={allow:true,session:true,persist:true,scope:hasPrefix?'prefix':''};}else if(k==='n'||k==='escape'||(!hasPrefix&&k==='4')||(hasPrefix&&k==='5')){payload={allow:false,session:false};}if(payload){e.preventDefault();resolve(payload);}};
   document.addEventListener('keydown',onkey);
 }
 
 // ── ask ──
 function showAsk(ask) {
   const d=el('div','ask');
+  const cleanup=()=>{pendingPrompts=pendingPrompts.filter(f=>f!==cleanup);d.remove();};
   ask.questions.forEach(q=>{
     const qDiv=el('div'); qDiv.appendChild(el('div','ask__prompt',q.prompt));
     const opts=el('div','ask__options'); const selected=new Set();
@@ -1178,10 +1314,11 @@ function showAsk(ask) {
     qDiv.appendChild(opts);
     const submit=el('button','ask__submit',__('submit')); submit.disabled=true;
     opts.addEventListener('click',()=>{submit.disabled=selected.size===0;});
-    submit.onclick=()=>{const answers=ask.questions.map(qq=>({questionId:qq.id,selected:Array.from(selected).map(i=>qq.options[i].label)}));post('/answer',{id:ask.id,answers});d.remove();};
+    submit.onclick=()=>{const answers=ask.questions.map(qq=>({questionId:qq.id,selected:Array.from(selected).map(i=>qq.options[i].label)}));post('/answer',{id:ask.id,answers});cleanup();};
     qDiv.appendChild(submit); d.appendChild(qDiv);
   });
-  log.appendChild(d);scrollDown();
+  log.appendChild(d);scrollDown(true);
+  pendingPrompts.push(cleanup);
 }
 
 // ── compaction ──
@@ -1265,18 +1402,27 @@ function applyRewind() {
 
 document.addEventListener('keydown',e=>{
   const overlay=$('#rewind-overlay'); if(!overlay)return;
-  if(e.key==='Escape'){e.preventDefault();if(rewindStage===0)overlay.remove();else{rewindStage=0;renderRewindPicker();}return;}
+  // The picker is modal and runs in the capture phase: plain keys it owns are
+  // swallowed before they reach the composer underneath — Enter would
+  // otherwise both send the composer draft and advance the picker, and
+  // letters would type into the hidden draft. Modifier chords
+  // (copy/reload/devtools), IME composition, and non-printable keys (F5, Tab)
+  // pass through — a bare Cmd+C must not hit a scope key and apply a rewind.
+  if(e.ctrlKey||e.metaKey||e.altKey||e.isComposing||e.key==='Process')return;
+  if(!(e.key==='Escape'||e.key==='Enter'||e.key==='ArrowDown'||e.key==='ArrowUp'||e.key.length===1))return;
+  e.preventDefault();e.stopPropagation();
+  if(e.key==='Escape'){if(rewindStage===0)overlay.remove();else{rewindStage=0;renderRewindPicker();}return;}
   if(rewindStage===0){
-    if(e.key==='j'||e.key==='ArrowDown'){e.preventDefault();rewindSelected=Math.min(rewindSelected+1,rewindCheckpoints.length-1);renderRewindPicker();}
-    if(e.key==='k'||e.key==='ArrowUp'){e.preventDefault();rewindSelected=Math.max(rewindSelected-1,0);renderRewindPicker();}
-    if(e.key==='Enter'){e.preventDefault();rewindStage=1;rewindScope=0;renderRewindPicker();}
+    if(e.key==='j'||e.key==='ArrowDown'){rewindSelected=Math.min(rewindSelected+1,rewindCheckpoints.length-1);renderRewindPicker();}
+    if(e.key==='k'||e.key==='ArrowUp'){rewindSelected=Math.max(rewindSelected-1,0);renderRewindPicker();}
+    if(e.key==='Enter'){rewindStage=1;rewindScope=0;renderRewindPicker();}
   } else {
-    if(e.key==='j'||e.key==='ArrowDown'){e.preventDefault();rewindScope=Math.min(rewindScope+1,SCOPES.length-1);renderRewindPicker();}
-    if(e.key==='k'||e.key==='ArrowUp'){e.preventDefault();rewindScope=Math.max(rewindScope-1,0);renderRewindPicker();}
-    if(e.key==='Enter'){e.preventDefault();applyRewind();}
-    const idx=SCOPES.findIndex(s=>s.key===e.key); if(idx>=0){e.preventDefault();rewindScope=idx;applyRewind();}
+    if(e.key==='j'||e.key==='ArrowDown'){rewindScope=Math.min(rewindScope+1,SCOPES.length-1);renderRewindPicker();}
+    if(e.key==='k'||e.key==='ArrowUp'){rewindScope=Math.max(rewindScope-1,0);renderRewindPicker();}
+    if(e.key==='Enter'){applyRewind();}
+    const idx=SCOPES.findIndex(s=>s.key===e.key); if(idx>=0){rewindScope=idx;applyRewind();}
   }
-});
+},true);
 
 // ── slash menu ──
 let slashOpen=false, slashIndex=0, slashFiltered=[];
@@ -1329,7 +1475,7 @@ es.onmessage=ev=>{setConnState('connected');
   const e=JSON.parse(ev.data);
   if(e.kind!=='retrying')clearRetrying();
   switch(e.kind){
-    case 'turn_started': setRunning(true); finalizeMsg(); toolCards={}; todosDismissed=false; break;
+    case 'turn_started': setRunning(true); clearPendingPrompts(); finalizeMsg(); toolCards={}; todosDismissed=false; break;
     case 'reasoning': appendReasoning(e.reasoning||e.text||''); break;
     case 'text': currentReasoning=null; appendText(e.text||''); break;
     case 'message': finalizeMsg(); break;
@@ -1355,10 +1501,12 @@ es.onmessage=ev=>{setConnState('connected');
     case 'phase': finalizeMsg(); log.appendChild(el('div','phase',e.text||''));scrollDown();break;
     case 'approval_request': if(e.approval)showApproval(e.approval); break;
     case 'ask_request': if(e.ask)showAsk(e.ask); break;
+    case 'extension_surface': if(e.extension)renderExtensionSurface(e.extension); break;
+    case 'extension_status': if(e.extension)renderExtensionSurface(e.extension); break;
     case 'compaction_started': showCompaction({trigger:e.compaction?.trigger}); break;
     case 'compaction_done': showCompaction(e.compaction||{}); break;
     case 'retrying': setRetrying(e.retryAttempt,e.retryMax); break;
-    case 'turn_done': finalizeMsg(); setRunning(false); if(e.err){log.appendChild(el('div','msg--error','✗ '+e.err));scrollDown();} fetchStatus(); fetchTodos(); refreshCheckpointAvailability(); break;
+    case 'turn_done': clearPendingPrompts(); finalizeMsg(); setRunning(false); if(e.outcome==='recovery_paused'){showNotice('⏸ '+__('recovery_paused'));}else if(e.err){log.appendChild(el('div','msg--error','✗ '+e.err));scrollDown();} fetchStatus(); fetchTodos(); refreshCheckpointAvailability(); break;
   }
 };
 es.onerror=()=>{
@@ -1433,7 +1581,7 @@ function renderHistoryMessages(ms){
       renderToolResult({id,name:m.toolName||'tool',output:m.content||''});
     }
   });
-  currentMsg=null;currentText=null;currentReasoning=null; scrollDown(); updateActionAvailability(); return true;
+  currentMsg=null;currentText=null;currentReasoning=null; scrollDown(true); updateActionAvailability(); return true;
 }
 fetch('/history').then(r=>r.json()).then(msgs=>{renderHistoryMessages(msgs);fetchTodos();}).catch(()=>{});
 
@@ -1567,6 +1715,14 @@ async function syncModeBeforeSubmit(){
 }
 async function send(){
   const v=input.value.trim(); if(!v)return;
+  if(v==='/reload'){
+    input.value='';input.style.height='';closeSlashMenu();
+    showNotice(__('extensions_reloading'));
+    const response=await post('/extensions/reload',{});
+    if(response.ok){showNotice(__('extensions_reloaded'));fetchStatus();}
+    else{showNotice((await response.text()).trim()||__('extensions_reload_failed'),'warn');}
+    return;
+  }
   await syncModeBeforeSubmit();
   let submitInput=v;
   if(goalMode && !v.startsWith('/goal')){
@@ -1607,7 +1763,7 @@ input.addEventListener('keydown',e=>{
 document.addEventListener('keydown',e=>{
   if(e.target===input&&e.key==='Tab'&&e.shiftKey){e.preventDefault();cycleMode();return;}
   if(e.target===input&&(e.key==='y'||e.key==='Y')&&(e.ctrlKey||e.metaKey)&&!e.altKey&&!e.shiftKey){e.preventDefault();toggleYolo();return;}
-  if(e.key==='/'&&e.target!==input){e.preventDefault();input.focus();return;}
+  if(e.key==='/'&&isPlainKey(e)){e.preventDefault();input.focus();return;}
 });
 
 // mode helpers — Shift+Tab toggles Plan; Ctrl+Y toggles YOLO separately.
@@ -1776,7 +1932,10 @@ document.addEventListener('click',e=>{
   const del=e.target.closest('.session-del');
   if(!del)return;
   e.stopPropagation();
-  openDeleteSession(del.dataset.name);
+  const name=del.dataset.name;
+  const target=sessionsCache.find(s=>s.name===name);
+  if(target&&target.current){showNotice(__('cannot_delete_active'),'warn');return;}
+  openDeleteSession(name);
 });
 $('#delete-modal-close').onclick=()=>closeDeleteSession();
 $('#delete-cancel').onclick=()=>closeDeleteSession();
@@ -1785,7 +1944,10 @@ $('#delete-confirm').onclick=()=>{
   const name=pendingDeleteSession;
   if(!name)return;
   closeDeleteSession();
-  post('/delete-session',{name}).then(()=>loadSessions());
+  post('/delete-session',{name}).then(async r=>{
+    if(!r.ok){showNotice((await r.text()).trim()||('HTTP '+r.status),'warn');}
+    loadSessions();
+  }).catch(()=>showNotice(__('delete_failed'),'warn'));
 };
 
 // welcome examples

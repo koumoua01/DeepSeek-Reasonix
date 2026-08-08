@@ -5,6 +5,7 @@ import { asArray } from "../lib/array";
 import { app } from "../lib/bridge";
 import { useI18n, type Locale, type Translator } from "../lib/i18n";
 import { formatMoneyLocalized } from "../lib/money";
+import { formatTokens, formatOptionalTokens } from "../lib/format";
 import type { DictKey } from "../locales/en";
 import type { BalanceInfo, ContextInfo, ContextPanelInfo, UsageSourceStats, WireUsage } from "../lib/types";
 
@@ -21,12 +22,12 @@ interface ContextPanelProps {
   balance?: BalanceInfo;
   sessionGen?: number;
   refreshKey?: number;
+  // Monotonic counter bumped by EVERY usage event (executor and subagent).
+  // The executor-gated `usage` prop freezes during sub-agent runs, which used
+  // to pin 会话指标/用量分析 for minutes; this keeps the snapshot ticking.
+  usageSeq?: number;
 }
 
-function fmtFullTokens(n: number): string {
-  if (n <= 0) return "0";
-  return String(Math.round(n));
-}
 
 function fmtDuration(ms: number, t: Translator): string {
   if (ms <= 0) return "-";
@@ -37,10 +38,6 @@ function fmtDuration(ms: number, t: Translator): string {
   return t("context.durationMinutesSeconds", { minutes, seconds });
 }
 
-function fmtOptionalTokens(tokens?: number): string {
-  if (typeof tokens !== "number" || tokens <= 0) return "-";
-  return tokens.toLocaleString();
-}
 
 interface MetricTokenDisplay {
   display: string;
@@ -142,21 +139,23 @@ export function contextCostDisplay({
 }
 
 // contextSessionCache picks the session-cumulative cache hit/miss pair for the
-// panel's session average. All-sources telemetry (panel info, then ContextInfo)
-// wins over the wire session counters, which the Go agent scopes to the
-// executor only — the same preference StatusBar applies — and the pair always
-// comes from a single source so the computed rate never mixes scopes.
+// panel's session average. The shared ContextInfo is refreshed after every
+// usage event and also drives StatusBar, so prefer it over the panel's
+// independently throttled snapshot. Panel telemetry remains the all-sources
+// fallback for callers without live context; executor-only wire counters only
+// bridge the pre-refresh gap. The pair always comes from one source so the
+// computed rate never mixes scopes.
 export function contextSessionCache(
   info?: Pick<ContextPanelInfo, "sessionCacheHitTokens" | "sessionCacheMissTokens"> | null,
   context?: Pick<ContextInfo, "cacheHitTokens" | "cacheMissTokens">,
   usage?: Pick<WireUsage, "sessionCacheHitTokens" | "sessionCacheMissTokens">,
 ): { hit: number; miss: number } {
-  const infoHit = info?.sessionCacheHitTokens ?? 0;
-  const infoMiss = info?.sessionCacheMissTokens ?? 0;
-  if (infoHit + infoMiss > 0) return { hit: infoHit, miss: infoMiss };
   const ctxHit = context?.cacheHitTokens ?? 0;
   const ctxMiss = context?.cacheMissTokens ?? 0;
   if (ctxHit + ctxMiss > 0) return { hit: ctxHit, miss: ctxMiss };
+  const infoHit = info?.sessionCacheHitTokens ?? 0;
+  const infoMiss = info?.sessionCacheMissTokens ?? 0;
+  if (infoHit + infoMiss > 0) return { hit: infoHit, miss: infoMiss };
   return { hit: usage?.sessionCacheHitTokens ?? 0, miss: usage?.sessionCacheMissTokens ?? 0 };
 }
 
@@ -173,6 +172,34 @@ interface ContextBreakdown {
 
 function nonNegativeTokenCount(value: number): number {
   return Number.isFinite(value) ? Math.max(0, value) : 0;
+}
+
+/** Prefer Context* (latest attempt) over billable aggregates for turn panels. */
+export function liveTurnUsageBreakdown(
+  usage?: WireUsage | null,
+  info?: Pick<ContextPanelInfo, "promptTokens" | "completionTokens" | "reasoningTokens"> | null,
+): { promptTokens: number; completionTokens: number; reasoningTokens: number } {
+  if (usage) {
+    const hasContext =
+      (usage.contextPromptTokens ?? 0) > 0 || (usage.contextCompletionTokens ?? 0) > 0;
+    if (hasContext) {
+      return {
+        promptTokens: usage.contextPromptTokens ?? 0,
+        completionTokens: usage.contextCompletionTokens ?? 0,
+        reasoningTokens: usage.contextReasoningTokens ?? 0,
+      };
+    }
+    return {
+      promptTokens: usage.promptTokens ?? 0,
+      completionTokens: usage.completionTokens ?? 0,
+      reasoningTokens: usage.reasoningTokens ?? 0,
+    };
+  }
+  return {
+    promptTokens: info?.promptTokens ?? 0,
+    completionTokens: info?.completionTokens ?? 0,
+    reasoningTokens: info?.reasoningTokens ?? 0,
+  };
 }
 
 export function contextBreakdown(
@@ -268,6 +295,7 @@ export interface ContextSourceRow {
   cost: number;
   currency?: string;
   requests: number;
+  estimated: boolean;
 }
 
 export function contextSourceRows(info: ContextPanelInfo | null, sessionCurrency?: string): ContextSourceRow[] {
@@ -299,6 +327,7 @@ export function contextSourceRows(info: ContextPanelInfo | null, sessionCurrency
       cost: sourceCost(stats),
       currency: stats.sessionCurrency || sessionCurrency || info?.sessionCurrency,
       requests: stats.requestCount ?? 0,
+      estimated: stats.estimated === true,
     }));
 }
 
@@ -314,6 +343,7 @@ export function ContextPanel({
   balance,
   sessionGen,
   refreshKey,
+  usageSeq,
 }: ContextPanelProps) {
   const { locale, t } = useI18n();
   const [info, setInfo] = useState<ContextPanelInfo | null>(null);
@@ -345,23 +375,28 @@ export function ContextPanel({
     void refresh();
   }, [refresh, refreshKey]);
 
-  // Refresh the panel snapshot while usage events stream. The key includes
-  // general token fields so providers without cache telemetry still tick.
+  // Refresh the panel snapshot while usage events stream — from any source:
+  // usageSeq covers sub-agent/title requests the executor-gated usage prop
+  // never reflects, and usageRefreshKey keeps ticking for providers whose
+  // events lack a seq. Throttled to once per second.
   useEffect(() => {
-    if (!usageRefreshKey) return;
+    if (!usageRefreshKey && !usageSeq) return;
     const now = Date.now();
     if (now - lastRefreshTime.current >= 1000) {
       lastRefreshTime.current = now;
       void refresh();
     }
-  }, [usageRefreshKey, refresh]);
+  }, [usageRefreshKey, usageSeq, refresh]);
 
   const usedTokens = context?.used && context.used > 0 ? context.used : info?.usedTokens ?? 0;
   const windowTokens = context?.window && context.window > 0 ? context.window : info?.windowTokens ?? 0;
   // Prefer live usage props (updated in real-time by the reducer during streaming)
-  // over the async-fetched info snapshot (only refreshed on turn_done).
-  const promptTokens = usage?.promptTokens ?? info?.promptTokens ?? 0;
-  const completionTokens = usage?.completionTokens ?? info?.completionTokens ?? 0;
+  // over the async-fetched info snapshot (only refreshed on turn_done). Multi-
+  // attempt stream recovery reports billable aggregates on prompt/completion
+  // and latest-attempt shape on Context* — use the latter for turn breakdown.
+  const turnBreakdown = liveTurnUsageBreakdown(usage, info);
+  const promptTokens = turnBreakdown.promptTokens;
+  const completionTokens = turnBreakdown.completionTokens;
   const totalTokens = info?.totalTokens && info.totalTokens > 0
     ? info.totalTokens
     : sessionTokens && sessionTokens > 0
@@ -369,7 +404,7 @@ export function ContextPanel({
       : usage?.totalTokens && usage.totalTokens > 0
         ? usage.totalTokens
         : promptTokens + completionTokens;
-  const reasoningTokens = usage?.reasoningTokens ?? info?.reasoningTokens ?? 0;
+  const reasoningTokens = turnBreakdown.reasoningTokens;
   // Session-cumulative cache tokens for the top summary: all-sources telemetry
   // first (matching the session cost and per-source rows in this panel — the
   // wire session counters are executor-only), with the live counters bridging
@@ -402,12 +437,15 @@ export function ContextPanel({
   const requestCount = info?.requestCount && info.requestCount > 0 ? info.requestCount : derivedRequestCount;
   const windowStatus = contextWindowStatus(usagePct, compactPct);
   const balanceLabel = balance?.available && balance.display ? balance.display : "-";
-  const turnCostLabel = formatMoneyLocalized(turnCost, sessionCurrency, { locale, empty: "dash" });
-  const sessionCostLabel = formatMoneyLocalized(cost.amount, cost.currency, { locale, empty: "dash" });
+  const turnEstimated = usage?.estimated === true || info?.estimated === true;
+  const sessionEstimated = info?.sessionEstimated === true || context?.estimated === true;
+  const markEstimated = (value: string, estimated: boolean) => estimated && value !== "-" ? `≈${value}` : value;
+  const turnCostLabel = markEstimated(formatMoneyLocalized(turnCost, sessionCurrency, { locale, empty: "dash" }), turnEstimated);
+  const sessionCostLabel = markEstimated(formatMoneyLocalized(cost.amount, cost.currency, { locale, empty: "dash" }), sessionEstimated);
   const totalTokensTitle = totalTokensMetric.exact === "-" ? "-" : t("context.tokensValue", { value: totalTokensMetric.exact });
-  const usedLabel = fmtFullTokens(usedTokens);
-  const windowLabel = fmtFullTokens(windowTokens);
-  const compactRemainingLabel = tokensUntilCompact > 0 ? fmtFullTokens(tokensUntilCompact) : "0";
+  const usedLabel = formatTokens(usedTokens);
+  const windowLabel = formatTokens(windowTokens);
+  const compactRemainingLabel = tokensUntilCompact > 0 ? formatTokens(tokensUntilCompact) : "0";
   const compactMarkerPct = Math.max(0, Math.min(100, compactPct));
   const usageMarkerPct = Math.max(6, Math.min(94, usagePct));
   const compactLabelPct = Math.max(6, Math.min(94, compactMarkerPct));
@@ -429,7 +467,7 @@ export function ContextPanel({
     const totalMetric = formatMetricTokens(sourceTokenTotal(row), locale);
     const cacheReported = row.cacheHitTokens + row.cacheMissTokens > 0;
     const cacheRate = cacheReported ? formatCacheHitRate(row.cacheHitTokens, row.cacheMissTokens) : t("context.cacheNotReported");
-    const costLabel = formatMoneyLocalized(row.cost, row.currency, { locale, empty: "dash" });
+    const costLabel = markEstimated(formatMoneyLocalized(row.cost, row.currency, { locale, empty: "dash" }), row.estimated);
     return (
       <div className="context-panel__source-row" key={row.source}>
         <div className="context-panel__source-head">
@@ -519,13 +557,13 @@ export function ContextPanel({
                 <MiniStat label={t("context.sessionCost")} value={sessionCostLabel} />
                 <MiniStat label={t("context.time")} value={fmtDuration(elapsed, t)} />
                 <MiniStat label={t("context.requests")} value={requestCount > 0 ? String(requestCount) : "-"} />
-                <MiniStat label={t("context.sessionTokensShort")} value={totalTokensMetric.display} title={totalTokensTitle} wide />
+                <MiniStat label={t("context.sessionTokensShort")} value={markEstimated(totalTokensMetric.display, sessionEstimated)} title={totalTokensTitle} wide />
               </div>
             </div>
           </section>
           <section className="context-panel__creation-grid" aria-label={t("context.overview")}>
             <MetricCard label={t("status.cacheLabel")} value={fmtUsageCacheRate(usage)} tone="accent" />
-            <MetricCard label={t("status.turnTokensLabel")} value={fmtOptionalTokens(turnTokens)} />
+            <MetricCard label={t("status.turnTokensLabel")} value={formatOptionalTokens(turnTokens)} />
             <MetricCard label={t("status.turnCostLabel")} value={turnCostLabel} />
             <MetricCard label={t("status.balanceLabel")} value={balanceLabel} tone="accent" />
           </section>

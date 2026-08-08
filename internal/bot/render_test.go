@@ -14,7 +14,54 @@ import (
 )
 
 func TestApprovalCardCarriesChatType(t *testing.T) {
-	card := approvalCard(event.Approval{ID: "approval-1"}, ChatDM, "allowed-user")
+	if got := renderApprovalText(event.Approval{
+		ID: "r1", Tool: "write_file", Subject: "a.go", Kind: "recovery",
+		Recovery: &event.RecoveryApproval{
+			FailedTool: "bash", FailedSummary: "exit 1", Diagnosis: "nil pointer",
+			NextTool: "write_file", NextAction: "edit a.go", ChangeRationale: "strategy change",
+			SourceAgent: "subagent",
+		},
+	}); !strings.Contains(got, "执行前确认") || !strings.Contains(got, "回复 1 继续，2 换个办法") || strings.Contains(got, "Auto Guard") {
+		t.Fatalf("recovery text = %q", got)
+	}
+
+	grantApproval := event.Approval{ID: "r2", Kind: "recovery", Recovery: &event.RecoveryApproval{
+		CanGrantTask: true, TaskGrantScope: "git push origin → feature",
+	}}
+	if got := renderRecoveryText(grantApproval); !strings.Contains(got, "2 在本任务内允许同类操作") ||
+		!strings.Contains(got, "风险升级仍会再次确认") || !strings.Contains(got, "授权范围: git push origin → feature") {
+		t.Fatalf("task-grant recovery text = %q", got)
+	}
+	keyboard := recoveryKeyboard(grantApproval)
+	if len(keyboard.Rows) != 2 || keyboard.Rows[0].Buttons[1].CallbackID != "/recovery-continue-task r2" {
+		t.Fatalf("task-grant keyboard = %#v", keyboard)
+	}
+	grantCard := recoveryCard(grantApproval, ChatDM, "allowed-user")
+	grantActions, ok := grantCard.Elements[1].Extra["actions"].([]map[string]any)
+	if !ok || len(grantActions) != 3 {
+		t.Fatalf("task-grant card actions = %#v", grantCard.Elements[1].Extra["actions"])
+	}
+
+	planApproval := event.Approval{ID: "r3", Kind: "recovery", Recovery: &event.RecoveryApproval{
+		ChangeKind: "strategy", NextAction: "replace the storage backend", ChangeRationale: "the original approach cannot satisfy the requirement",
+		PlanBefore: "1. Keep the current storage backend", PlanAfter: "1. Replace the storage backend",
+	}}
+	if got := renderRecoveryText(planApproval); !strings.Contains(got, "执行计划需要你的决定") ||
+		!strings.Contains(got, "原计划:\n1. Keep the current storage backend") ||
+		!strings.Contains(got, "新计划:\n1. Replace the storage backend") ||
+		!strings.Contains(got, "回复 1 采用新计划并继续，2 不采用并让 Auto 调整") {
+		t.Fatalf("plan-change recovery text = %q", got)
+	}
+	planKeyboard := recoveryKeyboard(planApproval)
+	if len(planKeyboard.Rows) != 1 || planKeyboard.Rows[0].Buttons[0].Label != "1 采用并继续" || planKeyboard.Rows[0].Buttons[0].Style != 0 {
+		t.Fatalf("plan-change keyboard = %#v", planKeyboard)
+	}
+	planCard := recoveryCard(planApproval, ChatDM, "allowed-user")
+	if planCard.Header != "执行计划需要你的决定" {
+		t.Fatalf("plan-change card header = %q", planCard.Header)
+	}
+
+	card := approvalCard(event.Approval{ID: "approval-1", Tool: "bash", Subject: "ls"}, ChatDM, "allowed-user")
 	if len(card.Elements) < 2 {
 		t.Fatalf("approval card elements = %d, want at least 2", len(card.Elements))
 	}
@@ -181,6 +228,8 @@ func TestRenderSinkSendsProgressWithoutToolOutput(t *testing.T) {
 
 	sink.Emit(event.Event{Kind: event.TurnStarted})
 	sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "tool-1", Name: "read_file", ReadOnly: true}})
+	sink.lastProgress = time.Now().Add(-renderProgressMinInterval)
+	sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "tool-1", Name: "read_file", ReadOnly: true, Refreshed: true}})
 	sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{ID: "tool-1", Name: "read_file", Output: "secret output that should stay out of IM"}})
 	sink.Emit(event.Event{Kind: event.Text, Text: "完成。"})
 	sink.Emit(event.Event{Kind: event.TurnDone})
@@ -204,7 +253,7 @@ func TestRenderSinkLimitsProgressMessages(t *testing.T) {
 	adapter := newFakeAdapter(PlatformWeixin, "fake-weixin")
 	sink := newRenderSink(context.Background(), adapter, "weixin-weixin", "weixin", "chat-1", ChatDM, "user-1", "msg-1", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
 
-	for i := 0; i < renderMaxProgressMessages+2; i++ {
+	for range renderMaxProgressMessages + 2 {
 		sink.lastProgress = time.Now().Add(-renderProgressMinInterval)
 		sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "tool", Name: "bash"}})
 	}
@@ -443,5 +492,66 @@ func TestRenderSinkSuppressesReasoning(t *testing.T) {
 	}
 	if strings.Contains(sent[0].Text, "internal reasoning") {
 		t.Fatalf("reasoning leaked into IM message: %q", sent[0].Text)
+	}
+}
+
+func TestRenderSinkSuppressesOperatorNoticesWithoutHidingUserWarnings(t *testing.T) {
+	adapter := newFakeAdapter(PlatformWeixin, "fake-weixin")
+	sink := newRenderSink(context.Background(), adapter, "weixin-weixin", "weixin", "chat-1", ChatDM, "user-1", "msg-1", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+
+	sink.Emit(event.Event{Kind: event.Notice, Level: event.LevelWarn, Text: "please resend your message"})
+	for _, code := range []string{
+		event.NoticeCodeSessionRecoveryForked,
+		event.NoticeCodeSessionRecoveryAdopted,
+		event.NoticeCodeSessionRecoveryAdoptedCovered,
+		event.NoticeCodeSessionRecoveryDepthCap,
+		event.NoticeCodeSessionShutdownRecoveryForked,
+	} {
+		sink.Emit(event.Event{
+			Kind: event.Notice, Level: event.LevelWarn,
+			Audience: event.NoticeAudienceOperator,
+			Code:     code,
+			Text:     "local session maintenance",
+		})
+	}
+
+	sent := adapter.sentMessages()
+	if len(sent) != 1 {
+		t.Fatalf("sent = %+v, want only the actionable user warning", sent)
+	}
+	if sent[0].Text != "⚠️ please resend your message" {
+		t.Fatalf("sent text = %q, want the ordinary user warning", sent[0].Text)
+	}
+}
+
+// TestRenderSinkIgnoresSubagentProgress locks the bot policy for the reserved
+// sub-agent progress ToolProgress channels: streaming previews must never leak
+// into IM channels, exactly like ordinary tool output.
+func TestRenderSinkIgnoresSubagentProgress(t *testing.T) {
+	adapter := newFakeAdapter(PlatformWeixin, "fake-weixin")
+	sink := newRenderSink(context.Background(), adapter, "weixin-weixin", "weixin", "chat-1", ChatDM, "user-1", "msg-1", slog.New(slog.NewTextHandler(io.Discard, nil)), nil, nil)
+
+	sink.Emit(event.Event{Kind: event.TurnStarted})
+	sink.Emit(event.Event{Kind: event.ToolDispatch, Tool: event.Tool{ID: "task-1", Name: "task"}})
+	sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{
+		ID: "task-1", Name: event.SubagentProgressStatusName, Output: "reasoning",
+	}})
+	sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{
+		ID: "task-1", Name: event.SubagentProgressReasoningName, Output: "thinking out loud",
+	}})
+	sink.Emit(event.Event{Kind: event.ToolProgress, Tool: event.Tool{
+		ID: "task-1", Name: event.SubagentProgressTextName, Output: "answer preview",
+	}})
+	sink.Emit(event.Event{Kind: event.ToolResult, Tool: event.Tool{ID: "task-1", Name: "task", Output: "final"}})
+	sink.Emit(event.Event{Kind: event.TurnDone})
+
+	sent := adapter.sentMessages()
+	if len(sent) != 1 {
+		t.Fatalf("sent count = %d, want only the dispatch status: %+v", len(sent), sent)
+	}
+	for i, m := range sent {
+		if strings.Contains(m.Text, "thinking out loud") || strings.Contains(m.Text, "answer preview") {
+			t.Fatalf("sub-agent preview leaked into IM message %d: %+v", i, m)
+		}
 	}
 }

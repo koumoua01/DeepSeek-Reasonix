@@ -3,8 +3,10 @@ package builtin
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
+	"reasonix/internal/fileutil"
 	fileenc "reasonix/internal/fileutil/encoding"
 )
 
@@ -21,8 +23,11 @@ func readFileEncoded(path string) (content string, enc fileenc.Kind, err error) 
 }
 
 // writeFileEncoded encodes content back to the given encoding and writes it.
+// The write is atomic: a truncating write that fails midway (a Windows filter
+// driver holding a transient lock, a full disk) would leave the user's source
+// file empty or half-written.
 func writeFileEncoded(path string, content string, enc fileenc.Kind) error {
-	return os.WriteFile(path, fileenc.Encode(content, enc), 0o644)
+	return fileutil.AtomicOverwriteFile(path, fileenc.Encode(content, enc), 0o644)
 }
 
 // matchLineEndings adapts an edit's old/new text to a CRLF file when the literal
@@ -56,11 +61,23 @@ type editApplyResult struct {
 	applied int
 	matches int
 	fuzzy   bool
+	receipt editReplacementReceipt
 }
 
 type editRange struct {
 	start int
 	end   int
+}
+
+// editReplacementReceipt records only the span the tool actually matched and
+// the span it wrote in its place. It deliberately excludes surrounding file
+// content so a successful edit can ground the next model turn without widening
+// provider-visible workspace data.
+type editReplacementReceipt struct {
+	matched     string
+	replacement string
+	occurrences int
+	fuzzy       bool
 }
 
 // applyOldStringEdit is the shared edit_file/multi_edit/Preview contract. It
@@ -77,17 +94,29 @@ func applyOldStringEdit(content, oldString, newString string, replaceAll bool) e
 				updated: strings.ReplaceAll(content, old, newStr),
 				applied: count,
 				matches: count,
+				receipt: editReplacementReceipt{
+					matched:     old,
+					replacement: newStr,
+					occurrences: count,
+				},
 			}
 		}
 		ranges := fuzzyEditRanges(content, old)
 		if len(ranges) == 0 {
 			return editApplyResult{updated: content}
 		}
+		replacement := matchReplacementLineEndings(content, newStr)
 		return editApplyResult{
-			updated: replaceEditRanges(content, ranges, matchReplacementLineEndings(content, newStr)),
+			updated: replaceEditRanges(content, ranges, replacement),
 			applied: len(ranges),
 			matches: len(ranges),
 			fuzzy:   true,
+			receipt: editReplacementReceipt{
+				matched:     matchedRangeSample(content, old, ranges),
+				replacement: replacement,
+				occurrences: len(ranges),
+				fuzzy:       true,
+			},
 		}
 	}
 
@@ -102,16 +131,45 @@ func applyOldStringEdit(content, oldString, newString string, replaceAll bool) e
 			applied: 1,
 			matches: 1,
 			fuzzy:   true,
+			receipt: editReplacementReceipt{
+				matched:     matchedRangeSample(content, old, ranges),
+				replacement: matchReplacementLineEndings(content, newStr),
+				occurrences: 1,
+				fuzzy:       true,
+			},
 		}
 	case 1:
 		return editApplyResult{
 			updated: strings.Replace(content, old, newStr, 1),
 			applied: 1,
 			matches: 1,
+			receipt: editReplacementReceipt{
+				matched:     old,
+				replacement: newStr,
+				occurrences: 1,
+			},
 		}
 	default:
 		return editApplyResult{updated: content, matches: count}
 	}
+}
+
+func matchedRangeSample(content, fallback string, ranges []editRange) string {
+	if len(ranges) == 0 {
+		return fallback
+	}
+	r := ranges[0]
+	if r.start < 0 || r.end < r.start || r.end > len(content) {
+		return fallback
+	}
+	actual := content[r.start:r.end]
+	sample := clipPostWriteSpan(actual, maxCapturedReceiptSpanBytes)
+	if len(sample) == len(actual) {
+		// Do not let a short substring keep an otherwise-dead large intermediate
+		// multi_edit buffer alive until all later steps finish.
+		return strings.Clone(sample)
+	}
+	return sample
 }
 
 func oldStringNotFoundError(path, oldString, content string) error {
@@ -300,8 +358,8 @@ func stripReadFileLinePrefix(line string) (string, bool) {
 
 func replaceEditRanges(content string, ranges []editRange, replacement string) string {
 	updated := content
-	for i := len(ranges) - 1; i >= 0; i-- {
-		r := ranges[i]
+	for _, v := range slices.Backward(ranges) {
+		r := v
 		updated = updated[:r.start] + replacement + updated[r.end:]
 	}
 	return updated
@@ -380,11 +438,8 @@ func firstNonEmptyLine(s string) string {
 }
 
 func commonPrefixLen(a, b string) int {
-	n := len(a)
-	if len(b) < n {
-		n = len(b)
-	}
-	for i := 0; i < n; i++ {
+	n := min(len(b), len(a))
+	for i := range n {
 		if a[i] != b[i] {
 			return i
 		}

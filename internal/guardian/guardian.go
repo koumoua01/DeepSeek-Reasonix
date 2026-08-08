@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"reasonix/internal/agent"
@@ -41,11 +41,12 @@ const (
 // system prompt and prior transcript stay in the prefix cache. Each review adds
 // a delta user message, keeping the common prefix byte-stable.
 type Session struct {
-	prov    provider.Provider
-	agent   *agent.Agent
-	sess    *agent.Session
-	sink    event.Sink
-	pricing *provider.Pricing
+	prov     provider.Provider
+	agent    *agent.Agent
+	sess     *agent.Session
+	sink     event.Sink
+	pricing  *provider.Pricing
+	modelRef string
 
 	policyPrompt string // stored so Reset can recreate the system prompt
 
@@ -61,9 +62,11 @@ type Session struct {
 	// After a threshold the session is compacted to bound memory growth.
 	reviewCount int
 
-	// lastUsage caches the most recent guardian-model telemetry so Review() can
-	// include per-call token cost in the assessment event.
-	lastUsage atomic.Pointer[provider.Usage]
+	// usageMu protects the aggregate for one review. It is separate from mu
+	// because the agent emits Usage while Review holds mu.
+	usageMu         sync.Mutex
+	reviewUsage     provider.Usage
+	haveReviewUsage bool
 }
 
 // NewSession creates a guardian review session with a dedicated model, read-only
@@ -81,19 +84,23 @@ func NewSession(prov provider.Provider, readOnlyReg *tool.Registry, policyPrompt
 		prov:         prov,
 		sink:         sink,
 		pricing:      pricing,
+		modelRef:     strings.TrimSpace(modelRef),
 		policyPrompt: policyPrompt,
 	}
 	sess := agent.NewSession(policyPrompt)
 	ag := agent.New(prov, readOnlyReg, sess, agent.Options{
-		MaxSteps:    6, // guardian reviews: enough for a few read-only tool calls
-		Temperature: temperature,
+		ModelRef:            strings.TrimSpace(modelRef),
+		MaxSteps:            6, // guardian reviews: enough for a few read-only tool calls
+		Temperature:         temperature,
+		RequireVisibleFinal: true, // each review must produce its own parseable verdict
 		// Use the shared context window so the guardian session can compact
 		// itself when it grows too large across many reviews.
-		ContextWindow:       100_000,
-		CompactRatio:        0.8,
-		SoftCompactRatio:    0.5,
-		ToolResultSnipRatio: 0.6,
-		CompactForceRatio:   0.9,
+		ContextWindow:          100_000,
+		CompactRatio:           0.8,
+		SoftCompactRatio:       0.5,
+		ToolResultSnipRatio:    0.6,
+		CompactForceRatio:      0.9,
+		StrictAlternatingRoles: true,
 		// Guardian's own sink drops everything — the audit line (emitTo) is the
 		// only user-visible output. Usage events are captured internally for
 		// per-review cost reporting.
@@ -107,13 +114,32 @@ func NewSession(prov provider.Provider, readOnlyReg *tool.Registry, policyPrompt
 // It reads the parent agent session to build a transcript, constructs a review
 // prompt, asks the guardian model (which may use read-only tools to investigate),
 // and returns allow/deny with a structured reason.
-// A non-nil error means the review could not complete (fail-closed: deny).
+//
+// Review keeps the legacy contract: an unavailable or unparseable review is
+// folded into a high-risk deny verdict (err is always nil), which downstream
+// surfaces as a reasoned human prompt. Callers that must tell an authentic
+// verdict apart from a failed review use ReviewVerdict.
 //
 // The mutex serialises access to the guardian agent.session so concurrent
 // reviews cannot interleave their messages (guardian reuses one session for
 // prefix-cache warmth). Event emission is deferred to outside the lock so a
 // slow sink does not stall the next review.
 func (gs *Session) Review(ctx context.Context, toolName string, args json.RawMessage, parentSession *agent.Session) (allow bool, reason string, err error) {
+	allow, reason, _ = gs.review(ctx, toolName, args, parentSession)
+	return allow, reason, nil
+}
+
+// ReviewVerdict is Review for callers that must distinguish an authentic
+// verdict from an unavailable or indeterminate review. Transport errors,
+// timeouts, and unparseable assessments return a non-nil error (alongside the
+// same circuit-breaker bookkeeping); authentic allow/deny verdicts return a
+// nil error. auto_review uses this so a failed review degrades to a fresh
+// human decision instead of masquerading as a reviewer deny.
+func (gs *Session) ReviewVerdict(ctx context.Context, toolName string, args json.RawMessage, parentSession *agent.Session) (allow bool, reason string, err error) {
+	return gs.review(ctx, toolName, args, parentSession)
+}
+
+func (gs *Session) review(ctx context.Context, toolName string, args json.RawMessage, parentSession *agent.Session) (allow bool, reason string, failure error) {
 	reviewCtx, cancel := context.WithTimeout(ctx, reviewTimeout)
 	defer cancel()
 
@@ -136,7 +162,7 @@ func (gs *Session) Review(ctx context.Context, toolName string, args json.RawMes
 	sink := gs.sink
 	gs.reviewCount++
 	reviewN := gs.reviewCount
-	gs.lastUsage.Store(nil)
+	gs.resetReviewUsage()
 
 	// The transcript evidence and the action request ride in ONE user message
 	// per review, so the guardian session alternates user/assistant strictly —
@@ -165,16 +191,16 @@ func (gs *Session) Review(ctx context.Context, toolName string, args json.RawMes
 	start := time.Now()
 	agentErr := gs.agent.Run(reviewCtx, transcriptText+"\n"+formatReviewRequest(toolName, args))
 	dur := time.Since(start).Milliseconds()
-	reviewUsage := gs.lastUsage.Load()
-
 	if agentErr == nil && reviewN%compactEvery == 0 {
 		_ = gs.agent.CompactNow(reviewCtx, "")
 	}
+	reviewUsage := gs.snapshotReviewUsage()
 
 	// Parse the result and update circuit breaker under the lock.
 	var assessment Assessment
 	if agentErr != nil {
 		gs.rollbackReview(before, rewriteBefore)
+		failure = fmt.Errorf("guardian review failed: %w", agentErr)
 		assessment = Assessment{
 			RiskLevel:         "high",
 			UserAuthorization: "unknown",
@@ -186,6 +212,7 @@ func (gs *Session) Review(ctx context.Context, toolName string, args json.RawMes
 		var parseErr error
 		assessment, parseErr = ParseAssessment(last)
 		if parseErr != nil {
+			failure = fmt.Errorf("guardian verdict unparseable: %w", parseErr)
 			assessment = Assessment{
 				RiskLevel:         "high",
 				UserAuthorization: "unknown",
@@ -217,7 +244,7 @@ func (gs *Session) Review(ctx context.Context, toolName string, args json.RawMes
 	gs.emitTo(sink, assessment, toolName, subject(args), dur, reviewUsage)
 
 	if assessment.Outcome == "deny" {
-		return false, reason, nil
+		return false, reason, failure
 	}
 	return true, "", nil
 }
@@ -266,13 +293,9 @@ func (gs *Session) Save(path string) error {
 	return nil
 }
 
-// rollbackReview discards a failed review turn. agent.Run already appended the
-// combined review as a user message; leaving it dangling would make the next
-// review append another user message right after it — consecutive user roles,
-// which strict-alternation providers reject, permanently poisoning the session.
-// Without a mid-review rewrite the pre-review snapshot is restored exactly;
-// after a rewrite (auto-compaction on a large transcript) only trailing plain
-// user messages are dropped, so the compaction the review paid for survives.
+// rollbackReview removes a failed review without leaving consecutive users.
+// It restores the exact snapshot unless compaction rewrote the session; then it
+// removes only failed tail turns so the compacted, completed history survives.
 // Caller holds gs.mu.
 func (gs *Session) rollbackReview(before []provider.Message, rewriteBefore int) {
 	if gs.sess.RewriteVersion() == rewriteBefore {
@@ -282,6 +305,12 @@ func (gs *Session) rollbackReview(before []provider.Message, rewriteBefore int) 
 	msgs := gs.sess.Snapshot()
 	for len(msgs) > 0 {
 		last := msgs[len(msgs)-1]
+		if last.Role == provider.RoleAssistant {
+			if len(last.ToolCalls) > 0 || strings.TrimSpace(last.Content) == "" {
+				msgs = msgs[:len(msgs)-1]
+				continue
+			}
+		}
 		if last.Role != provider.RoleUser || agent.IsCompactionSummary(last) {
 			break
 		}
@@ -323,8 +352,7 @@ func (gs *Session) normalizeAlternation() {
 	if !merged {
 		return
 	}
-	gs.sess.Replace(out)
-	gs.sess.IncrementRewrite()
+	gs.sess.Rewrite(out, "guardian_merge")
 }
 
 // Load replaces the guardian's internal agent session with the one at path,
@@ -468,7 +496,8 @@ func (gs *Session) countRecentDenials() int {
 func (gs *Session) emitTo(sink event.Sink, a Assessment, tool, subj string, durMs int64, usage *provider.Usage) {
 	id := fmt.Sprintf("guardian-%d", time.Now().UnixNano())
 	sink.Emit(event.Event{
-		Kind: event.GuardianAssessment,
+		Kind:     event.GuardianAssessment,
+		ModelRef: gs.modelRef,
 		Guardian: event.GuardianResult{
 			ID:                id,
 			Tool:              tool,
@@ -533,21 +562,71 @@ func firstRunesStr(s string, n int) string {
 
 func lastAssistantText(sess *agent.Session) string {
 	msgs := sess.Snapshot()
-	for i := len(msgs) - 1; i >= 0; i-- {
-		if msgs[i].Role == provider.RoleAssistant && strings.TrimSpace(msgs[i].Content) != "" {
-			return msgs[i].Content
+	for _, v := range slices.Backward(msgs) {
+		if v.Role == provider.RoleAssistant && strings.TrimSpace(v.Content) != "" {
+			return v.Content
 		}
 	}
 	return ""
 }
 
-// newSink returns a sink that captures Usage events so Review() can include
-// per-call token cost in the assessment event. All events are silently dropped —
-// the only guardian output the user sees is the audit line from emitTo.
+func (gs *Session) resetReviewUsage() {
+	gs.usageMu.Lock()
+	gs.reviewUsage = provider.Usage{}
+	gs.haveReviewUsage = false
+	gs.usageMu.Unlock()
+}
+
+func (gs *Session) snapshotReviewUsage() *provider.Usage {
+	gs.usageMu.Lock()
+	defer gs.usageMu.Unlock()
+	if !gs.haveReviewUsage {
+		return nil
+	}
+	usage := gs.reviewUsage
+	return &usage
+}
+
+func (gs *Session) addReviewUsage(usage *provider.Usage) {
+	if usage == nil {
+		return
+	}
+	gs.usageMu.Lock()
+	defer gs.usageMu.Unlock()
+	gs.reviewUsage.PromptTokens += usage.PromptTokens
+	gs.reviewUsage.CompletionTokens += usage.CompletionTokens
+	gs.reviewUsage.TotalTokens += usage.TotalTokens
+	gs.reviewUsage.CacheHitTokens += usage.CacheHitTokens
+	gs.reviewUsage.CacheMissTokens += usage.CacheMissTokens
+	gs.reviewUsage.CacheWriteTokens += usage.CacheWriteTokens
+	gs.reviewUsage.CacheWriteBilledTokens += usage.CacheWriteBilledTokens
+	gs.reviewUsage.ReasoningTokens += usage.ReasoningTokens
+	gs.reviewUsage.RequestCount += guardianUsageRequestCount(usage)
+	gs.reviewUsage.Estimated = gs.reviewUsage.Estimated || usage.Estimated
+	if usage.FinishReason != "" {
+		gs.reviewUsage.FinishReason = usage.FinishReason
+	}
+	gs.haveReviewUsage = true
+}
+
+func guardianUsageRequestCount(usage *provider.Usage) int {
+	if usage == nil {
+		return 0
+	}
+	if usage.RequestCount > 0 {
+		return usage.RequestCount
+	}
+	return 1
+}
+
+// newSink returns a sink that aggregates every Usage event in one review so
+// Review() can include all model and compaction calls in the assessment event.
+// All events are otherwise silently dropped — the only guardian output the user
+// sees is the audit line from emitTo.
 func (gs *Session) newSink() event.Sink {
 	return event.FuncSink(func(e event.Event) {
 		if e.Kind == event.Usage && e.Usage != nil {
-			gs.lastUsage.Store(e.Usage)
+			gs.addReviewUsage(e.Usage)
 		}
 	})
 }

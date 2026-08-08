@@ -7,7 +7,9 @@ import (
 	"strings"
 	"unicode"
 
+	"reasonix/internal/ablation"
 	"reasonix/internal/agent"
+	"reasonix/internal/memory"
 	"reasonix/internal/planmode"
 	"reasonix/internal/skill"
 )
@@ -120,39 +122,13 @@ func StripReferencedContextPrefix(content string) string {
 // approval, stream recovery, readiness retry, etc.). These should not be shown
 // in the chat UI.
 func IsSyntheticUserMessage(content string) bool {
-	trimmed := strings.TrimSpace(agent.StripTransientUserBlocks(content))
-	if trimmed == planApprovedMessage {
+	if trimmed := strings.TrimSpace(agent.StripTransientUserBlocks(content)); trimmed == planApprovedMessage {
 		return true
 	}
-	for _, prefix := range syntheticPrefixes {
-		if strings.HasPrefix(trimmed, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-// syntheticPrefixes must be kept in sync with the synthetic user messages
-// injected by the controller (planApprovedMessage, goal loop turns), agent loop
-// (streamRecoveryMessage, finalReadinessRetryMessage, emptyFinalRetryMessage,
-// executorHandoffRetryMessage in internal/agent/agent.go), and compaction
-// folds (internal/agent/compact.go), which store summaries as user-role
-// messages the chat UI must never render as user bubbles (#3653).
-var syntheticPrefixes = []string{
-	"Plan approved — plan mode is off",
-	"Host final-answer readiness check failed",
-	"You are already in the executor phase",
-	"The previous assistant response was interrupted while a tool call",
-	"The previous assistant response was interrupted during streaming",
-	"The previous assistant response was interrupted before visible",
-	"The previous assistant response finished without any visible answer",
-	"<compaction-summary>",
-	"Summary of the later conversation (compacted from here on):",
-	"Summary of earlier conversation (compacted up to here):",
-	"Continue pursuing the active goal",
-	"The agent signaled goal completion and all tasks are marked done.",
-	"Goal signaled complete but issues remain:",
-	"No tool calls in recent turns.",
+	// The prefix list lives in internal/agent (agent.SyntheticUserPrefixes) so
+	// preview/title/turn-count derivations there share the exact same filter
+	// (#3653).
+	return agent.IsSyntheticUserText(content)
 }
 
 // Compose applies the plan-mode marker to a turn's text when plan mode is on,
@@ -163,13 +139,31 @@ func (c *Controller) Compose(text string) string {
 }
 
 func (c *Controller) compose(text, source string, includeHookContext bool) string {
+	goal, goalStatus, goalResearchMode, autoResearchTaskID := c.goals.snapshot()
+	return c.composeWithGoal(
+		text,
+		source,
+		includeHookContext,
+		goal,
+		goalStatus,
+		goalResearchMode,
+		autoResearchTaskID,
+	)
+}
+
+func (c *Controller) composeWithGoal(
+	text, source string,
+	includeHookContext bool,
+	goal, goalStatus string,
+	goalResearchMode GoalResearchMode,
+	autoResearchTaskID string,
+) string {
 	c.mu.Lock()
 	plan := c.planMode
 	responseLanguage := c.responseLanguage
 	reasoningLanguage := c.reasoningLanguage
 	c.mu.Unlock()
 	notes := c.memory.drainPending()
-	goal, goalStatus, goalResearchMode, autoResearchTaskID := c.goals.snapshot()
 
 	if strings.TrimSpace(goal) != "" && goalStatus == GoalStatusRunning {
 		prefix := activeGoalBlock(goal, goalResearchMode)
@@ -210,8 +204,27 @@ func (c *Controller) compose(text, source string, includeHookContext bool) strin
 		if block := c.drainHookContextBlock(); block != "" {
 			text = block + "\n\n" + text
 		}
+		// Relevant facts ride only the real user-turn tail. This preserves the
+		// stable system/tool prefix and keeps synthetic recovery turns free of
+		// accidental recall. A just-written fact already arrives in memory-update.
+		if len(notes) == 0 && !c.ablation.Off(ablation.Retrieval) {
+			if block := c.memory.recall(source).Block(); block != "" {
+				text = strings.TrimRight(text, "\n") + "\n\n" + block
+			}
+		} else if len(notes) > 0 {
+			c.memory.recordRecall(memory.RecallResult{
+				Query:      strings.TrimSpace(source),
+				Suppressed: "memory update already supplies the new fact",
+			})
+		}
 	}
 	return text
+}
+
+// LastMemoryRecall returns the last real turn's automatic-recall decision for
+// diagnostics and context-management surfaces.
+func (c *Controller) LastMemoryRecall() memory.RecallResult {
+	return c.memory.lastRecallResult()
 }
 
 func (c *Controller) enqueueHookContexts(contexts []string) {
@@ -279,10 +292,10 @@ func escapeHookContext(s string) string {
 }
 
 func (c *Controller) autoResearchRuntimeBlock(taskID string) string {
-	if c.autoResearch == nil || strings.TrimSpace(taskID) == "" {
+	if !c.autoResearch.enabled() || strings.TrimSpace(taskID) == "" {
 		return ""
 	}
-	summary, err := c.autoResearch.Summary(taskID)
+	summary, err := c.autoResearch.summary(taskID)
 	if err != nil {
 		return "<autoresearch-runtime>\nstatus: invalid\nerror: " + strings.ReplaceAll(err.Error(), autoResearchRuntimeClose, "<\\/autoresearch-runtime>") + "\n</autoresearch-runtime>"
 	}
@@ -362,7 +375,7 @@ const goalTaskContractInstructions = `Goal mode: pursue this goal autonomously. 
 - Pause only when the next step involves an irreversible or externally visible operation, the requested scope has changed, or progress requires information only the user can provide. Otherwise keep working and report assumptions at the end.
 - Complete only when the concrete request is done, the output format and constraints are satisfied, and relevant verification was attempted or reported unavailable.
 
-Do not stop after describing a plan; execute the next useful step. End every goal-mode assistant reply with exactly one status marker on its own line: [goal:continue], [goal:complete], or [goal:blocked:<short reason>].`
+Do not stop after describing a plan; execute the next useful step. End every goal-mode turn by calling the update_goal tool with your disposition: continue (work is ongoing — give the next concrete step in next_action), complete (only when fully done and verified), or blocked (only when the user can unblock). The host validates your claim and decides whether to continue automatically.`
 
 const autoResearchGoalInstructions = `AutoResearch protocol: this goal looks like long-horizon research, debugging, optimization, or implementation work. Treat AutoResearch as a durable strategy for this Goal, not as a background daemon or a global skill.
 - Say briefly in the first visible reply that the goal is being handled with AutoResearch and that host-owned state lives under .reasonix/autoresearch/<task-id>/, using the actual task_id from <autoresearch-runtime>.
@@ -385,36 +398,6 @@ func shouldUseAutoResearch(goal string, mode GoalResearchMode) bool {
 		return false
 	}
 	return isAutoResearchGoal(goal)
-}
-
-func shouldAutoStartResearchGoal(input string) bool {
-	trimmed := strings.TrimSpace(input)
-	if trimmed == "" || strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "!") {
-		return false
-	}
-	lower := strings.ToLower(trimmed)
-	if strings.Contains(lower, ".reasonix/autoresearch/") {
-		return true
-	}
-	for _, phrase := range autoResearchAutoStartPhrases {
-		if strings.Contains(lower, phrase) {
-			return true
-		}
-	}
-	categories := autoResearchPhaseCount(lower)
-	switch {
-	case strings.Contains(lower, "彻底") && categories >= 3:
-		return true
-	case strings.Contains(lower, "完整") && categories >= 3:
-		return true
-	case strings.Contains(lower, "长期") && categories >= 2 && containsAnyGoalKeyword(lower, []string{"实验", "验证", "修复", "排查", "优化"}):
-		return true
-	case strings.Contains(lower, "thoroughly") && categories >= 3:
-		return true
-	case strings.Contains(lower, "complete") && categories >= 3:
-		return true
-	}
-	return false
 }
 
 func isAutoResearchGoal(goal string) bool {
@@ -442,32 +425,6 @@ func autoResearchPhaseCount(lower string) int {
 		}
 	}
 	return categories
-}
-
-var autoResearchAutoStartPhrases = []string{
-	"直到根因",
-	"根因明确",
-	"多轮排查",
-	"不要原地打转",
-	"别原地打转",
-	"完整做成方案",
-	"完整方案并验证",
-	"跑实验",
-	"反复验证",
-	"系统性研究",
-	"持续研究",
-	"持续排查",
-	"持续推进",
-	"长期跑",
-	"until the root cause",
-	"root cause is clear",
-	"debug until",
-	"do not spin",
-	"don't spin",
-	"keep researching",
-	"long-horizon",
-	"long horizon",
-	"long-running",
 }
 
 var autoResearchStrongKeywords = []string{
@@ -556,6 +513,8 @@ const (
 	GoalCommandStatus GoalCommandAction = iota + 1
 	GoalCommandSet
 	GoalCommandClear
+	GoalCommandPause
+	GoalCommandResume
 )
 
 type GoalCommand struct {
@@ -578,6 +537,10 @@ func ParseGoalCommand(input string) (GoalCommand, bool) {
 		return GoalCommand{Action: GoalCommandStatus, Strict: strict, ResearchMode: researchMode}, true
 	case "clear", "off", "stop", "done":
 		return GoalCommand{Action: GoalCommandClear, Strict: strict, ResearchMode: researchMode}, true
+	case "pause":
+		return GoalCommand{Action: GoalCommandPause, Strict: strict, ResearchMode: researchMode}, true
+	case "resume":
+		return GoalCommand{Action: GoalCommandResume, Strict: strict, ResearchMode: researchMode}, true
 	default:
 		return GoalCommand{Action: GoalCommandSet, Text: actionArgs, Strict: strict, ResearchMode: researchMode}, true
 	}
@@ -656,7 +619,7 @@ func (c *Controller) RunSkill(input string) (sent string, found bool) {
 	if !ok {
 		return "", false
 	}
-	return skill.Render(sk, task), true
+	return c.skills.render(sk, task), true
 }
 
 // MCPPrompt resolves a "/mcp__server__prompt args…" line: it maps the positional

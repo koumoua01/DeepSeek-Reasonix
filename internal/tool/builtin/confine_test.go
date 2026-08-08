@@ -3,19 +3,29 @@ package builtin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
-	"time"
 
 	"reasonix/internal/config"
 	"reasonix/internal/sandbox"
 	"reasonix/internal/secrets"
+	"reasonix/internal/testenv"
 	"reasonix/internal/tool"
 )
+
+func isolateBuiltinTestUserState(t *testing.T) string {
+	t.Helper()
+	cleanup, err := testenv.IsolateUserState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(cleanup)
+	return os.Getenv("HOME")
+}
 
 func TestWithin(t *testing.T) {
 	root := filepath.FromSlash("/work/proj")
@@ -41,6 +51,66 @@ func TestWithin(t *testing.T) {
 func TestConfineUnconfinedWhenNoRoots(t *testing.T) {
 	if err := confine(nil, "/anywhere/at/all"); err != nil {
 		t.Errorf("empty roots should be unconfined, got %v", err)
+	}
+}
+
+func TestRebindBashWriteRootsUsesMinimalWriteSurface(t *testing.T) {
+	root := t.TempDir()
+	claim := filepath.Join(root, "claimed")
+	tool, ok := RebindBashWriteRoots(ConfineBash(sandbox.Spec{
+		Mode:       "enforce",
+		WriteRoots: []string{root},
+	}, SessionDataGuard{}), []string{claim})
+	if !ok {
+		t.Fatal("expected confined bash to be rebound")
+	}
+	rebound, ok := tool.(bash)
+	if !ok {
+		t.Fatalf("rebound tool type = %T, want bash", tool)
+	}
+	if !rebound.sb.MinimalWrites {
+		t.Fatal("rebound bash must disable write allowances outside claim roots")
+	}
+	want := realRoots([]string{claim})
+	if len(rebound.sb.WriteRoots) != 1 || rebound.sb.WriteRoots[0] != want[0] {
+		t.Fatalf("write roots = %v, want %v", rebound.sb.WriteRoots, want)
+	}
+	if len(rebound.sb.AppContainerWriteRoots) != 1 || rebound.sb.AppContainerWriteRoots[0] != want[0] {
+		t.Fatalf("app-container write roots = %v, want %v", rebound.sb.AppContainerWriteRoots, want)
+	}
+}
+
+func TestReboundBashCannotWriteOutsideClaim(t *testing.T) {
+	if !sandbox.Available() {
+		t.Skip("OS sandbox unavailable")
+	}
+	root := t.TempDir()
+	claim := filepath.Join(root, "claimed")
+	if err := os.MkdirAll(claim, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rebound, ok := RebindBashWriteRoots(ConfineBash(sandbox.Spec{
+		Mode:       "enforce",
+		WriteRoots: []string{root},
+	}, SessionDataGuard{}), []string{claim})
+	if !ok {
+		t.Fatal("expected confined bash to be rebound")
+	}
+
+	inside := filepath.Join(claim, "inside.txt")
+	args, _ := json.Marshal(map[string]string{"command": fmt.Sprintf("printf inside > %q", inside)})
+	if _, err := rebound.Execute(context.Background(), args); err != nil {
+		t.Fatalf("write inside claim failed: %v", err)
+	}
+	if _, err := os.Stat(inside); err != nil {
+		t.Fatalf("write inside claim did not land: %v", err)
+	}
+
+	outside := filepath.Join(t.TempDir(), "escaped.txt")
+	args, _ = json.Marshal(map[string]string{"command": fmt.Sprintf("printf escaped > %q", outside)})
+	_, _ = rebound.Execute(context.Background(), args)
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("rebound bash wrote outside claim, stat err=%v", err)
 	}
 }
 
@@ -105,11 +175,7 @@ func TestWriteFileConfinement(t *testing.T) {
 }
 
 func TestWriteFileDefaultRootsDenyUserConfigUnlessAllowed(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	home := isolateBuiltinTestUserState(t)
 
 	project := filepath.Join(home, "project")
 	if err := os.MkdirAll(project, 0o755); err != nil {
@@ -154,11 +220,7 @@ func (s *stubConfigWriteApprover) ApproveManagedConfigWrite(_ context.Context, r
 }
 
 func TestManagedConfigWriteFailsClosedWithoutApprover(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	home := isolateBuiltinTestUserState(t)
 
 	project := filepath.Join(home, "project")
 	if err := os.MkdirAll(project, 0o755); err != nil {
@@ -185,11 +247,7 @@ func TestManagedConfigWriteFailsClosedWithoutApprover(t *testing.T) {
 }
 
 func TestManagedConfigWriteGatedOnApprover(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("AppData", filepath.Join(home, "AppData", "Roaming"))
+	home := isolateBuiltinTestUserState(t)
 
 	project := filepath.Join(home, "project")
 	if err := os.MkdirAll(project, 0o755); err != nil {
@@ -271,24 +329,12 @@ func TestBashSandboxConfinement(t *testing.T) {
 	}
 	t.Cleanup(func() { os.RemoveAll(work) })
 	t.Chdir(work)
-	var timeout []time.Duration
-	if runtime.GOOS == "windows" {
-		wait := 20 * time.Second
-		t.Setenv("WINDOWS_SANDBOX_WAIT_MS", fmt.Sprint(wait.Milliseconds()))
-		timeout = []time.Duration{wait}
-	}
 	spec := sandbox.Spec{Mode: "enforce", WriteRoots: []string{work}, Network: true}
-	if runtime.GOOS == "windows" {
-		spec.Shell = sandbox.ResolveShell("powershell", "", nil)
-	}
-	b := ConfineBash(spec, SessionDataGuard{}, timeout...)
+	b := ConfineBash(spec, SessionDataGuard{})
 
 	// Writing inside the root works; writing to a sibling under $HOME is denied
 	// by the sandbox the bash tool wrapped the command in.
 	inCommand := "echo hi > " + filepath.Join(work, "in.txt")
-	if runtime.GOOS == "windows" {
-		inCommand = "Set-Content -LiteralPath " + psQuoteForBuiltinTest(filepath.Join(work, "in.txt")) + " -Value hi"
-	}
 	inArgs, _ := json.Marshal(map[string]string{"command": inCommand})
 	if _, err := b.Execute(context.Background(), inArgs); err != nil {
 		t.Fatalf("bash write inside root failed: %v", err)
@@ -296,9 +342,6 @@ func TestBashSandboxConfinement(t *testing.T) {
 	outPath := filepath.Join(home, ".reasonix-bashsb-escape.txt")
 	t.Cleanup(func() { os.Remove(outPath) })
 	outCommand := "echo nope > " + outPath
-	if runtime.GOOS == "windows" {
-		outCommand = "Set-Content -LiteralPath " + psQuoteForBuiltinTest(outPath) + " -Value nope"
-	}
 	outArgs, _ := json.Marshal(map[string]string{"command": outCommand})
 	if _, err := b.Execute(context.Background(), outArgs); err == nil {
 		t.Error("bash write outside the workspace should be denied by the sandbox")
@@ -308,14 +351,7 @@ func TestBashSandboxConfinement(t *testing.T) {
 	}
 }
 
-func psQuoteForBuiltinTest(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-}
-
 func TestBashEnforceRejectsWhenSandboxUnavailable(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("native Windows sandbox availability is helper-backed and independent of PATH")
-	}
 	t.Setenv("PATH", t.TempDir())
 
 	exe, err := os.Executable()
@@ -355,7 +391,7 @@ func TestUnconfinedWriterWritesAnywhere(t *testing.T) {
 	}
 }
 
-// --- confineRead & ConfineReaders ---
+// confineRead & ConfineReaders
 
 func TestConfineReadEmpty(t *testing.T) {
 	if confineRead(nil, "/anywhere") {
@@ -376,6 +412,24 @@ func TestConfineReadInsideAndOutside(t *testing.T) {
 	}
 }
 
+func TestConfineReadExactFileRoot(t *testing.T) {
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "credentials.env")
+	visible := filepath.Join(dir, "project.env")
+	for _, path := range []string{secret, visible} {
+		if err := os.WriteFile(path, []byte("value"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	forbidRoots := realRoots([]string{secret})
+	if !confineRead(forbidRoots, secret) {
+		t.Fatal("exact forbidden file should be unreadable")
+	}
+	if confineRead(forbidRoots, visible) {
+		t.Fatal("sibling file should remain readable")
+	}
+}
+
 func TestConfineReadBlocksReadFile(t *testing.T) {
 	forbidDir := t.TempDir()
 	secretPath := filepath.Join(forbidDir, "secret.txt")
@@ -389,7 +443,8 @@ func TestConfineReadBlocksReadFile(t *testing.T) {
 	if err == nil {
 		t.Error("read_file should refuse a forbid-read path")
 	}
-	if _, ok := err.(*os.PathError); !ok {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
 		t.Errorf("read_file forbid-read error should be *os.PathError, got %T: %v", err, err)
 	}
 	// Unconfined (nil forbidRoots) should work.
@@ -481,7 +536,7 @@ func TestGlobFiltersSensitiveMatchesWhenProtected(t *testing.T) {
 	}
 }
 
-// --- grep forbid-read ---
+// grep forbid-read
 
 func TestConfineReadBlocksGrepFile(t *testing.T) {
 	forbidDir := t.TempDir()
@@ -496,7 +551,8 @@ func TestConfineReadBlocksGrepFile(t *testing.T) {
 	if err == nil {
 		t.Error("grep on a forbid-read file should error, not return (no matches)")
 	}
-	if _, ok := err.(*os.PathError); !ok {
+	var pathErr *os.PathError
+	if !errors.As(err, &pathErr) {
 		t.Errorf("grep forbid-read error should be *os.PathError, got %T: %v", err, err)
 	}
 	// Unconfined (nil forbidRoots) should work.

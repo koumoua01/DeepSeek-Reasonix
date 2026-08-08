@@ -15,6 +15,7 @@ import (
 	"reasonix/internal/command"
 	"reasonix/internal/config"
 	"reasonix/internal/control"
+	"reasonix/internal/permission"
 	"reasonix/internal/skill"
 )
 
@@ -247,27 +248,60 @@ func TestUpdateSubagentProfileRefusesNonManualSkill(t *testing.T) {
 func TestUpdateSubagentProfileRefusesUnmanagedFrontmatter(t *testing.T) {
 	a := newTestSubagentApp(t)
 	home := os.Getenv("HOME")
-	// invocation: manual but carrying read-only — dropping it on save would
-	// turn a read-only agent writable (boot.go picks the registry from it).
-	dir := filepath.Join(home, ".reasonix", "skills", "manual-readonly")
+	// invocation: manual but carrying an unmanaged routing key — dropping it
+	// on save would silently change discovery/auto-use semantics.
+	dir := filepath.Join(home, ".reasonix", "skills", "manual-rich")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"),
-		[]byte("---\ndescription: locked down\nrunAs: subagent\ninvocation: manual\nread-only: true\n---\nbody"), 0o644); err != nil {
+		[]byte("---\ndescription: locked down\nrunAs: subagent\ninvocation: manual\ntriggers: [deploy]\n---\nbody"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := a.UpdateSubagentProfile("manual-readonly", "global", SubagentProfileInput{Description: "x", SystemPrompt: "y"})
+	err := a.UpdateSubagentProfile("manual-rich", "global", SubagentProfileInput{Description: "x", SystemPrompt: "y"})
 	if err == nil {
 		t.Fatal("expected refusal for unmanaged frontmatter keys")
 	}
-	if !strings.Contains(err.Error(), "read-only") {
+	if !strings.Contains(err.Error(), "triggers") {
 		t.Fatalf("error should name the unmanaged key, got: %v", err)
 	}
 	// The file must be untouched by the refused edit.
 	raw, rerr := os.ReadFile(filepath.Join(dir, "SKILL.md"))
-	if rerr != nil || !strings.Contains(string(raw), "read-only: true") {
+	if rerr != nil || !strings.Contains(string(raw), "triggers:") {
 		t.Fatalf("refused edit must not modify the file, got: %s (%v)", raw, rerr)
+	}
+}
+
+func TestUpdateSubagentProfileRoundTripsReadOnly(t *testing.T) {
+	a := newTestSubagentApp(t)
+	path, err := a.CreateSubagentProfile(SubagentProfileInput{
+		Name: "ro-agent", Description: "readonly", SystemPrompt: "stay read only",
+		ReadOnly: true, Scope: "global",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "read-only: true") {
+		t.Fatalf("create should emit read-only frontmatter, got:\n%s", raw)
+	}
+	if err := a.UpdateSubagentProfile("ro-agent", "global", SubagentProfileInput{
+		Description: "readonly v2", SystemPrompt: "still read only", ReadOnly: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "read-only: true") {
+		t.Fatalf("update must preserve read-only, got:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "readonly v2") {
+		t.Fatalf("update must change description, got:\n%s", raw)
 	}
 }
 
@@ -370,7 +404,7 @@ func TestTrySubagentRegistryIsReadOnly(t *testing.T) {
 			t.Errorf("try registry should strip writer tool %q; got %v", writer, reg.Names())
 		}
 	}
-	for _, meta := range []string{"task", "run_skill", "install_skill", "install_source", "parallel_tasks"} {
+	for _, meta := range []string{"task", "run_skill", "install_skill", "install_source", "parallel_tasks", "fleet"} {
 		if _, ok := reg.Get(meta); ok {
 			t.Errorf("try registry should strip meta/delegation tool %q; got %v", meta, reg.Names())
 		}
@@ -387,7 +421,7 @@ func TestTrySubagentRegistryBashEnforcesReadOnlyPolicy(t *testing.T) {
 		t.Fatalf("try registry should keep bash; got %v", reg.Names())
 	}
 	if !bash.ReadOnly() {
-		t.Fatal("try bash should report ReadOnly=true (plan-mode-safe wrapper)")
+		t.Fatal("try bash should report ReadOnly=true (restricted read-only wrapper)")
 	}
 	out, err := bash.Execute(context.Background(), json.RawMessage(`{"command":"rm -rf /tmp/x"}`))
 	if err != nil {
@@ -468,6 +502,22 @@ func TestTrySubagentProfileRequiresTaskAndPrompt(t *testing.T) {
 	}
 }
 
+func TestTrySubagentProfilePermissionGateFailsClosedOnAsk(t *testing.T) {
+	gate := trySubagentPermissionGate(permission.New("ask", nil, nil, nil))
+	allow, reason, err := gate.Check(context.Background(), "write_file", json.RawMessage(`{"path":"result.txt"}`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if allow || !strings.Contains(reason, "user declined") {
+		t.Fatalf("headless Ask gate = (%v, %q), want fail-closed denial", allow, reason)
+	}
+
+	allow, reason, err = gate.Check(context.Background(), "read_file", json.RawMessage(`{"path":"input.txt"}`), true)
+	if err != nil || !allow || reason != "" {
+		t.Fatalf("read-only call = (%v, %q, %v), want allow", allow, reason, err)
+	}
+}
+
 func TestTrySubagentProfileRejectsUnknownModel(t *testing.T) {
 	isolateDesktopUserDirs(t)
 	a := NewApp()
@@ -477,6 +527,31 @@ func TestTrySubagentProfileRejectsUnknownModel(t *testing.T) {
 	}, "do something")
 	if err == nil {
 		t.Error("expected an error for an unresolvable model ref")
+	}
+}
+
+func TestTrySubagentPermissionGateFailsClosedOnAsk(t *testing.T) {
+	cfg := config.Default()
+	cfg.Permissions.Ask = []string{"read_file"}
+	policy := permission.New(cfg.Permissions.Mode, cfg.Permissions.Allow, cfg.Permissions.Ask, cfg.Permissions.Deny).
+		WithAllowDynamicBashFallback(cfg.Permissions.AllowDynamicBash)
+	gate := trySubagentPermissionGate(policy)
+
+	allow, reason, err := gate.Check(context.Background(), "read_file", json.RawMessage(`{"path":"README.md"}`), true)
+	if err != nil {
+		t.Fatalf("ask decision returned an error instead of a denial: %v", err)
+	}
+	if allow || (!strings.Contains(strings.ToLower(reason), "denied") &&
+		!strings.Contains(strings.ToLower(reason), "declined")) {
+		t.Fatalf("explicit Ask decision allow=%v reason=%q, want fail-closed denial", allow, reason)
+	}
+
+	cfg.Permissions.Ask = nil
+	policy = permission.New(cfg.Permissions.Mode, cfg.Permissions.Allow, cfg.Permissions.Ask, cfg.Permissions.Deny).
+		WithAllowDynamicBashFallback(cfg.Permissions.AllowDynamicBash)
+	allow, reason, err = trySubagentPermissionGate(policy).Check(context.Background(), "read_file", json.RawMessage(`{"path":"README.md"}`), true)
+	if err != nil || !allow {
+		t.Fatalf("ordinary read-only fallback allow=%v reason=%q err=%v, want allowed", allow, reason, err)
 	}
 }
 

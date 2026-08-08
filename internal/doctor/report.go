@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -84,17 +85,14 @@ type SandboxReport struct {
 	Network    bool     `json:"network"`
 	WriteRoots []string `json:"write_roots,omitempty"`
 	// Available is whether an OS sandbox actually backs an "enforce" request on
-	// this host (Seatbelt, bubblewrap, or the Windows helper). Without it
+	// this host (Seatbelt or bubblewrap). Without it
 	// "enforce" refuses bash execution instead of running unconfined.
 	Available bool `json:"available"`
-	// Shell is the interpreter the bash tool resolved (kind and path). On
-	// Windows this is the first thing to check when sandboxed commands fail:
-	// Git-for-Windows/MSYS2 bash is far more fragile under a low-integrity
-	// token than PowerShell.
+	// Shell is the interpreter the bash tool resolved (kind and path).
 	Shell string `json:"shell,omitempty"`
 	// BashConfigIgnored is set when the config file requests bash = "enforce"
-	// but the platform force-resolves it to "off" (Windows, until the native
-	// backend is reliable) — the one case where Bash silently disagrees with
+	// but the platform force-resolves it to "off" (Windows, where the native
+	// backend is unsupported) — the one case where Bash silently disagrees with
 	// what the user wrote.
 	BashConfigIgnored bool `json:"bash_config_ignored,omitempty"`
 }
@@ -145,11 +143,17 @@ func Collect(opts Options) Report {
 	}
 	// A config that says enforce while the platform force-resolves it to off is
 	// the one case where bash behavior silently disagrees with the file the user
-	// edited (Windows forces off until the native backend is reliable) — say it
+	// edited (Windows has no OS-level Bash backend) — say it
 	// out loud instead of leaving it to be discovered from unconfined commands.
 	bashConfigIgnored := strings.TrimSpace(cfg.Sandbox.Bash) == "enforce" && cfg.BashMode() == "off"
 	if bashConfigIgnored {
-		warnings = append(warnings, `config requests [sandbox] bash = "enforce", but this platform currently forces the Bash sandbox off; bash runs unconfined`)
+		warnings = append(warnings, `config requests [sandbox] bash = "enforce", but Windows does not provide an OS-level Bash sandbox; the setting is fixed to "off" and bash runs unconfined`)
+	}
+	// Supervised deployments sometimes override HOME onto a service config dir
+	// while Reasonix isolation should use REASONIX_HOME. Do not rewrite
+	// subprocess HOME automatically (#7600 rejected); surface the mismatch.
+	if warn := homeIsolationWarning(); warn != "" {
+		warnings = append(warnings, warn)
 	}
 	report := Report{
 		Version: opts.Version,
@@ -282,7 +286,7 @@ func RenderText(r Report) string {
 		bashLine += " (unavailable: no OS sandbox on this host; bash execution is refused. " + sandbox.UnavailableRemediation() + ")"
 	}
 	if r.Sandbox.BashConfigIgnored {
-		bashLine += ` (config requests "enforce", ignored: this platform currently forces the Bash sandbox off)`
+		bashLine += ` (config requests "enforce", ignored: Windows has no OS-level Bash sandbox and fixes this setting to "off")`
 	}
 	fmt.Fprintf(&b, "  bash         %s\n", bashLine)
 	if r.Sandbox.Shell != "" {
@@ -360,6 +364,46 @@ func valueOr(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// homeIsolationWarning detects a process HOME that differs from the OS account
+// home while REASONIX_HOME is unset. Services should keep the real account HOME
+// and isolate Reasonix state with REASONIX_HOME instead of rewriting HOME.
+func homeIsolationWarning() string {
+	if strings.TrimSpace(os.Getenv("REASONIX_HOME")) != "" {
+		return ""
+	}
+	envHome := strings.TrimSpace(os.Getenv("HOME"))
+	if envHome == "" {
+		// Windows services often set USERPROFILE rather than HOME.
+		envHome = strings.TrimSpace(os.Getenv("USERPROFILE"))
+	}
+	if envHome == "" {
+		return ""
+	}
+	acct, err := user.Current()
+	if err != nil || acct == nil || strings.TrimSpace(acct.HomeDir) == "" {
+		return ""
+	}
+	envClean := filepath.Clean(envHome)
+	acctClean := filepath.Clean(acct.HomeDir)
+	if samePathFold(envClean, acctClean) {
+		return ""
+	}
+	// Do not embed either absolute path: when HOME is overridden, redactHome
+	// cannot mask the account home, and shareable doctor output must stay free
+	// of machine-local identity.
+	return "process HOME differs from the OS account home; keep the real account HOME for services and isolate Reasonix with REASONIX_HOME"
+}
+
+func samePathFold(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return false
 }
 
 // redactHome rewrites a path under the user's home directory to start with "~",

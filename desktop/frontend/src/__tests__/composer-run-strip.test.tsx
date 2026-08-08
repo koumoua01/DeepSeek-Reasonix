@@ -91,7 +91,7 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
   const rootEl = document.getElementById("root");
   if (!rootEl) throw new Error("missing root");
   const root = createRoot(rootEl);
-  const calls = { cancel: 0, tokenModes: [] as TokenMode[] };
+  const calls = { cancel: 0, tokenModes: [] as TokenMode[], approvalModes: [] as ToolApprovalMode[] };
   let currentProps: Parameters<typeof Composer>[0] = {
     running: false,
     collaborationMode: "normal" as CollaborationMode,
@@ -108,7 +108,9 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
     onCycleMode: () => {},
     onSetMode: () => {},
     onSetCollaborationMode: () => {},
-    onSetToolApprovalMode: () => {},
+    onSetToolApprovalMode: (mode) => {
+      calls.approvalModes.push(mode);
+    },
     onToggleYoloApprovalMode: () => {},
     onClearGoal: () => {},
     onSwitchModel: () => {},
@@ -136,17 +138,61 @@ async function renderComposer(props: Partial<Parameters<typeof Composer>[0]> = {
   return { root, calls, rerender: paint };
 }
 
+function installWindowTimerQueue() {
+  let clock = 0;
+  let nextId = 1;
+  const tasks = new Map<number, { at: number; callback: () => void }>();
+  const originalSetTimeout = window.setTimeout;
+  const originalClearTimeout = window.clearTimeout;
+
+  window.setTimeout = ((handler: TimerHandler, delay = 0, ...args: unknown[]) => {
+    if (typeof handler !== "function") throw new Error("string timers are unsupported in tests");
+    const id = nextId++;
+    tasks.set(id, { at: clock + Number(delay), callback: () => handler(...args) });
+    return id;
+  }) as typeof window.setTimeout;
+  window.clearTimeout = ((id?: number) => {
+    if (id !== undefined) tasks.delete(id);
+  }) as typeof window.clearTimeout;
+
+  return {
+    advance(ms: number) {
+      clock += ms;
+      while (true) {
+        const next = [...tasks.entries()]
+          .filter(([, task]) => task.at <= clock)
+          .sort((a, b) => a[1].at - b[1].at || a[0] - b[0])[0];
+        if (!next) break;
+        tasks.delete(next[0]);
+        next[1].callback();
+      }
+    },
+    restore() {
+      tasks.clear();
+      window.setTimeout = originalSetTimeout;
+      window.clearTimeout = originalClearTimeout;
+    },
+  };
+}
+
 console.log("\ncomposer run strip");
 
 // Idle: no strip, no stop button, plain send arrow.
 {
   const dom = installDom();
-  const { root } = await renderComposer();
+  const { root, calls } = await renderComposer();
 
   eq(document.querySelector(".composer-run-strip"), null, "idle composer renders no run strip");
   eq(document.querySelector(".composer__btn--stop"), null, "idle composer renders no stop button");
   ok(document.querySelector(".composer__btn--send") !== null, "idle composer keeps the send button");
   eq(document.querySelector(".composer-toolbar--status-only"), null, "floating status pill is gone");
+  const yolo = document.querySelector<HTMLButtonElement>(".composer-modebar__item--yolo");
+  ok(yolo !== null, "approval bar always exposes Yolo alongside Ask and Auto");
+  await act(async () => {
+    yolo?.click();
+    await flushTimers();
+  });
+  eq(calls.approvalModes.at(-1), "yolo", "the visible Yolo option selects Yolo approval");
 
   await act(async () => {
     root.unmount();
@@ -202,6 +248,68 @@ console.log("\ncomposer run strip");
   });
   eq(document.querySelector(".composer-intent-menu")?.textContent?.includes("Work mode"), false, "task-intent menu no longer owns work mode");
   eq(document.querySelectorAll('.composer-intent-menu [role="menuitemradio"]').length, 3, "task method menu exposes direct, plan, and goal");
+
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+// A short Creation hover must stay a no-op. In particular, leaving before the
+// 120ms open delay must not manufacture a closing-only popover or flash the
+// trigger's open styling 140ms later.
+{
+  const dom = installDom();
+  const timers = installWindowTimerQueue();
+  const { root } = await renderComposer({ showContextWindowRing: true });
+
+  for (const selector of [".composer-task-mode-trigger", ".composer-profile-trigger"]) {
+    const trigger = document.querySelector(selector) as HTMLButtonElement | null;
+    if (!trigger) throw new Error(`missing Creation hover trigger: ${selector}`);
+
+    await act(async () => {
+      trigger.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: null }));
+      timers.advance(119);
+      trigger.dispatchEvent(new MouseEvent("mouseout", { bubbles: true, relatedTarget: document.body }));
+      timers.advance(140);
+    });
+
+    ok(!trigger.classList.contains(`${selector.slice(1)}--open`), `${selector} stays visually closed after a short hover`);
+    ok(
+      document.querySelector(selector.includes("task") ? ".composer-intent-menu" : ".composer-profile-menu") === null,
+      `${selector} does not render a closing-only menu`,
+    );
+  }
+
+  const intentTrigger = document.querySelector(".composer-task-mode-trigger") as HTMLButtonElement | null;
+  if (!intentTrigger) throw new Error("missing Creation intent trigger");
+  await act(async () => {
+    intentTrigger.dispatchEvent(new MouseEvent("mouseover", { bubbles: true, relatedTarget: null }));
+    timers.advance(120);
+  });
+  ok(intentTrigger.classList.contains("composer-task-mode-trigger--open"), "a sustained Creation hover still opens the trigger");
+  ok(document.querySelector(".composer-intent-menu") !== null, "a sustained Creation hover still renders the menu");
+
+  timers.restore();
+  await act(async () => {
+    root.unmount();
+  });
+  dom.window.close();
+}
+
+// Runtime controller transitions disable every mode axis and submit together,
+// so rapid Goal + Delivery + approval-mode clicks cannot mutate a half-rebuilt runtime.
+{
+  const dom = installDom();
+  const { root } = await renderComposer({ disabled: true, goal: "ship it", collaborationMode: "goal" });
+  const profile = document.querySelector<HTMLButtonElement>(".composer-profile-trigger");
+  const task = document.querySelector<HTMLButtonElement>(".composer-task-mode-trigger");
+  const approvals = Array.from(document.querySelectorAll<HTMLButtonElement>(".composer-modebar--approval button"));
+  const send = document.querySelector<HTMLButtonElement>(".composer__btn--send");
+  ok(Boolean(profile?.disabled), "runtime transition disables Delivery profile changes");
+  ok(Boolean(task?.disabled), "runtime transition disables Goal mode changes");
+  ok(approvals.length === 3 && approvals.every((button) => button.disabled), "runtime transition disables Ask/Auto/Yolo changes");
+  ok(Boolean(send?.disabled), "runtime transition disables submit");
 
   await act(async () => {
     root.unmount();

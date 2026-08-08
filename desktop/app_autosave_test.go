@@ -124,12 +124,10 @@ func TestScheduleSnapshotCoalesces(t *testing.T) {
 	_ = a
 
 	var wg sync.WaitGroup
-	for i := 0; i < 64; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range 64 {
+		wg.Go(func() {
 			tab.sink.Emit(event.Event{Kind: event.TurnDone})
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -247,6 +245,13 @@ func TestDesktopSnapshotConflictRecoveryUpdatesTabAndProjectTree(t *testing.T) {
 	if tab.SessionPath != recoveryPath {
 		t.Fatalf("tab session path = %q, want recovery path %q", tab.SessionPath, recoveryPath)
 	}
+	saved := loadTabsFile()
+	if len(saved.Tabs) != 1 || saved.Tabs[0].ID != tab.ID {
+		t.Fatalf("saved tabs = %+v, want recovered tab %q", saved.Tabs, tab.ID)
+	}
+	if got := saved.Tabs[0].SessionPath; got != recoveryPath {
+		t.Fatalf("saved tab session path = %q, want recovery path %q", got, recoveryPath)
+	}
 	if tab.TopicID != originalTopic {
 		t.Fatalf("tab topic ID = %q, want original topic %q", tab.TopicID, originalTopic)
 	}
@@ -328,11 +333,11 @@ func TestDesktopSnapshotConflictRecoveryRequiresRecoveryLease(t *testing.T) {
 		detachedSessions: map[string]*WorkspaceTab{},
 		activeTabID:      "recovery_tab",
 	}
-	app.runtimeEvents.emit = func(ctx context.Context, name string, payload ...interface{}) {
+	app.runtimeEvents.emit = func(ctx context.Context, name string, payload ...any) {
 		runtimeEvents <- runtimeEventEnvelope{
 			ctx:     ctx,
 			name:    name,
-			payload: append([]interface{}(nil), payload...),
+			payload: append([]any(nil), payload...),
 		}
 	}
 	tab := &WorkspaceTab{
@@ -357,6 +362,9 @@ func TestDesktopSnapshotConflictRecoveryRequiresRecoveryLease(t *testing.T) {
 		OnSessionRecovered:  app.handleTabSessionRecovered(tab),
 	})
 	app.tabs[tab.ID] = tab
+	app.mu.Lock()
+	app.saveTabsLocked()
+	app.mu.Unlock()
 
 	err = tab.Ctrl.Snapshot()
 	if !errors.Is(err, agent.ErrSessionLeaseHeld) {
@@ -370,6 +378,10 @@ func TestDesktopSnapshotConflictRecoveryRequiresRecoveryLease(t *testing.T) {
 	}
 	if tab.TopicID != "topic_original" {
 		t.Fatalf("tab topic ID = %q, want original topic", tab.TopicID)
+	}
+	saved := loadTabsFile()
+	if len(saved.Tabs) != 1 || saved.Tabs[0].SessionPath != originalPath {
+		t.Fatalf("saved tabs after failed recovery = %+v, want original path %q", saved.Tabs, originalPath)
 	}
 
 	deadline := time.After(time.Second)

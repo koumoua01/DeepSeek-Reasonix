@@ -110,13 +110,16 @@ func (a *Agent) maintainStaleToolResults(mode toolResultMaintenanceMode) (PruneS
 	if st.Results == 0 {
 		return st, nil
 	}
-	a.session.Replace(next)
-	a.session.IncrementRewrite()
+	reason := "prune"
+	if mode == toolResultSnip {
+		reason = "snip"
+	}
+	a.session.Rewrite(next, reason)
 	return st, nil
 }
 
 func shouldMaintainToolResult(m provider.Message, mode toolResultMaintenanceMode) bool {
-	if m.Role != provider.RoleTool {
+	if m.LocalOnly || m.Role != provider.RoleTool {
 		return false
 	}
 	if strings.HasPrefix(m.Content, prunedMarker) {

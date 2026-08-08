@@ -13,6 +13,7 @@ func TestSessionSidecarLayout(t *testing.T) {
 		{"meta", SessionMeta(p), p + ".meta"},
 		{"goal-state", SessionGoalState(p), "/home/u/.reasonix/sessions/abc.goal-state.json"},
 		{"event-log", SessionEventLog(p), "/home/u/.reasonix/sessions/abc.events.jsonl"},
+		{"event-log-damaged", SessionEventLogDamaged(p), "/home/u/.reasonix/sessions/abc.events.jsonl.damaged"},
 		{"event-index", SessionEventIndex(p), "/home/u/.reasonix/sessions/abc.event-index.json"},
 		{"conflict-log", SessionConflictLog(p), "/home/u/.reasonix/sessions/abc.conflicts.jsonl"},
 		{"lock", SessionLockFile(p), p + ".lock"},
@@ -21,6 +22,7 @@ func TestSessionSidecarLayout(t *testing.T) {
 		{"checkpoint", SessionCheckpointDir(p), "/home/u/.reasonix/sessions/abc.ckpt"},
 		{"jobs", SessionJobsDir(p), "/home/u/.reasonix/sessions/abc.jobs"},
 		{"cleanup-pending", SessionCleanupPending(p), "/home/u/.reasonix/sessions/abc.cleanup-pending.json"},
+		{"context", SessionContext(p), "/home/u/.reasonix/sessions/abc.context.json"},
 	}
 	for _, c := range cases {
 		if c.got != c.want {
@@ -37,6 +39,7 @@ func TestSessionSidecarEmptyPath(t *testing.T) {
 		{"meta", SessionMeta},
 		{"goal-state", SessionGoalState},
 		{"event-log", SessionEventLog},
+		{"event-log-damaged", SessionEventLogDamaged},
 		{"event-index", SessionEventIndex},
 		{"conflict-log", SessionConflictLog},
 		{"lock", SessionLockFile},
@@ -45,6 +48,7 @@ func TestSessionSidecarEmptyPath(t *testing.T) {
 		{"checkpoint", SessionCheckpointDir},
 		{"jobs", SessionJobsDir},
 		{"cleanup-pending", SessionCleanupPending},
+		{"context", SessionContext},
 	} {
 		if got := fn.f(""); got != "" {
 			t.Errorf("%s(\"\") = %q, want empty", fn.name, got)
@@ -62,6 +66,7 @@ func TestIsSessionTranscriptName(t *testing.T) {
 		{"session.conflicts.jsonl", false},
 		{"session.guardian.jsonl", false},
 		{"session.guardian.events.jsonl", false},
+		{"session.events.jsonl.damaged", false},
 		{"session.jsonl.meta", false},
 		{"notes.txt", false},
 		{"", false},
@@ -80,8 +85,11 @@ func TestSessionSidecarFiles(t *testing.T) {
 		p + ".meta",
 		"/home/u/.reasonix/sessions/abc.goal-state.json",
 		"/home/u/.reasonix/sessions/abc.events.jsonl",
+		"/home/u/.reasonix/sessions/abc.events.jsonl.damaged",
 		"/home/u/.reasonix/sessions/abc.event-index.json",
 		"/home/u/.reasonix/sessions/abc.conflicts.jsonl",
+		"/home/u/.reasonix/sessions/abc.recovery.json",
+		"/home/u/.reasonix/sessions/abc.context.json",
 	}
 	if len(got) != len(want) {
 		t.Fatalf("SessionSidecarFiles = %v, want %v", got, want)

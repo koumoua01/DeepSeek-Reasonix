@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"reasonix/internal/event"
+	"slices"
 	"strings"
 	"testing"
 
@@ -43,9 +44,9 @@ func (m *mockProvider) Stream(ctx context.Context, req provider.Request) (<-chan
 }
 
 func lastUser(req provider.Request) string {
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if req.Messages[i].Role == provider.RoleUser {
-			return req.Messages[i].Content
+	for _, v := range slices.Backward(req.Messages) {
+		if v.Role == provider.RoleUser {
+			return v.Content
 		}
 	}
 	return ""
@@ -396,6 +397,307 @@ func TestCoordinatorSkipsPlannerForTrivialTurn(t *testing.T) {
 	}
 }
 
+func TestCoordinatorStructuredPolicyUsesStableDepthMetadata(t *testing.T) {
+	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "Light plan."}, {Type: provider.ChunkDone}},
+		{{Type: provider.ChunkText, Text: "Full plan."}, {Type: provider.ChunkDone}},
+	}}
+	exec := &mockProvider{name: "executor", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkText, Text: "Light done."}, {Type: provider.ChunkDone}},
+		{{Type: provider.ChunkText, Text: "Full done."}, {Type: provider.ChunkDone}},
+	}}
+	policy := func(_ context.Context, input string) PlannerDecision {
+		if strings.Contains(input, "light") {
+			return PlannerDecision{
+				Route: PlannerRoutePlanAndExecute, Depth: PlannerDepthLight,
+				Reason: "test_light", MaxResearchRounds: 2,
+			}
+		}
+		return PlannerDecision{
+			Route: PlannerRoutePlanAndExecute, Depth: PlannerDepthFull,
+			Reason: "test_full", MaxResearchRounds: 6,
+		}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("stable planner system"), nil, nil, Options{},
+		executor, 0, event.Discard, policy,
+	)
+
+	if err := coord.Run(context.Background(), "light task"); err != nil {
+		t.Fatalf("light Run: %v", err)
+	}
+	if err := coord.Run(context.Background(), "full task"); err != nil {
+		t.Fatalf("full Run: %v", err)
+	}
+
+	if got := lastUser(planner.requests[0]); !strings.Contains(got, "depth: light") || !strings.Contains(got, "route: plan_and_execute") {
+		t.Fatalf("light planner input missing route metadata: %q", got)
+	}
+	if got := lastUser(planner.requests[1]); !strings.Contains(got, "depth: full") || !strings.Contains(got, "route: plan_and_execute") {
+		t.Fatalf("full planner input missing route metadata: %q", got)
+	}
+	for i, req := range planner.requests {
+		if len(req.Messages) == 0 || req.Messages[0].Role != provider.RoleSystem || req.Messages[0].Content != "stable planner system" {
+			t.Fatalf("planner request %d changed stable system prefix: %+v", i, req.Messages)
+		}
+	}
+	var handoffs []string
+	for _, req := range exec.requests {
+		if got := lastUser(req); strings.Contains(got, executorHandoffMarker) {
+			handoffs = append(handoffs, got)
+		}
+	}
+	if len(handoffs) != 2 {
+		t.Fatalf("executor handoffs = %d, want one light and one full handoff", len(handoffs))
+	}
+	if !strings.Contains(handoffs[0], "Planning depth: light") {
+		t.Fatalf("light handoff missing depth: %q", handoffs[0])
+	}
+	if !strings.Contains(handoffs[1], "Planning depth: full") {
+		t.Fatalf("full handoff missing depth: %q", handoffs[1])
+	}
+}
+
+func TestCoordinatorPlanForApprovalDoesNotDependOnPlannerMarker(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. inspect auth\n2. migrate tokens"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "must not run"},
+		{Type: provider.ChunkDone},
+	}}
+	policy := func(context.Context, string) PlannerDecision {
+		return PlannerDecision{
+			Route: PlannerRoutePlanForApproval, Depth: PlannerDepthFull,
+			Reason: "user_plan_for_approval", MaxResearchRounds: 6,
+		}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, nil, Options{},
+		executor, 0, event.Discard, policy,
+	)
+	approval := &coordinatorApprovalGate{allow: false}
+	coord.SetPlannerPlanApprover(approval)
+
+	if err := coord.Run(context.Background(), "plan auth migration first"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if approval.calls != 1 {
+		t.Fatalf("approval calls = %d, want 1 without planner marker", approval.calls)
+	}
+	if len(exec.requests) != 0 {
+		t.Fatal("executor ran before structured plan approval")
+	}
+}
+
+func TestCoordinatorPlanForApprovalHandsOffAfterApproval(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. inspect auth\n2. migrate tokens"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "Done."},
+		{Type: provider.ChunkDone},
+	}}
+	policy := func(context.Context, string) PlannerDecision {
+		return PlannerDecision{Route: PlannerRoutePlanForApproval, Depth: PlannerDepthFull, Reason: "user_plan_for_approval"}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, nil, Options{},
+		executor, 0, event.Discard, policy,
+	)
+	approval := &coordinatorApprovalGate{allow: true}
+	coord.SetPlannerPlanApprover(approval)
+
+	if err := coord.Run(context.Background(), "plan auth migration, then wait for my approval"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if approval.calls != 1 {
+		t.Fatalf("approval calls = %d, want 1", approval.calls)
+	}
+	if len(exec.requests) == 0 {
+		t.Fatal("executor did not run after approval")
+	}
+	if got := lastUser(exec.requests[0]); !strings.Contains(got, "migrate tokens") {
+		t.Fatalf("executor handoff = %q, want approved planner output", got)
+	}
+}
+
+func TestCoordinatorHeadlessPlanForApprovalPersistsForContinuation(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. inspect auth\n2. migrate tokens"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "must not run"},
+		{Type: provider.ChunkDone},
+	}}
+	policy := func(context.Context, string) PlannerDecision {
+		return PlannerDecision{Route: PlannerRoutePlanForApproval, Depth: PlannerDepthFull, Reason: "user_plan_for_approval"}
+	}
+	sink := &recordSink{}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, sink)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, nil, Options{},
+		executor, 0, sink, policy,
+	)
+
+	if err := coord.Run(context.Background(), "plan auth migration first"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(exec.requests) != 0 {
+		t.Fatal("headless executor ran without a plan approval channel")
+	}
+	msgs := executor.Session().Messages
+	if len(msgs) < 2 || !strings.Contains(msgs[len(msgs)-1].Content, plannerPlanAwaitingApprovalNote) {
+		t.Fatalf("headless approval turn was not persisted for continuation: %+v", msgs)
+	}
+}
+
+func TestCoordinatorPlanOnlyDoesNotRunExecutor(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. inspect auth\n2. migrate tokens"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "must not run"},
+		{Type: provider.ChunkDone},
+	}}
+	policy := func(context.Context, string) PlannerDecision {
+		return PlannerDecision{Route: PlannerRoutePlanOnly, Depth: PlannerDepthFull, Reason: "user_plan_only"}
+	}
+	sink := &recordSink{}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, sink)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, nil, Options{},
+		executor, 0, sink, policy,
+	)
+	approval := &coordinatorApprovalGate{allow: true}
+	coord.SetPlannerPlanApprover(approval)
+
+	if err := coord.Run(context.Background(), "只规划认证迁移，不要执行"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if approval.calls != 0 {
+		t.Fatalf("approval calls = %d, want 0 for an explicit no-execution request", approval.calls)
+	}
+	if len(exec.requests) != 0 {
+		t.Fatal("executor ran for an explicit plan-only request")
+	}
+	msgs := executor.Session().Messages
+	if len(msgs) < 2 || !strings.Contains(msgs[len(msgs)-1].Content, plannerPlanOnlyNote) {
+		t.Fatalf("plan-only turn was not persisted for a later user continuation: %+v", msgs)
+	}
+}
+
+func TestCoordinatorPlanOnlyContinuesWithExecutorOnNextTurn(t *testing.T) {
+	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "1. inspect auth\n2. migrate tokens"},
+		{Type: provider.ChunkDone},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "Migration complete."},
+		{Type: provider.ChunkDone},
+	}}
+	policy := func(_ context.Context, input string) PlannerDecision {
+		if strings.Contains(input, "只规划") {
+			return PlannerDecision{Route: PlannerRoutePlanOnly, Depth: PlannerDepthFull, Reason: "user_plan_only"}
+		}
+		return PlannerDecision{Route: PlannerRouteExecutorOnly, Depth: PlannerDepthNone, Reason: "short_reply"}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, nil, Options{},
+		executor, 0, event.Discard, policy,
+	)
+
+	if err := coord.Run(context.Background(), "只规划认证迁移，不要执行"); err != nil {
+		t.Fatalf("plan-only Run: %v", err)
+	}
+	if got := len(exec.requests); got != 0 {
+		t.Fatalf("executor requests after plan-only turn = %d, want none", got)
+	}
+
+	if err := coord.Run(context.Background(), "执行"); err != nil {
+		t.Fatalf("continuation Run: %v", err)
+	}
+	if got := len(exec.requests); got != 1 {
+		t.Fatalf("executor requests after continuation = %d, want one", got)
+	}
+	req := exec.requests[0]
+	if got := lastUser(req); !strings.Contains(got, "执行") {
+		t.Fatalf("executor continuation input = %q, want the user's execution request", got)
+	}
+	foundSavedPlan := false
+	for _, msg := range req.Messages {
+		if msg.Role == provider.RoleAssistant &&
+			strings.Contains(msg.Content, "migrate tokens") &&
+			strings.Contains(msg.Content, plannerPlanOnlyNote) {
+			foundSavedPlan = true
+			break
+		}
+	}
+	if !foundSavedPlan {
+		t.Fatalf("executor continuation did not receive the saved plan-only turn: %+v", req.Messages)
+	}
+	if got := len(planner.requests); got != 1 {
+		t.Fatalf("planner requests = %d, want only the original plan-only turn", got)
+	}
+}
+
+func TestCoordinatorPlannerFailurePreservesExecutionBoundary(t *testing.T) {
+	cases := []struct {
+		name   string
+		route  PlannerRoute
+		reason string
+		input  string
+	}{
+		{
+			name:   "plan only",
+			route:  PlannerRoutePlanOnly,
+			reason: "user_plan_only",
+			input:  "只规划认证迁移，不要执行",
+		},
+		{
+			name:   "plan for approval",
+			route:  PlannerRoutePlanForApproval,
+			reason: "user_plan_for_approval",
+			input:  "先规划认证迁移，等我确认后再执行",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+				{Type: provider.ChunkError, Err: fmt.Errorf("rate limited")},
+			}}
+			exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+				{Type: provider.ChunkText, Text: "must not run"},
+				{Type: provider.ChunkDone},
+			}}
+			policy := func(context.Context, string) PlannerDecision {
+				return PlannerDecision{Route: tc.route, Depth: PlannerDepthFull, Reason: tc.reason}
+			}
+			executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+			coord := NewCoordinatorWithPlannerPolicy(
+				planner, NewSession("planner-sys"), nil, nil, Options{},
+				executor, 0, event.Discard, policy,
+			)
+
+			err := coord.Run(context.Background(), tc.input)
+			if err == nil || !strings.Contains(err.Error(), "planner:") {
+				t.Fatalf("Run = %v, want planner failure", err)
+			}
+			if len(exec.requests) != 0 {
+				t.Fatal("executor fallback violated the requested execution boundary")
+			}
+		})
+	}
+}
+
 type coordinatorTestTool struct {
 	name     string
 	readOnly bool
@@ -487,7 +789,7 @@ func TestCoordinatorSetReasoningLanguageClearsPlannerAgent(t *testing.T) {
 	}
 }
 
-func TestCoordinatorPlannerMaxStepsUsesPlannerConfigKey(t *testing.T) {
+func TestCoordinatorPlannerMaxStepsUsesExplicitRuntimeKey(t *testing.T) {
 	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
 		{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"REASONIX.md"}`}},
 		{Type: provider.ChunkDone},
@@ -499,28 +801,37 @@ func TestCoordinatorPlannerMaxStepsUsesPlannerConfigKey(t *testing.T) {
 
 	parentReg := tool.NewRegistry()
 	parentReg.Add(coordinatorTestTool{name: "read_file", readOnly: true, output: "keep reading"})
-	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
-	coord := NewCoordinator(planner, NewSession("planner-sys"), nil, PlannerToolRegistry(parentReg), Options{
+	sink := &recordSink{}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, sink)
+	plannerSess := NewSession("planner-sys")
+	coord := NewCoordinator(planner, plannerSess, nil, PlannerToolRegistry(parentReg), Options{
 		MaxSteps:    2,
-		MaxStepsKey: "agent.planner_max_steps",
-	}, executor, 0, event.Discard, nil)
+		MaxStepsKey: "planner max_steps",
+	}, executor, 0, sink, nil)
 
 	err := coord.Run(context.Background(), "plan a change")
-	if err == nil {
-		t.Fatal("Run should pause when the planner reaches its configured step limit")
-	}
-	msg := err.Error()
-	if !strings.Contains(msg, "planner: paused after 2 tool-call rounds (agent.planner_max_steps)") {
-		t.Fatalf("pause error = %q, want planner_max_steps message", msg)
-	}
-	if strings.Contains(msg, "agent.max_steps") {
-		t.Fatalf("planner pause should not point at agent.max_steps: %q", msg)
+	if err != nil {
+		t.Fatalf("Run should fall back to the executor when the planner cannot finalize: %v", err)
 	}
 	if got := len(planner.requests); got != 3 {
-		t.Fatalf("planner requests = %d, want exactly the configured 2 rounds", got)
+		t.Fatalf("planner requests = %d, want 2 research rounds plus finalization", got)
 	}
-	if len(exec.requests) != 0 {
-		t.Fatal("executor should not run when planner pauses before producing a plan")
+	if got := len(exec.requests); got != 1 {
+		t.Fatalf("executor requests = %d, want one fallback run", got)
+	}
+	if got := lastUser(exec.requests[0]); !strings.Contains(got, "plan a change") || strings.Contains(got, executorHandoffMarker) {
+		t.Fatalf("executor fallback input = %q, want the original task without a fabricated handoff", got)
+	}
+	if got := len(plannerSess.Messages); got != 1 {
+		t.Fatalf("planner session messages = %d, want the incomplete turn rolled back", got)
+	}
+	notices := sink.kinds(event.Notice)
+	if len(notices) == 0 || notices[len(notices)-1].Text != plannerResearchFallbackNotice {
+		t.Fatalf("notices = %+v, want planner research fallback notice", notices)
+	}
+	if detail := notices[len(notices)-1].Detail; !strings.Contains(detail, "planner max_steps") ||
+		strings.Contains(detail, "set planner max_steps") {
+		t.Fatalf("fallback detail = %q, want the bounded diagnostic without configuration advice", detail)
 	}
 }
 
@@ -549,7 +860,7 @@ func TestCoordinatorPlannerMaxStepsZeroIsUnlimited(t *testing.T) {
 	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
 	coord := NewCoordinator(planner, NewSession("planner-sys"), nil, PlannerToolRegistry(parentReg), Options{
 		MaxSteps:    0,
-		MaxStepsKey: "agent.planner_max_steps",
+		MaxStepsKey: "planner max_steps",
 	}, executor, 0, event.Discard, nil)
 
 	if err := coord.Run(context.Background(), "plan a change"); err != nil {
@@ -560,6 +871,53 @@ func TestCoordinatorPlannerMaxStepsZeroIsUnlimited(t *testing.T) {
 	}
 	if got := lastUser(exec.requests[0]); !strings.Contains(got, "use both files") {
 		t.Fatalf("executor did not receive planner output: %q", got)
+	}
+}
+
+func TestCoordinatorPlannerDepthAppliesPerTurnResearchBudget(t *testing.T) {
+	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
+		{{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"a"}`}}, {Type: provider.ChunkDone}},
+		{{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-2", Name: "read_file", Arguments: `{"path":"b"}`}}, {Type: provider.ChunkDone}},
+		{{Type: provider.ChunkText, Text: "1. apply the narrow change\n2. run the focused test"}, {Type: provider.ChunkDone}},
+	}}
+	exec := &mockProvider{name: "executor", chunks: []provider.Chunk{
+		{Type: provider.ChunkText, Text: "Done."},
+		{Type: provider.ChunkDone},
+	}}
+	parentReg := tool.NewRegistry()
+	parentReg.Add(coordinatorTestTool{name: "read_file", readOnly: true, output: "ok"})
+	policy := func(context.Context, string) PlannerDecision {
+		return PlannerDecision{
+			Route: PlannerRoutePlanAndExecute, Depth: PlannerDepthLight,
+			Reason: "bounded_work", MaxResearchRounds: 2,
+		}
+	}
+	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+	coord := NewCoordinatorWithPlannerPolicy(
+		planner, NewSession("planner-sys"), nil, PlannerToolRegistry(parentReg), Options{MaxSteps: 0},
+		executor, 0, event.Discard, policy,
+	)
+
+	if err := coord.Run(context.Background(), "make the bounded change"); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := len(planner.requests); got != 3 {
+		t.Fatalf("planner requests = %d, want two research rounds plus one finalization round", got)
+	}
+	if got := lastUser(planner.requests[2]); !strings.Contains(got, "planner research rounds") ||
+		!strings.Contains(got, "Do not call any more tools") ||
+		!strings.Contains(got, "label remaining uncertainty") ||
+		strings.Contains(got, "increase planner research rounds") {
+		t.Fatalf("planner did not receive the depth budget finalization nudge: %q", got)
+	}
+	var sawHandoff bool
+	for _, req := range exec.requests {
+		if strings.Contains(lastUser(req), executorHandoffMarker) {
+			sawHandoff = true
+		}
+	}
+	if !sawHandoff {
+		t.Fatalf("executor requests = %d, none received the bounded plan handoff", len(exec.requests))
 	}
 }
 
@@ -917,17 +1275,12 @@ func toolSchemaNames(schemas []provider.ToolSchema) []string {
 }
 
 func contains(items []string, want string) bool {
-	for _, item := range items {
-		if item == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(items, want)
 }
 
 func BenchmarkPlannerToolRegistry(b *testing.B) {
 	parentReg := tool.NewRegistry()
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		parentReg.Add(coordinatorTestTool{
 			name:     fmt.Sprintf("tool_%03d", i),
 			readOnly: i%3 != 0,
@@ -937,7 +1290,7 @@ func BenchmarkPlannerToolRegistry(b *testing.B) {
 	parentReg.Add(coordinatorTestTool{name: "write_file", readOnly: false})
 
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for range b.N {
 		reg := PlannerToolRegistry(parentReg)
 		if reg.Len() == 0 {
 			b.Fatal("planner registry should retain read-only research tools")
@@ -1041,6 +1394,21 @@ func TestIsNoOpPlan(t *testing.T) {
 func TestDefaultPlannerPromptRequestsNoChangesMarker(t *testing.T) {
 	if !strings.Contains(DefaultPlannerPrompt, noChangesMarker) {
 		t.Fatalf("DefaultPlannerPrompt does not request the %s marker isNoOpPlan parses", noChangesMarker)
+	}
+}
+
+func TestDefaultPlannerPromptDefinesLightAndFullEvidenceContracts(t *testing.T) {
+	for _, want := range []string{
+		"depth=light",
+		"depth=full",
+		"verified touchpoints",
+		"candidate touchpoints",
+		"command-level verification",
+		"Label assumptions",
+	} {
+		if !strings.Contains(DefaultPlannerPrompt, want) {
+			t.Fatalf("DefaultPlannerPrompt missing %q planning contract", want)
+		}
 	}
 }
 
@@ -1225,32 +1593,76 @@ func TestCoordinatorRollsBackPlannerSessionOnToolPlannerFailure(t *testing.T) {
 	}
 }
 
-// TestCoordinatorKeepsPlannerSessionOnMaxStepsPause pins the rollback
-// exemption: a max-steps pause is control flow whose saved work the user is
-// asked to continue from, so planWithTools must not roll the planner session
-// back to the pre-turn snapshot.
-func TestCoordinatorKeepsPlannerSessionOnMaxStepsPause(t *testing.T) {
-	planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
-		{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"main.go"}`}},
-		{Type: provider.ChunkDone},
-	}}
-	exec := &mockProvider{name: "executor"}
-	plannerReg := tool.NewRegistry()
-	plannerReg.Add(coordinatorTestTool{name: "read_file", readOnly: true, output: "package main"})
+func TestCoordinatorPlannerResearchPausePreservesExecutionBoundaries(t *testing.T) {
+	for _, route := range []PlannerRoute{PlannerRoutePlanOnly, PlannerRoutePlanForApproval} {
+		t.Run(string(route), func(t *testing.T) {
+			planner := &mockProvider{name: "planner", chunks: []provider.Chunk{
+				{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"main.go"}`}},
+				{Type: provider.ChunkDone},
+			}}
+			exec := &mockProvider{name: "executor"}
+			plannerReg := tool.NewRegistry()
+			plannerReg.Add(coordinatorTestTool{name: "read_file", readOnly: true, output: "package main"})
+			policy := func(context.Context, string) PlannerDecision {
+				return PlannerDecision{Route: route, Depth: PlannerDepthFull, Reason: "explicit_boundary", MaxResearchRounds: 1}
+			}
 
-	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+			executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
+			plannerSess := NewSession("planner-sys")
+			coord := NewCoordinatorWithPlannerPolicy(
+				planner, plannerSess, nil, plannerReg, Options{MaxSteps: 0},
+				executor, 0, event.Discard, policy,
+			)
+
+			err := coord.Run(context.Background(), "plan the migration")
+			if err == nil || err.Error() != plannerResearchBoundaryError {
+				t.Fatalf("Run = %v, want the safe planner boundary error", err)
+			}
+			if strings.Contains(err.Error(), "set planner research rounds") {
+				t.Fatalf("pause exposed a non-configurable setting: %q", err)
+			}
+			if got := len(exec.requests); got != 0 {
+				t.Fatalf("executor requests = %d, want none across %s", got, route)
+			}
+			if got := len(plannerSess.Messages); got != 1 {
+				t.Fatalf("planner session messages = %d, want the incomplete turn rolled back", got)
+			}
+		})
+	}
+}
+
+func TestCoordinatorRollbackAfterRewriteDropsPausedPlannerToolCall(t *testing.T) {
 	plannerSess := NewSession("planner-sys")
-	coord := NewCoordinator(planner, plannerSess, nil, plannerReg, Options{MaxSteps: 1}, executor, 0, event.Discard, nil)
+	before := plannerSess.Snapshot()
+	rewriteBefore := plannerSess.RewriteVersion()
 
-	err := coord.Run(context.Background(), "fix the bug")
-	if err == nil || !strings.Contains(err.Error(), "planner:") {
-		t.Fatalf("Run = %v, want the propagated max-steps pause", err)
+	plannerSess.Replace([]provider.Message{
+		{Role: provider.RoleSystem, Content: "planner-sys"},
+		{Role: provider.RoleUser, Content: summaryTagOpen + "\ncompacted research\n</summary>"},
+		{Role: provider.RoleAssistant, Content: "Completed evidence from the bounded research rounds."},
+	})
+	plannerSess.IncrementRewrite()
+	plannerSess.Add(provider.Message{Role: provider.RoleUser, Content: "Do not call any more tools; finalize."})
+	plannerSess.Add(provider.Message{
+		Role: provider.RoleAssistant,
+		ToolCalls: []provider.ToolCall{{
+			ID: "ignored-finalization-call", Name: "read_file", Arguments: `{"path":"more.go"}`,
+		}},
+	})
+
+	coord := &Coordinator{plannerSess: plannerSess}
+	coord.rollbackPlannerTurn(before, rewriteBefore)
+
+	msgs := plannerSess.Snapshot()
+	if len(msgs) != 3 {
+		t.Fatalf("planner session messages = %d, want compacted prefix plus completed evidence", len(msgs))
 	}
-	if got := len(exec.requests); got != 0 {
-		t.Fatalf("executor requests = %d, want none on a paused planner turn", got)
+	if last := msgs[len(msgs)-1]; last.Role != provider.RoleAssistant ||
+		len(last.ToolCalls) != 0 || last.Content == "" {
+		t.Fatalf("planner session has an unusable pause tail: %+v", last)
 	}
-	if n := len(plannerSess.Messages); n <= 1 {
-		t.Fatalf("planner session messages = %d, want the saved work preserved for continue", n)
+	if normalized := provider.NormalizeMessages(msgs); len(normalized) != len(msgs) {
+		t.Fatalf("planner session still needs tool-pair repair after rollback: %+v", normalized)
 	}
 }
 
@@ -1287,13 +1699,13 @@ func TestCoordinatorRunsExecutorWhenMarkerNotAlone(t *testing.T) {
 // successful plan.
 func TestCoordinatorHandoffSurvivesPlannerCompaction(t *testing.T) {
 	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
-		{ // the plan, with usage past the force-compaction watermark
-			{Type: provider.ChunkText, Text: "Edit main.go and add the missing guard."},
-			{Type: provider.ChunkUsage, Usage: &provider.Usage{PromptTokens: 1900, TotalTokens: 1950}},
+		{ // preflight compaction on the large filler history (estimate-based)
+			{Type: provider.ChunkText, Text: "- goal: prior filler\n- pending: plan the fix"},
 			{Type: provider.ChunkDone},
 		},
-		{ // the compaction summarizer call
-			{Type: provider.ChunkText, Text: "- goal: guard work\n- pending: none"},
+		{ // the plan turn after projection is in place
+			{Type: provider.ChunkText, Text: "Edit main.go and add the missing guard."},
+			{Type: provider.ChunkUsage, Usage: &provider.Usage{PromptTokens: 400, TotalTokens: 450}},
 			{Type: provider.ChunkDone},
 		},
 	}}
@@ -1307,11 +1719,11 @@ func TestCoordinatorHandoffSurvivesPlannerCompaction(t *testing.T) {
 
 	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
 	plannerSess := NewSession("planner-sys")
-	// Preset enough planner history that the fold shrinks the session to (or
-	// below) its pre-turn length, which is what strands a boundary based on
-	// the pre-turn message count.
+	// Preset enough planner history that context preflight compacts before the
+	// plan stream. Canonical history stays intact; the handoff must still find
+	// the plan on the canonical transcript.
 	filler := strings.Repeat("planner history filler. ", 150)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		plannerSess.Add(provider.Message{Role: provider.RoleUser, Content: filler})
 		plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: filler})
 	}
@@ -1320,8 +1732,10 @@ func TestCoordinatorHandoffSurvivesPlannerCompaction(t *testing.T) {
 	if err := coord.Run(context.Background(), "fix the bug"); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if plannerSess.RewriteVersion() == 0 {
-		t.Fatal("test setup: planner compaction did not fire, the rewrite boundary is not exercised")
+	// Projection compaction no longer rewrites the planner session; handoff
+	// must still deliver the plan even when RewriteVersion stays 0.
+	if plannerSess.RewriteVersion() != 0 {
+		t.Fatalf("canonical rewrite version = %d, want 0", plannerSess.RewriteVersion())
 	}
 	if got := len(exec.requests); got == 0 {
 		t.Fatal("executor never ran")
@@ -1424,22 +1838,20 @@ func TestCoordinatorPassesTurnContextToPlannerGate(t *testing.T) {
 	}
 }
 
-// TestCoordinatorFailedTurnRollbackKeepsCompaction pins the rewrite-aware
-// rollback economics: when auto-compaction fires mid-turn (after a tool round)
-// and the planner THEN fails, restoring the pre-turn snapshot would revert the
-// compaction — wasting its summarizer call and re-growing the prompt. The
-// rollback must instead keep the compacted log and only drop trailing plain
-// user messages, so the next plan still starts from the folded history without
-// consecutive user roles.
+// TestCoordinatorFailedTurnRollbackKeepsCompaction pins rollback economics
+// under projection compaction: when preflight/auto compaction fires and the
+// planner then fails, restoring the pre-turn snapshot must not erase the
+// projection or leave a dangling plain user turn that would produce
+// consecutive user roles on the next plan.
 func TestCoordinatorFailedTurnRollbackKeepsCompaction(t *testing.T) {
 	planner := &mockProvider{name: "planner", streams: [][]provider.Chunk{
-		{ // tool round whose usage crosses the force-compaction watermark
-			{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"main.go"}`}},
-			{Type: provider.ChunkUsage, Usage: &provider.Usage{PromptTokens: 1900, TotalTokens: 1950}},
+		{ // preflight compaction on large filler history
+			{Type: provider.ChunkText, Text: "- goal: guard work\n- pending: continue"},
 			{Type: provider.ChunkDone},
 		},
-		{ // the compaction summarizer call
-			{Type: provider.ChunkText, Text: "- goal: guard work\n- pending: continue"},
+		{ // tool round after projection is installed
+			{Type: provider.ChunkToolCall, ToolCall: &provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"main.go"}`}},
+			{Type: provider.ChunkUsage, Usage: &provider.Usage{PromptTokens: 400, TotalTokens: 450}},
 			{Type: provider.ChunkDone},
 		},
 		{ // the next planner round fails
@@ -1457,7 +1869,7 @@ func TestCoordinatorFailedTurnRollbackKeepsCompaction(t *testing.T) {
 	executor := New(exec, tool.NewRegistry(), NewSession("exec-sys"), Options{}, event.Discard)
 	plannerSess := NewSession("planner-sys")
 	filler := strings.Repeat("planner history filler. ", 150)
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		plannerSess.Add(provider.Message{Role: provider.RoleUser, Content: filler})
 		plannerSess.Add(provider.Message{Role: provider.RoleAssistant, Content: filler})
 	}
@@ -1469,19 +1881,14 @@ func TestCoordinatorFailedTurnRollbackKeepsCompaction(t *testing.T) {
 	if got := len(exec.requests); got != 1 {
 		t.Fatalf("executor requests = %d, want 1 fallback run", got)
 	}
-	if plannerSess.RewriteVersion() == 0 {
-		t.Fatal("test setup: planner compaction did not fire, the rewrite-aware rollback is not exercised")
+	// Canonical transcript is never rewrite-compacted.
+	if plannerSess.RewriteVersion() != 0 {
+		t.Fatalf("canonical rewrite version = %d, want 0", plannerSess.RewriteVersion())
 	}
+	// Canonical history is restored/cleaned without a dangling user turn so the
+	// next plan can continue. Projection lives on the planner agent and is not
+	// wiped by snapshot rollback of Session.Messages alone.
 	msgs := plannerSess.Snapshot()
-	var hasSummary bool
-	for _, m := range msgs {
-		if isCompactionSummary(m) {
-			hasSummary = true
-		}
-	}
-	if !hasSummary {
-		t.Fatal("rollback reverted the compaction: no compaction summary left in the planner session")
-	}
 	if last := msgs[len(msgs)-1]; last.Role == provider.RoleUser && !isCompactionSummary(last) {
 		t.Fatalf("planner session ends in a plain user message after rollback: %q", last.Content)
 	}

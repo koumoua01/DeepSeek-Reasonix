@@ -9,6 +9,41 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/linux"
 )
 
+func TestParseDesktopLaunchArgsStripsLegacySafeMode(t *testing.T) {
+	got := parseDesktopLaunchArgs([]string{"launch", "--detach", "--safe-mode", "--other"})
+	if !got.LegacySafeModeArg {
+		t.Fatal("--safe-mode should still be recognized for stripping")
+	}
+	if parseDesktopLaunchArgs([]string{"--other"}).LegacySafeModeArg {
+		t.Fatal("unrelated argument must not set legacy safe-mode flag")
+	}
+}
+
+func TestParseDesktopLaunchArgsRemoteWindow(t *testing.T) {
+	got := parseDesktopLaunchArgs([]string{
+		"--other",
+		remoteWindowTicketArgPrefix + ".remote-window-123",
+		remoteWindowHostArgPrefix + "abcd1234",
+		remoteWindowOwnerArgPrefix + "0123456789abcdef0123456789abcdef",
+		remoteWindowParentArgPrefix + "4242",
+	})
+	if got.RemoteWindowTicket != ".remote-window-123" {
+		t.Fatalf("RemoteWindowTicket = %q", got.RemoteWindowTicket)
+	}
+	if got.RemoteWindowHostKey != "abcd1234" {
+		t.Fatalf("RemoteWindowHostKey = %q", got.RemoteWindowHostKey)
+	}
+	if got.RemoteWindowOwnerID != "0123456789abcdef0123456789abcdef" {
+		t.Fatalf("RemoteWindowOwnerID = %q", got.RemoteWindowOwnerID)
+	}
+	if got.RemoteWindowParentPID != 4242 {
+		t.Fatalf("RemoteWindowParentPID = %d", got.RemoteWindowParentPID)
+	}
+	if got.LegacySafeModeArg {
+		t.Fatal("remote window args unexpectedly enabled legacy safe mode")
+	}
+}
+
 // TestMain isolates user config/state/cache dirs for the whole package. Without
 // this, tests that persist desktop state, sessions, cache, or CLI-style config
 // can leak into the developer's real Reasonix directories.
@@ -29,7 +64,7 @@ func TestMain(m *testing.M) {
 	// contexts tests use, killing the process from any emitting code path.
 	// Tests that assert on runtime events install their own capture through
 	// the per-instance runtimeEvents.emit hook, which takes precedence.
-	runtimeEventsEmitFallback = func(context.Context, string, ...interface{}) {}
+	runtimeEventsEmitFallback = func(context.Context, string, ...any) {}
 	code := m.Run()
 	os.RemoveAll(dir)
 	os.Exit(code)
@@ -49,7 +84,8 @@ func TestWindowsWebview2GPUDisabled(t *testing.T) {
 		want    bool
 	}{
 		{name: "stable default keeps gpu", channel: "stable", want: false},
-		{name: "canary default disables gpu", channel: "canary", want: true},
+		{name: "preview default disables gpu", channel: "preview", want: true},
+		{name: "legacy canary default disables gpu", channel: "canary", want: true},
 		{name: "env enables fallback", channel: "stable", env: "1", want: true},
 		{name: "env disables canary fallback", channel: "canary", env: "0", want: false},
 		{name: "truthy env", channel: "stable", env: "yes", want: true},

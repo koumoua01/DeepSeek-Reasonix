@@ -71,9 +71,10 @@ func TestFinishReasonMessage(t *testing.T) {
 		}
 	}
 	loud := map[string]string{
-		"length":                "max output",
-		"content_filter":        "content filter",
-		"repetition_truncation": "repetition",
+		"length":                 "max output",
+		"client_reasoning_limit": "client reasoning safety limit",
+		"content_filter":         "content filter",
+		"repetition_truncation":  "repetition",
 	}
 	for reason, fragment := range loud {
 		msg, ok := finishReasonMessage(&provider.Usage{FinishReason: reason})
@@ -103,7 +104,7 @@ func TestEmptyFinalNotice(t *testing.T) {
 	}
 }
 
-// --- parallel-dispatch tests ---
+// parallel-dispatch tests
 
 // fakeTool is a minimal Tool stand-in for dispatch tests; ReadOnly is
 // configurable and Execute sleeps a fixed duration so we can measure
@@ -218,6 +219,25 @@ func TestPartitionToolCallsTodoWriteSerial(t *testing.T) {
 	}
 }
 
+func TestPartitionToolCallsBackgroundCollectorsSerial(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "read_file", readOnly: true})
+	reg.Add(fakeTool{name: "wait", readOnly: true})
+	reg.Add(fakeTool{name: "bash_output", readOnly: true})
+
+	calls := []provider.ToolCall{{Name: "read_file"}, {Name: "wait"}, {Name: "bash_output"}, {Name: "read_file"}}
+	got := partitionToolCalls(reg, calls)
+	want := []toolCallBatch{
+		{start: 0, end: 1, parallel: true},
+		{start: 1, end: 2},
+		{start: 2, end: 3},
+		{start: 3, end: 4, parallel: true},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("partitionToolCalls = %+v, want %+v", got, want)
+	}
+}
+
 // TestExecuteBatchParallelReadOnly checks that three 80ms read-only calls
 // complete in well under 3×80ms — the wall-clock proof of true parallelism.
 func TestExecuteBatchParallelReadOnly(t *testing.T) {
@@ -231,7 +251,8 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	results, _ := a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	batch := a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}, {Name: "b"}, {Name: "c"}})
+	results := batch.results
 	elapsed := time.Since(start)
 
 	if calls != 3 {
@@ -243,6 +264,55 @@ func TestExecuteBatchParallelReadOnly(t *testing.T) {
 	// Allow generous slack for CI; even 2x serial would prove we got parallelism.
 	if elapsed >= 2*delay {
 		t.Errorf("read-only batch took %v (>= %v) — not parallel", elapsed, 2*delay)
+	}
+}
+
+func TestExecuteBatchStampsToolResultTimestamps(t *testing.T) {
+	const delay = 30 * time.Millisecond
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "a", readOnly: true, delay: delay})
+
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+
+	before := time.Now().UnixMilli()
+	a.executeBatch(context.Background(), []provider.ToolCall{{Name: "a"}})
+	after := time.Now().UnixMilli()
+
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 {
+		t.Fatalf("got %d tool results, want 1", len(results))
+	}
+	tr := results[0].Tool
+	if tr.StartedAt < before || tr.StartedAt > after {
+		t.Errorf("StartedAt = %d, want within [%d, %d]", tr.StartedAt, before, after)
+	}
+	if tr.EndedAt != tr.StartedAt+tr.DurationMs {
+		t.Errorf("EndedAt = %d, want StartedAt+DurationMs = %d", tr.EndedAt, tr.StartedAt+tr.DurationMs)
+	}
+	if tr.DurationMs < delay.Milliseconds() {
+		t.Errorf("DurationMs = %d, want >= %d", tr.DurationMs, delay.Milliseconds())
+	}
+}
+
+func TestExecuteBatchCancelledCallsCarryNoTimestamps(t *testing.T) {
+	reg := tool.NewRegistry()
+	reg.Add(fakeTool{name: "a", readOnly: true})
+
+	sink := &recordSink{}
+	a := New(nil, reg, NewSession(""), Options{}, sink)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.executeBatch(ctx, []provider.ToolCall{{Name: "a"}})
+
+	results := sink.kinds(event.ToolResult)
+	if len(results) != 1 {
+		t.Fatalf("got %d tool results, want 1", len(results))
+	}
+	tr := results[0].Tool
+	if tr.StartedAt != 0 || tr.EndedAt != 0 {
+		t.Errorf("never-ran call has StartedAt=%d EndedAt=%d, want both zero", tr.StartedAt, tr.EndedAt)
 	}
 }
 
@@ -264,13 +334,14 @@ func TestExecuteBatchSegmentsAroundWrites(t *testing.T) {
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
 	start := time.Now()
-	results, _ := a.executeBatch(context.Background(), []provider.ToolCall{
+	batch := a.executeBatch(context.Background(), []provider.ToolCall{
 		{Name: "ro1"},
 		{Name: "ro2"},
 		{Name: "rw"},
 		{Name: "ro3"},
 		{Name: "ro4"},
 	})
+	results := batch.results
 	elapsed := time.Since(start)
 
 	want := []string{"ro1 done", "ro2 done", "rw done", "ro3 done", "ro4 done"}
@@ -302,7 +373,7 @@ func TestExecuteBatchFeedsReceiptsToCompleteStep(t *testing.T) {
 	reg.Add(completeStep)
 	a := New(nil, reg, NewSession(""), Options{}, event.Discard)
 
-	results, _ := a.executeBatch(context.Background(), []provider.ToolCall{
+	batch := a.executeBatch(context.Background(), []provider.ToolCall{
 		{Name: "bash", Arguments: `{"command":"go test ./internal/..."}`},
 		{Name: "complete_step", Arguments: `{
 			"step":"Run checks",
@@ -310,6 +381,7 @@ func TestExecuteBatchFeedsReceiptsToCompleteStep(t *testing.T) {
 			"evidence":[{"kind":"verification","summary":"tests passed","command":"go test ./internal/..."}]
 		}`},
 	})
+	results := batch.results
 
 	if len(results) != 2 {
 		t.Fatalf("got %d results, want 2", len(results))

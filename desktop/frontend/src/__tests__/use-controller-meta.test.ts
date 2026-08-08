@@ -1,6 +1,8 @@
 // Run: tsx src/__tests__/use-controller-meta.test.ts
 
-import { currentTurnWaitMs, effortSwitchNoticeText, foregroundRunningFromRuntimeMeta, historyMessagesToItems, initialState, localizedBackendNoticeText, metaFromTab, modelSwitchNoticeText, reducer, sameMeta, shouldReconcileStaleTurn, tokenModeSwitchNoticeText } from "../lib/useController";
+import { currentTurnWaitMs, effortSwitchNoticeText, foregroundRunningFromRuntimeMeta, historyMessagesToItems, initialState, localizedBackendNoticeText, localizedNoticeText, metaFromTab, modelSwitchNoticeText, reducer, sameMeta, shouldReconcileStaleTurn, tokenModeSwitchNoticeText, type Item } from "../lib/useController";
+import { parseTodos } from "../lib/tools";
+import { resolveTodoPanelTodos } from "../lib/todoVisibility";
 import type { HistoryMessage, Meta, TabMeta, WireUsage } from "../lib/types";
 
 type LooseTabMeta = Omit<TabMeta, "toolApprovalMode"> & { toolApprovalMode?: TabMeta["toolApprovalMode"] | "" };
@@ -93,6 +95,21 @@ function usage(source: string): WireUsage {
 console.log("\nuse controller meta");
 
 {
+  eq(
+    modelSwitchNoticeText("active work is still running; running=false; pending_prompt=false; background_jobs=2; finish or cancel the current turn, answer pending prompts, and stop background jobs before changing model"),
+    "The model cannot change while 2 background jobs are running. Open Background jobs in the status bar to stop them.",
+    "model busy guard names the background-job blocker",
+  );
+  eq(
+    effortSwitchNoticeText("active work is still running; running=true; pending_prompt=false; background_jobs=0; finish or cancel the current turn, answer pending prompts, and stop background jobs before changing effort"),
+    "Reasoning effort cannot change while the current answer is running. Stop it first.",
+    "effort busy guard names the running-answer blocker",
+  );
+  eq(
+    tokenModeSwitchNoticeText("active work is still running; running=true; pending_prompt=true; background_jobs=0; finish or cancel the current turn, answer pending prompts, and stop background jobs before changing token mode"),
+    "Work mode cannot change while a prompt is waiting for your response. Handle it first.",
+    "work mode busy guard prioritizes the pending prompt blocker",
+  );
   eq(
     modelSwitchNoticeText("finish or cancel the current turn, answer pending prompts, and stop background jobs before changing model"),
     "The model cannot change yet. Stop the current answer, handle pending prompts, or wait for background jobs to finish.",
@@ -225,9 +242,57 @@ console.log("\nuse controller meta");
 }
 
 {
+  eq(
+    localizedNoticeText("Task status needs one more check (reworded backend copy).", "final_readiness"),
+    "Task status needs one more check; asking the assistant to finish or explain what is blocking it.",
+    "a stable notice code localizes the main copy even after backend copy edits",
+  );
+  eq(
+    localizedNoticeText("reworded workspace contention copy", "workspace_lease"),
+    "Another Delivery session is writing to this workspace; this session will continue automatically when it is safe.",
+    "workspace lease contention uses its stable localized notice code",
+  );
+  eq(
+    localizedNoticeText("reworded cancelled-turn copy", "cancelled_turn_display"),
+    "This turn was interrupted. Partial output is kept for reference; only completed tool pairs and a bounded recovery summary enter the next model turn. Inspect the workspace before continuing or reverting changes.",
+    "cancelled turn history explains the model-context boundary",
+  );
+  eq(
+    localizedNoticeText("reworded unapplied copy\nuse plan B", "unapplied_steer"),
+    "Guidance was not applied because the turn ended before it could be processed. Send it again if it is still needed:\nuse plan B",
+    "unapplied steer keeps the user's guidance while localizing the warning",
+  );
+  eq(
+    localizedNoticeText("reworded recovery copy", "session_recovery_forked"),
+    "The session changed on disk, so the unsaved local transcript was kept as a conflict copy.",
+    "session recovery fork localization uses its stable notice code",
+  );
+  eq(
+    localizedNoticeText("reworded covered adoption", "session_recovery_adopted_covered"),
+    "The session changed on disk, so Reasonix adopted the newer transcript; the local changes were already covered.",
+    "covered session adoption localization uses its stable notice code",
+  );
+  eq(
+    localizedNoticeText("reworded depth cap", "session_recovery_depth_cap"),
+    "Repeated save conflicts were detected, so the current conflict copy was saved in place.",
+    "session recovery depth-cap localization uses its stable notice code",
+  );
+  eq(
+    localizedNoticeText("Tool round limit reached; asking the assistant to summarize progress.", "unknown_future_code"),
+    "Tool round limit reached; asking the assistant to summarize progress.",
+    "an unknown notice code falls back to exact-text matching",
+  );
+  eq(
+    localizedNoticeText("some free-form backend message"),
+    "some free-form backend message",
+    "a codeless unmatched notice keeps its raw text",
+  );
+}
+
+{
   let s = reducer(initialState, {
     type: "event",
-    e: { kind: "notice", level: "warn", text: "session conflicts kept recurring; kept the transcript on the current recovery branch" },
+    e: { kind: "notice", level: "warn", code: "session_recovery_depth_cap", text: "reworded recovery maintenance" },
   });
   s = reducer(s, {
     type: "event",
@@ -290,6 +355,16 @@ console.log("\nuse controller meta");
 }
 
 {
+  const hydrated = historyMessagesToItems([{ role: "notice", level: "info", content: "Tool round limit reached (reworded backend copy).", code: "tool_budget" }], "h");
+  const notice = hydrated.items.find((item) => item.kind === "notice");
+  eq(
+    notice?.kind === "notice" && notice.text,
+    "Tool round limit reached; asking the assistant to summarize progress.",
+    "history notices localize by stable code when the replayed record carries one",
+  );
+}
+
+{
   const hydrated = historyMessagesToItems([
     { role: "user", content: "finish" },
     { role: "assistant", content: "done", reasoning: "worked", workDurationMs: 24_000 },
@@ -304,12 +379,89 @@ console.log("\nuse controller meta");
   eq(sameMeta(meta({ workspacePath: "/repo" }), meta({ workspacePath: "/other" })), false, "workspace path changes invalidate meta equality");
   eq(sameMeta(meta({ gitBranch: "main" }), meta({ gitBranch: "feature" })), false, "git branch changes invalidate meta equality");
   eq(sameMeta(meta({ imageInputEnabled: true }), meta({ imageInputEnabled: false })), false, "image input capability changes invalidate meta equality");
+  eq(
+    sameMeta(
+      meta({ canonicalTodos: [{ content: "Ship", status: "in_progress" }] }),
+      meta({ canonicalTodos: [{ content: "Ship", status: "completed" }] }),
+    ),
+    false,
+    "canonical todo progress invalidates meta equality",
+  );
+  eq(
+    sameMeta(meta({ canonicalTodos: [] }), meta({ canonicalTodos: [] })),
+    true,
+    "equivalent empty canonical todo lists keep meta stable",
+  );
 }
 
 {
   const preserved = metaFromTab(tab({ toolApprovalMode: "" }), meta({ toolApprovalMode: "auto", autoApproveTools: false }));
   eq(preserved.toolApprovalMode, "auto", "blank tab snapshot preserves explicit auto approval mode");
   eq(preserved.autoApproveTools, false, "blank tab snapshot does not silently resurrect yolo approval");
+  const todos = [{ content: "Keep task state", status: "in_progress" }];
+  const withTodos = metaFromTab(tab(), meta({ canonicalTodos: todos }));
+  eq(withTodos.canonicalTodos, todos, "optimistic tab metadata preserves canonical todos for the same session");
+}
+
+{
+  const before = meta({ canonicalTodos: [{ content: "Ship", status: "in_progress" }] });
+  const completed = meta({ canonicalTodos: [{ content: "Ship", status: "completed" }] });
+  const updated = reducer({ ...initialState, meta: before }, { type: "meta", meta: completed });
+  eq(updated.meta?.canonicalTodos?.[0]?.status, "completed", "meta refresh applies canonical todo progress");
+
+  const reset = reducer(updated, { type: "reset" });
+  eq(reset.meta?.canonicalTodos, undefined, "session reset clears canonical todos from the previous session");
+
+  const cleared = reducer(reset, { type: "meta", meta: meta({ canonicalTodos: [] }) });
+  eq(cleared.meta?.canonicalTodos?.length, 0, "authoritative empty canonical todos survive meta refresh");
+}
+
+{
+  const delayedLiveMeta = meta({
+    canonicalTodos: [
+      { content: "Inspect the report", status: "completed" },
+      { content: "Ship the fix", status: "in_progress" },
+    ],
+  });
+  const hydrated = reducer({ ...initialState, meta: delayedLiveMeta }, { type: "meta", meta: delayedLiveMeta });
+  const noLiveTodo = hydrated.items.find(
+    (item): item is Extract<Item, { kind: "tool" }> => item.kind === "tool" && item.name === "todo_write",
+  );
+  eq(
+    resolveTodoPanelTodos(hydrated.meta?.canonicalTodos, noLiveTodo ? parseTodos(noLiveTodo.args) : undefined),
+    delayedLiveMeta.canonicalTodos,
+    "panel uses fresh Meta todos while the live todo_write event is delayed",
+  );
+
+  const staleMeta = meta({
+    canonicalTodos: [
+      { content: "Inspect the report", status: "in_progress" },
+      { content: "Ship the fix", status: "pending" },
+    ],
+  });
+  const liveArgs = JSON.stringify({
+    todos: [
+      { content: "Inspect the report", status: "completed" },
+      { content: "Ship the fix", status: "in_progress" },
+    ],
+  });
+  let liveState = reducer({ ...initialState, meta: staleMeta }, { type: "event", e: { kind: "turn_started" } });
+  liveState = reducer(liveState, {
+    type: "event",
+    e: { kind: "tool_dispatch", tool: { id: "todo-live", name: "todo_write", args: liveArgs, readOnly: true } },
+  });
+  liveState = reducer(liveState, {
+    type: "event",
+    e: { kind: "tool_result", tool: { id: "todo-live", name: "todo_write", readOnly: true, output: "Todos updated" } },
+  });
+  const liveTodo = liveState.items.find(
+    (item): item is Extract<Item, { kind: "tool" }> => item.kind === "tool" && item.name === "todo_write",
+  );
+  eq(
+    JSON.stringify(resolveTodoPanelTodos(liveState.meta?.canonicalTodos, liveTodo ? parseTodos(liveTodo.args) : undefined)),
+    JSON.stringify(JSON.parse(liveArgs).todos),
+    "panel switches to the live todo_write snapshot after it arrives",
+  );
 }
 
 {

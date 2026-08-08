@@ -319,11 +319,8 @@ func (sm *SessionManager) consumeDroppedPrefixLocked(key, text string) string {
 	fmt.Fprintf(&b, "[Queue note: %d older pending message(s) were dropped because this bot session reached its queue cap.", len(dropped))
 	if len(dropped) > 0 {
 		b.WriteString(" Dropped summaries:")
-		limit := len(dropped)
-		if limit > 3 {
-			limit = 3
-		}
-		for i := 0; i < limit; i++ {
+		limit := min(len(dropped), 3)
+		for i := range limit {
 			fmt.Fprintf(&b, "\n- %s", dropped[i])
 		}
 		if len(dropped) > limit {
@@ -352,6 +349,23 @@ func (sm *SessionManager) IsActive(key string) bool {
 	sm.mu.Lock()
 	defer sm.mu.Unlock()
 	return sm.active[key]
+}
+
+// runIfIdle holds the per-gateway admission lock while fn switches runtime
+// ownership for key. A normal message cannot become active between the idle
+// check and the controller unlink/close sequence.
+func (sm *SessionManager) runIfIdle(key string, fn func() bool) bool {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	if sm.active[key] || fn == nil {
+		return false
+	}
+	if !fn() {
+		return false
+	}
+	delete(sm.pending, key)
+	delete(sm.dropped, key)
+	return true
 }
 
 // ActiveCount 返回当前活跃 session 数。

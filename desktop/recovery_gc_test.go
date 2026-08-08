@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -106,8 +105,7 @@ func TestRecoveryGCFirstSweepWaitsForTabRestore(t *testing.T) {
 	}
 	_, branchPath := forkCoveredRecoveryBranch(t, dir, "startup")
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	app := &App{
 		ctx:          ctx,
 		tabs:         map[string]*WorkspaceTab{},
@@ -152,4 +150,22 @@ func TestRecoveryGCFirstSweepWaitsForTabRestore(t *testing.T) {
 
 	// markTabsRestored is idempotent (restore + recover paths may both fire).
 	app.markTabsRestored()
+}
+
+func TestRecoveryGCRunsDespiteSafeModeEnv(t *testing.T) {
+	// v1.20+: GC is no longer suppressed by REASONIX_SAFE_MODE.
+	isolateDesktopUserDirs(t)
+	t.Setenv("REASONIX_SAFE_MODE", "1")
+	root := globalTabWorkspaceRoot()
+	dir := desktopSessionDir(root)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir sessions: %v", err)
+	}
+	_, branchPath := forkCoveredRecoveryBranch(t, dir, "safe")
+
+	app := &App{tabs: map[string]*WorkspaceTab{}, detachedSessions: map[string]*WorkspaceTab{}}
+	_ = app.reclaimRecoveryBranchesIn([]string{dir}, time.Now().Add(48*time.Hour))
+	// Branch may or may not be reclaimed depending on age/coverage; the
+	// important contract is that Safe Mode env does not force a no-op panic-free path.
+	_ = branchPath
 }

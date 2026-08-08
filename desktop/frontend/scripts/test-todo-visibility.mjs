@@ -18,6 +18,8 @@ const transpiled = ts.transpileModule(source, {
 const moduleUrl = `data:text/javascript;base64,${Buffer.from(transpiled).toString("base64")}`;
 const {
   dismissedTodoKeyForScope,
+  resolveTodoPanelTodos,
+  sameTodoList,
   scopedTodoBatchKey,
   scopedTodoDismissalKey,
   shouldOpenTodoPanelByDefault,
@@ -35,6 +37,40 @@ const activeTodos = [
   { content: "Inspect the report", status: "in_progress" },
   { content: "Ship the fix", status: "pending" },
 ];
+
+assert.deepEqual(
+  resolveTodoPanelTodos([], undefined),
+  [],
+  "an authoritative empty canonical list with no live tool clears the panel",
+);
+assert.deepEqual(
+  resolveTodoPanelTodos(
+    [{ content: "Inspect the report", status: "in_progress" }, { content: "Ship the fix", status: "pending" }],
+    [{ content: "Inspect the report", status: "completed" }, { content: "Ship the fix", status: "in_progress" }],
+  ),
+  [{ content: "Inspect the report", status: "completed" }, { content: "Ship the fix", status: "in_progress" }],
+  "a live todo_write snapshot advances mid-turn status past a stale meta snapshot",
+);
+assert.deepEqual(
+  resolveTodoPanelTodos(undefined, activeTodos),
+  activeTodos,
+  "an unavailable canonical list falls back to the transcript snapshot",
+);
+assert.deepEqual(
+  resolveTodoPanelTodos(activeTodos, undefined),
+  activeTodos,
+  "without a live tool the panel keeps the meta snapshot",
+);
+assert.equal(
+  sameTodoList(activeTodos, activeTodos.map((todo) => ({ ...todo }))),
+  true,
+  "equivalent canonical lists do not churn meta state",
+);
+assert.equal(
+  sameTodoList(activeTodos, [{ ...activeTodos[0], status: "completed" }, activeTodos[1]]),
+  false,
+  "canonical status changes invalidate meta state",
+);
 
 assert.equal(
   shouldShowTodoPanel("todo-final", null, completedTodos),
@@ -151,14 +187,9 @@ assert.notEqual(
   "new task content creates a new todo batch",
 );
 assert.equal(
-  shouldOpenTodoPanelByDefault(activeTodos),
-  true,
-  "new incomplete todo batches open by default",
-);
-assert.equal(
-  shouldOpenTodoPanelByDefault(completedTodos),
+  shouldOpenTodoPanelByDefault(),
   false,
-  "completed todo batches collapse by default",
+  "todo batches collapse by default regardless of completion",
 );
 
 const iterations = 200_000;

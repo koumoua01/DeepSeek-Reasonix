@@ -28,6 +28,27 @@ func IsSessionTranscriptName(name string) bool {
 		!strings.HasSuffix(name, ".guardian.jsonl")
 }
 
+// SessionRecoveryState is the persisted Auto-mode recovery checkpoint state
+// (<id>.recovery.json). It is a regular session-owned sidecar, not a transcript.
+func SessionRecoveryState(sessionPath string) string {
+	sessionPath = strings.TrimSpace(sessionPath)
+	if sessionPath == "" {
+		return ""
+	}
+	return sessionStem(sessionPath) + ".recovery.json"
+}
+
+// SessionContext is the context-projection / compaction-state sidecar
+// (<id>.context.json). It holds the model-visible projection and cache
+// telemetry; the primary .jsonl remains the canonical transcript.
+func SessionContext(sessionPath string) string {
+	sessionPath = strings.TrimSpace(sessionPath)
+	if sessionPath == "" {
+		return ""
+	}
+	return sessionStem(sessionPath) + ".context.json"
+}
+
 // sessionStem strips the .jsonl suffix so a sidecar sits beside the session as
 // <id>.<kind> rather than <id>.jsonl.<kind>.
 func sessionStem(sessionPath string) string {
@@ -58,6 +79,18 @@ func SessionEventLog(sessionPath string) string {
 		return ""
 	}
 	return sessionStem(sessionPath) + ".events.jsonl"
+}
+
+// SessionEventLogDamaged is the salvage sidecar for event-log bytes that tail
+// repair would otherwise discard (<id>.events.jsonl.damaged). It must NOT end
+// in .jsonl: older binaries scanning a shared session directory classify any
+// non-excluded .jsonl file as a primary transcript and would resurrect the
+// damaged bytes as a phantom session.
+func SessionEventLogDamaged(sessionPath string) string {
+	if sessionPath == "" {
+		return ""
+	}
+	return SessionEventLog(sessionPath) + ".damaged"
 }
 
 // SessionEventIndex is the listing/checkpoint index for the event log
@@ -147,7 +180,10 @@ func SessionSidecarFiles(sessionPath string) []string {
 		SessionMeta(sessionPath),
 		SessionGoalState(sessionPath),
 		SessionEventLog(sessionPath),
+		SessionEventLogDamaged(sessionPath),
 		SessionEventIndex(sessionPath),
 		SessionConflictLog(sessionPath),
+		SessionRecoveryState(sessionPath),
+		SessionContext(sessionPath),
 	}
 }

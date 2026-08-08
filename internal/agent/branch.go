@@ -135,7 +135,27 @@ func LoadBranchMeta(sessionPath string) (BranchMeta, bool, error) {
 	if m.ID == "" {
 		m.ID = BranchID(sessionPath)
 	}
+	m.sanitizeDisplayFields()
 	return m, true, nil
+}
+
+// sanitizeDisplayFields cleans persisted display strings that older builds
+// polluted with internal wrappers (memory-compiler execution contracts,
+// transient blocks) — #5666. Every reader goes through LoadBranchMeta, so this
+// is the single boundary; UserPreviewText is a no-op on clean text, and a
+// field that was pure wrapper falls back to empty so callers use their normal
+// fallbacks (preview, default title).
+func (m *BranchMeta) sanitizeDisplayFields() {
+	m.TopicTitle = sanitizeStoredDisplayText(m.TopicTitle)
+	m.CustomTitle = sanitizeStoredDisplayText(m.CustomTitle)
+	m.Preview = sanitizeStoredDisplayText(m.Preview)
+}
+
+func sanitizeStoredDisplayText(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return strings.TrimSpace(s)
+	}
+	return UserPreviewText(s)
 }
 
 // branchMetaReadBackoffs paces the re-reads of a branch-meta sidecar that
@@ -270,9 +290,19 @@ func TouchBranchMeta(sessionPath string) error {
 }
 
 func MarkSessionInFlightTurn(sessionPath string, startMessageIndex int, preserveUser bool) error {
-	if startMessageIndex < 0 {
-		startMessageIndex = 0
-	}
+	return SetSessionInFlightTurn(sessionPath, InFlightTurnMeta{
+		StartMessageIndex: startMessageIndex,
+		PreserveUser:      preserveUser,
+		StartedAt:         time.Now().UTC(),
+	})
+}
+
+// SetSessionInFlightTurn writes an existing in-flight marker verbatim. It is
+// used when a running turn moves to a recovery branch: preserving StartedAt is
+// what lets crash recovery relocate the turn after an in-turn compaction has
+// rewritten its original message index.
+func SetSessionInFlightTurn(sessionPath string, marker InFlightTurnMeta) error {
+	startMessageIndex := max(marker.StartMessageIndex, 0)
 	// The sidecar is read-modify-write; the per-path save lock keeps concurrent
 	// writers (autosave's UpdateSessionMeta, listing backfill) from dropping
 	// each other's fields.
@@ -282,11 +312,11 @@ func MarkSessionInFlightTurn(sessionPath string, startMessageIndex int, preserve
 	if err != nil {
 		return err
 	}
-	m.InFlightTurn = &InFlightTurnMeta{
-		StartMessageIndex: startMessageIndex,
-		PreserveUser:      preserveUser,
-		StartedAt:         time.Now().UTC(),
+	marker.StartMessageIndex = startMessageIndex
+	if marker.StartedAt.IsZero() {
+		marker.StartedAt = time.Now().UTC()
 	}
+	m.InFlightTurn = &marker
 	return SaveBranchMetaPreserveUpdated(sessionPath, m)
 }
 
